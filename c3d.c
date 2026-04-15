@@ -1204,6 +1204,15 @@ static inline float c3d_subband_baseline(unsigned i) {
     return c3d_subband_baseline_table[i];
 }
 
+/* Default rANS denom_shift per subband.  LLL_5 needs M=16384 (only 512 coeffs
+ * need a tight histogram); every other subband uses M=4096.  Tried pushing
+ * finest HF bands to M=1024: LUT shrinks from 4 KiB to 1 KiB but each symbol
+ * consumes fewer fractional bits of state → renorm reads ~12 % more bytes,
+ * net decode regressed 15-20 % at fine q.  The LUT was already L1-resident. */
+static inline uint32_t c3d_default_denom_shift(unsigned i) {
+    return (i == 0) ? 14u : 12u;
+}
+
 /* Per-subband default Laplacian-optimal dead-zone offset (dequant α).  The
  * reconstruction is (|q| - 0.5 + α) * step; smaller α biases toward zero
  * (matches heavier-tailed distributions in pure-HF subbands), larger α
@@ -1423,6 +1432,16 @@ static size_t c3d_encode_one_subband(
     }
     c3d_assert(idx == n);
 
+    /* All-zero fast path: every coefficient quantizes to symbol 0.  Emit a
+     * 2-byte sentinel (freq_table_size = 0xFFFF) and stop — decoder zero-fills
+     * the subband.  Saves ~40 bytes/subband on sparse chunks (rANS state
+     * header alone is 32 B).  Common case for HF subbands at moderate ratios. */
+    if (hist[0] == n) {
+        c3d_assert(out_cap >= 2);
+        c3d_write_u16_le(out, 0xFFFFu);
+        return 2;
+    }
+
     /* Pick the frequency source per-subband.  Prefer external (saves the
      * in-band freq table bytes) when it covers every symbol in this chunk;
      * otherwise fall back to a locally-built table. */
@@ -1515,6 +1534,9 @@ static double c3d_estimate_one_subband_bytes(
         }
     }
 
+    /* All-zero subband fast path matches c3d_encode_one_subband. */
+    if (hist[0] == n) return 2.0;
+
     bool use_external = (external_freqs != NULL);
     if (use_external) {
         for (unsigned k = 0; k < 65; ++k) {
@@ -1570,7 +1592,7 @@ static double c3d_estimate_entropy_at_q(float q, const c3d_encoder *s,
                                                               : c3d_subband_baseline(i);
         float step = q * baseline;
         uint32_t denom_shift = (ctx && ctx->has_freq_tables) ? ctx->denom_shifts[i]
-                                                             : (i == 0 ? 14u : 12u);
+                                                             : c3d_default_denom_shift(i);
         total += c3d_estimate_one_subband_bytes(
             s->coeff_buf, &sb, step, denom_shift,
             (ctx && ctx->has_freq_tables) ? ctx->freqs[i] : NULL);
@@ -1604,7 +1626,7 @@ static size_t c3d_emit_entropy_at_q(float q, const c3d_encoder *s,
                                                                 : c3d_subband_baseline(i);
         float step = q * baseline;
         uint32_t denom_shift = (ctx && ctx->has_freq_tables) ? ctx->denom_shifts[i]
-                                                              : (i == 0 ? 14u : 12u);
+                                                              : c3d_default_denom_shift(i);
 
         c3d_write_f32_le(qmul_ptr + 4 * i, step);
         c3d_write_u32_le(suboff_ptr + 4 * i, (uint32_t)entropy_pos);
@@ -1773,6 +1795,18 @@ static void c3d_decode_one_subband(
     c3d_assert(in_size >= 2);
     uint16_t ftable_bytes = c3d_read_u16_le(in + r);
     r += 2;
+
+    /* All-zero subband sentinel (encoder's fast path): zero-fill and return. */
+    if (ftable_bytes == 0xFFFFu) {
+        c3d_assert(in_size == 2);
+        for (uint32_t z = sb->z0; z < sb->z0 + sb->side; ++z)
+        for (uint32_t y = sb->y0; y < sb->y0 + sb->side; ++y)
+        for (uint32_t x = sb->x0; x < sb->x0 + sb->side; ++x)
+            coeff_buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + x] = 0.0f;
+        (void)step; (void)alpha;
+        (void)sub_symbols; (void)tbl_scratch;
+        return;
+    }
 
     uint32_t denom_shift;
     uint32_t local_freqs[65];
@@ -2566,7 +2600,7 @@ c3d_ctx *c3d_ctx_builder_finish(c3d_ctx_builder *b, bool include_freq_tables) {
     if (include_freq_tables && b->n_observed > 0) {
         ctx->has_freq_tables = true;
         for (unsigned s = 0; s < C3D_N_SUBBANDS; ++s) {
-            uint32_t denom_shift = (s == 0) ? 14u : 12u;
+            uint32_t denom_shift = c3d_default_denom_shift(s);
             /* Bump zero bins to 1 so every symbol has nonzero probability in
              * the ctx table, but only when observations come from multiple
              * chunks.  For a single-chunk observation the ctx matches the
