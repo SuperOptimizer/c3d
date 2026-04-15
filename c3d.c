@@ -1440,9 +1440,22 @@ static size_t c3d_encode_one_subband(
     const uint32_t *external_freqs,
     uint8_t *sub_symbols, uint8_t *sub_escapes,
     uint8_t *rans_scratch, size_t rans_scratch_size,
-    uint8_t *out, size_t out_cap)
+    uint8_t *out, size_t out_cap,
+    float max_abs)
 {
     size_t n = (size_t)sb->side * sb->side * sb->side;
+
+    /* All-zero fast path (before the quant scan): if max|c| < 0.5*step,
+     * every coefficient will quantize to 0 and we can emit the 2-byte
+     * sentinel without scanning the subband at all. */
+    if (max_abs < 0.5f * step) {
+        c3d_assert(out_cap >= 2);
+        c3d_write_u16_le(out, 0xFFFFu);
+        (void)denom_shift; (void)external_freqs;
+        (void)sub_symbols; (void)sub_escapes;
+        (void)rans_scratch; (void)rans_scratch_size;
+        return 2;
+    }
 
     /* Pass 1: quantize + symbol + escape + histogram. */
     uint32_t hist[65] = {0};
@@ -1675,13 +1688,15 @@ static size_t c3d_emit_entropy_at_q(float q, const c3d_encoder *s,
         c3d_write_f32_le(qmul_ptr + 4 * i, step);
         c3d_write_u32_le(suboff_ptr + 4 * i, (uint32_t)entropy_pos);
 
+        float max_abs = s->has_max_abs ? s->max_abs_per_subband[i] : s->coeff_scale;
         size_t bytes = c3d_encode_one_subband(
             s->coeff_buf, &sb, step, denom_shift,
             (ctx && ctx->has_freq_tables) ? ctx->freqs[i] : NULL,
             s->sub_symbols, s->sub_escapes,
             s->rans_scratch, rans_scratch_size,
             out + C3D_CHUNK_FIXED_SIZE + entropy_pos,
-            entropy_cap - entropy_pos);
+            entropy_cap - entropy_pos,
+            max_abs);
         entropy_pos += bytes;
     }
 
