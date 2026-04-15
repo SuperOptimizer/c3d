@@ -1298,6 +1298,11 @@ struct c3d_encoder {
      * (which falls back to the cached default-softness table). */
     float    dyn_baselines[C3D_N_SUBBANDS];
     bool     has_dyn_baselines;
+    /* Per-subband max |coeff| after prepare_chunk.  Lets the estimator skip
+     * the full quant scan on subbands that are definitely all-zero at the
+     * trial step — matches the empty-subband fast path in the real emit. */
+    float    max_abs_per_subband[C3D_N_SUBBANDS];
+    bool     has_max_abs;
 };
 
 struct c3d_decoder {
@@ -1315,6 +1320,7 @@ c3d_encoder *c3d_encoder_new(void) {
     e->rans_scratch = malloc((size_t)128 * 128 * 128 * 2 + 1024);
     c3d_assert(e->coeff_buf && e->sub_symbols && e->sub_escapes && e->rans_scratch);
     e->has_dyn_baselines = false;
+    e->has_max_abs = false;
     return e;
 }
 void c3d_encoder_free(c3d_encoder *e) {
@@ -1394,6 +1400,20 @@ static bool c3d_prepare_chunk(const uint8_t *in, uint8_t *out,
     for (size_t i = 0; i < C3D_VOXELS_PER_CHUNK; ++i) {
         s->coeff_buf[i] *= inv;
     }
+
+    /* Precompute per-subband max |coeff| for the estimator's all-zero check. */
+    for (unsigned i = 0; i < C3D_N_SUBBANDS; ++i) {
+        c3d_subband_info sb; c3d_subband_info_of(i, &sb);
+        float mx = 0.0f;
+        for (uint32_t z = sb.z0; z < sb.z0 + sb.side; ++z)
+        for (uint32_t y = sb.y0; y < sb.y0 + sb.side; ++y)
+        for (uint32_t x = sb.x0; x < sb.x0 + sb.side; ++x) {
+            float a = fabsf(s->coeff_buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + x]);
+            if (a > mx) mx = a;
+        }
+        s->max_abs_per_subband[i] = mx;
+    }
+    s->has_max_abs = true;
     return true;
 }
 
@@ -1514,8 +1534,15 @@ static size_t c3d_encode_one_subband(
 static double c3d_estimate_one_subband_bytes(
     const float *coeff_buf, const c3d_subband_info *sb,
     float step, uint32_t denom_shift,
-    const uint32_t *external_freqs)
+    const uint32_t *external_freqs,
+    float max_abs)
 {
+    /* Fast reject: if max |c| in this subband quantizes to 0, the whole band
+     * is empty → matches c3d_encode_one_subband's 2-byte sentinel, and we
+     * skip the O(N) quant loop entirely.  On sparse chunks (typical at
+     * r≥50) this hits for 10-20 of 36 subbands per estimator iteration. */
+    if (max_abs < 0.5f * step) return 2.0;
+
     size_t n = (size_t)sb->side * sb->side * sb->side;
     uint32_t hist[65] = {0};
     size_t escape_bytes = 0;
@@ -1593,9 +1620,11 @@ static double c3d_estimate_entropy_at_q(float q, const c3d_encoder *s,
         float step = q * baseline;
         uint32_t denom_shift = (ctx && ctx->has_freq_tables) ? ctx->denom_shifts[i]
                                                              : c3d_default_denom_shift(i);
+        float max_abs = s->has_max_abs ? s->max_abs_per_subband[i] : 1.0f;
         total += c3d_estimate_one_subband_bytes(
             s->coeff_buf, &sb, step, denom_shift,
-            (ctx && ctx->has_freq_tables) ? ctx->freqs[i] : NULL);
+            (ctx && ctx->has_freq_tables) ? ctx->freqs[i] : NULL,
+            max_abs);
     }
     return total;
 }
