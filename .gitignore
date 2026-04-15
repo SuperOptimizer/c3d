@@ -53,3 +53,18 @@ dkms.conf
 
 # debug information files
 *.dwo
+
+# test corpus (user-supplied raw u8 256^3 chunks)
+/corpus/
+
+# CMake / build trees
+/build/
+/build-*/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+
+# third-party sources (submodule or fetched)
+/third_party/
+.claude/
