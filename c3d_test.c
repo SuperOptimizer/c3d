@@ -478,7 +478,7 @@ static void test_dwt_3d_roundtrip(void) {
         buf[i]  = v;
         orig[i] = v;
     }
-    float scratch[8 * C3D_CHUNK_SIDE];
+    float scratch[2 * C3D_TILE_X * C3D_CHUNK_SIDE];
     c3d_dwt3_fwd(buf, scratch);
     c3d_dwt3_inv_levels(buf, C3D_N_DWT_LEVELS, scratch);
 
@@ -511,7 +511,7 @@ static void test_dwt_3d_lod_partial(void) {
     for (size_t i = 0; i < C3D_VOXELS_PER_CHUNK; ++i) {
         full_fwd[i] = (float)((rand() & 0x1ff) - 128);
     }
-    float scratch[8 * C3D_CHUNK_SIDE];
+    float scratch[2 * C3D_TILE_X * C3D_CHUNK_SIDE];
     c3d_dwt3_fwd(full_fwd, scratch);
 
     /* For each LOD k, inverse-synth 5-k levels and check the LLL_k sub-cube

@@ -67,10 +67,47 @@ int main(int argc, char **argv) {
                (double)q, esz, enc_ms, enc_mbps, dec_ms, dec_mbps);
     }
 
+    /* LOD decode sweep: decode_lod(k) for k = 0..5 at a fixed q.  Reports the
+     * bytes touched (from lod_offsets) and decode throughput per LOD.  Higher
+     * k = coarser resolution = fewer bytes read and fewer IDWT levels run. */
+    {
+        float q_fixed = 0.1f;
+        size_t esz = c3d_encoder_chunk_encode_at_q(encoder, in, q_fixed, NULL,
+                                                   enc, c3d_chunk_encode_max_size());
+        c3d_chunk_info info;
+        c3d_chunk_inspect(enc, esz, &info);
+
+        /* Per-LOD output buffer size: (256 >> lod)^3 voxels. */
+        uint8_t *out_lod = aligned_alloc(32, CHUNK_BYTES);
+
+        printf("\nLOD sweep (q=%.3f, chunk_bytes=%zu):\n", (double)q_fixed, esz);
+        printf("%3s %6s %12s %10s %10s %10s\n",
+               "lod", "side", "bytes_read", "out_vox", "dec_ms", "dec_MB/s_out");
+        for (int lod = (int)C3D_N_LODS - 1; lod >= 0; --lod) {
+            uint32_t side = 256u >> lod;
+            size_t out_vox = (size_t)side * side * side;
+            /* lod_offsets[k] = cumulative bytes needed up to LOD k (entropy).
+             * Actual payload read bytes ≈ FIXED_SIZE + lod_offsets[lod]. */
+            size_t bytes_read = C3D_CHUNK_FIXED_SIZE + info.lod_offsets[lod];
+
+            const int REPS = 5;
+            double t0 = now_s();
+            for (int r = 0; r < REPS; ++r) {
+                c3d_decoder_chunk_decode_lod(decoder, enc, esz, (uint8_t)lod,
+                                             NULL, out_lod);
+            }
+            double t = (now_s() - t0) / REPS;
+            double mbps_out = (out_vox / (1024.0 * 1024.0)) / t;
+            printf("%3d %6u %12zu %10zu %10.2f %10.1f\n",
+                   lod, side, bytes_read, out_vox, t * 1000.0, mbps_out);
+        }
+        free(out_lod);
+    }
+
     /* Raw DWT micro-measurement (no encode/decode, just DWT forward+inverse). */
     {
         float *coef = aligned_alloc(32, (size_t)256*256*256 * sizeof(float));
-        float scratch[8 * 256];
+        float scratch[2 * C3D_TILE_X * 256];
         for (size_t i = 0; i < CHUNK_BYTES; ++i) coef[i] = (float)in[i] - 128.0f;
         /* Warm */
         c3d_dwt3_fwd(coef, scratch);
