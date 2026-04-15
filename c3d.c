@@ -1364,16 +1364,15 @@ static bool c3d_prepare_chunk(const uint8_t *in, uint8_t *out,
     /* Zero-fill tables (will be overwritten). */
     memset(out + 40, 0, C3D_CHUNK_FIXED_SIZE - 40);
 
-    /* Ingest: u8 → f32 − 128. */
-    double mean_sum = 0.0;
+    /* Ingest: u8 → f32 − 128 − dc_offset.  Two passes over `in` (integer
+     * accumulator on the first, no coeff_buf write) + one pass that writes
+     * coeff_buf exactly once.  Saves one 64 MiB coeff_buf round-trip vs the
+     * naive (write f32-128 then subtract dc) ordering. */
+    uint64_t u8_sum = 0;
+    for (size_t i = 0; i < C3D_VOXELS_PER_CHUNK; ++i) u8_sum += in[i];
+    float dc_offset = (float)u8_sum / (float)C3D_VOXELS_PER_CHUNK - 128.0f;
     for (size_t i = 0; i < C3D_VOXELS_PER_CHUNK; ++i) {
-        float v = (float)in[i] - 128.0f;
-        s->coeff_buf[i] = v;
-        mean_sum += v;
-    }
-    float dc_offset = (float)(mean_sum / (double)C3D_VOXELS_PER_CHUNK);
-    for (size_t i = 0; i < C3D_VOXELS_PER_CHUNK; ++i) {
-        s->coeff_buf[i] -= dc_offset;
+        s->coeff_buf[i] = (float)in[i] - 128.0f - dc_offset;
     }
 
     /* Forward 3D DWT in place. */
