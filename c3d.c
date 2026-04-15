@@ -1307,6 +1307,12 @@ struct c3d_encoder {
      * step at emit/estimate time so the normalise-to-[-1,1] scan can be
      * skipped — see c3d_prepare_chunk. */
     float    coeff_scale;
+    /* Warm start for rate-control bisection.  Populated from the previous
+     * call at the same target_ratio; successive chunks in a shard usually
+     * converge to a very similar q, so this cuts bisection from ~8 iters
+     * to ~3-4. */
+    float    last_q;
+    float    last_target_ratio;
 };
 
 struct c3d_decoder {
@@ -1325,6 +1331,8 @@ c3d_encoder *c3d_encoder_new(void) {
     c3d_assert(e->coeff_buf && e->sub_symbols && e->sub_escapes && e->rans_scratch);
     e->has_dyn_baselines = false;
     e->has_max_abs = false;
+    e->last_q = 0.0f;
+    e->last_target_ratio = 0.0f;
     return e;
 }
 void c3d_encoder_free(c3d_encoder *e) {
@@ -1776,10 +1784,23 @@ size_t c3d_encoder_chunk_encode(c3d_encoder *e, const uint8_t *in,
                           - (double)C3D_CHUNK_FIXED_SIZE;
     if (target_bytes_d < 64.0) target_bytes_d = 64.0;
 
-    float q = sqrtf(target_ratio) / 64.0f;
-    if (q < C3D_Q_MIN) q = C3D_Q_MIN;
-    if (q > C3D_Q_MAX) q = C3D_Q_MAX;
-    float q_lo = C3D_Q_MIN, q_hi = C3D_Q_MAX;
+    /* Warm-start q from the previous chunk when target_ratio hasn't changed.
+     * Bracket narrows to [q/4, q*4] — still wide enough to converge even if
+     * chunk content varies sharply, but cuts typical iteration count in half. */
+    float q, q_lo, q_hi;
+    if (e->last_q > 0.0f && e->last_target_ratio == target_ratio) {
+        q = e->last_q;
+        q_lo = q * 0.25f;
+        q_hi = q * 4.0f;
+        if (q_lo < C3D_Q_MIN) q_lo = C3D_Q_MIN;
+        if (q_hi > C3D_Q_MAX) q_hi = C3D_Q_MAX;
+    } else {
+        q = sqrtf(target_ratio) / 64.0f;
+        if (q < C3D_Q_MIN) q = C3D_Q_MIN;
+        if (q > C3D_Q_MAX) q = C3D_Q_MAX;
+        q_lo = C3D_Q_MIN;
+        q_hi = C3D_Q_MAX;
+    }
 
     /* Bisect on the cheap estimator (quantize + Shannon, no rANS) to pick q,
      * then run the true emit exactly once.  ~3-4× encode speedup vs the
@@ -1803,6 +1824,8 @@ size_t c3d_encoder_chunk_encode(c3d_encoder *e, const uint8_t *in,
         }
     }
     total = c3d_emit_entropy_at_q(q, e, ctx, out, out_cap);
+    e->last_q = q;
+    e->last_target_ratio = target_ratio;
     return total;
 }
 
