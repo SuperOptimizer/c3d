@@ -1818,18 +1818,28 @@ static void c3d_rd_estimate_subband(const c3d_encoder *s, unsigned sidx,
      *   2  freq_table_size u16
      *   ~2 + 3*nnz  ftable_bytes (SELF mode; encoder chooses this for us)
      *   8  n_symbols + rans_block_size u32s
-     *   32 rANS initial state header
-     * Escape LEB128 bytes vary with zigzag size.  For step values that push
-     * coefficients well past |q|=64, zigzag ≈ 2·|c|/step reaches ~128-1000,
-     * LEB128 = 2-3 bytes typical.  Use a per-escape estimate of 3 B plus a
-     * growth term based on mean |c|/step for escapes. */
+     *   32 rANS initial state header */
     double ftable_bytes = 2.0 + 3.0 * (double)nnz;
-    /* Mean |c| within escape fine bins ≈ 63.5*step + half_escape_range. */
-    double esc_mean_zigzag = 128.0;  /* safe mid estimate */
-    double esc_leb_per = 1.0 + ceil(log2(esc_mean_zigzag + 1.0) / 7.0);
+    /* Accurate escape LEB128 cost: sum per escape fine bin, with zigzag
+     * estimated from bin midpoint.  zigzag ≈ 2·|q| for positive; LEB size
+     * = ceil((log2(zigzag+1))/7), floored to 1. */
+    double esc_leb_bytes = 0.0;
+    for (unsigned i = 0; i < C3D_FINE_BINS; ++i) {
+        uint32_t h = pref[i + 1] - pref[i];
+        if (!h) continue;
+        float c_mid = ((float)i + 0.5f) * w;
+        if (c_mid < 63.5f * step) continue;
+        uint32_t k = (uint32_t)((c_mid - 0.5f * step) / step) + 1u;
+        if (k < 64u) continue;
+        uint32_t z = 2u * k;            /* zigzag for positive |q| */
+        unsigned leb = 1;
+        uint32_t v = z;
+        while ((v >>= 7) != 0) leb++;
+        esc_leb_bytes += (double)h * (double)leb;
+    }
     double rate_bytes = rate_bits / 8.0
                       + 2.0 + ftable_bytes + 8.0 + 32.0
-                      + esc_leb_per * (double)trial_hist[64];
+                      + esc_leb_bytes;
 
     /* Distortion: sum over fine bins of count × (c_mid - reconstruction)².
      * For bin i with count h_i at midpoint c_mid = (i+0.5)*w, reconstruction
@@ -1989,12 +1999,8 @@ static void c3d_rd_allocate(c3d_encoder *s, const c3d_ctx *ctx,
         total_est_rate += rate[i][best_j];
     }
     s->has_allocator_steps = true;
-    if (getenv("C3D_RD_DEBUG")) {
-        fprintf(stderr, "RD: target=%.0f  rate_fine=%.0f  rate_coarse=%.0f  "
-                "final_lam=%.2e  est_rate=%.0f\n",
-                target_bytes, rate_fine, rate_coarse, lam, total_est_rate);
-    }
-    (void)best_j_all;
+    (void)best_j_all; (void)total_est_rate; (void)rate_fine; (void)rate_coarse;
+    (void)lam;
 }
 
 /* Cheap whole-chunk estimate: sum of per-subband estimates under the same
