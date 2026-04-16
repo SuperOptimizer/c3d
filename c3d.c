@@ -1339,6 +1339,12 @@ struct c3d_decoder {
     float   *coeff_buf;
     uint8_t *sub_symbols;
     float    dwt_scratch[2 * C3D_TILE_X * C3D_CHUNK_SIDE];
+    /* rANS table cache for stable EXTERNAL ctx.  cached_tables is lazily
+     * allocated (2.4 MiB total, 36 × ~65 KiB) on first EXTERNAL-ctx decode;
+     * reused across chunks as long as the ctx id matches. */
+    c3d_rans_tables *cached_tables;
+    uint8_t          cached_ctx_id[16];
+    bool             cached_valid;
 };
 
 c3d_encoder *c3d_encoder_new(void) {
@@ -1368,11 +1374,14 @@ c3d_decoder *c3d_decoder_new(void) {
     d->coeff_buf   = aligned_alloc(C3D_ALIGN, C3D_VOXELS_PER_CHUNK * sizeof(float));
     d->sub_symbols = malloc((size_t)128 * 128 * 128);
     c3d_assert(d->coeff_buf && d->sub_symbols);
+    d->cached_tables = NULL;
+    memset(d->cached_ctx_id, 0, 16);
+    d->cached_valid = false;
     return d;
 }
 void c3d_decoder_free(c3d_decoder *d) {
     if (!d) return;
-    free(d->coeff_buf); free(d->sub_symbols); free(d);
+    free(d->coeff_buf); free(d->sub_symbols); free(d->cached_tables); free(d);
 }
 
 /* -- Stage 1: ingest + DWT + compute coeff_scale, normalise. -------------- *
@@ -1880,7 +1889,8 @@ static void c3d_decode_one_subband(
     float step, float alpha,
     const uint32_t *external_freqs, uint32_t external_denom_shift,
     float *coeff_buf, const c3d_subband_info *sb,
-    uint8_t *sub_symbols, c3d_rans_tables *tbl_scratch)
+    uint8_t *sub_symbols, c3d_rans_tables *tbl_scratch,
+    const c3d_rans_tables *cached_external_tbl)
 {
     size_t n = (size_t)sb->side * sb->side * sb->side;
     size_t r = 0;
@@ -1925,8 +1935,16 @@ static void c3d_decode_one_subband(
     c3d_assert(n_symbols == n);
     c3d_assert(r + rans_block_size <= in_size);
 
-    c3d_rans_build_tables(tbl_scratch, denom_shift, freqs_to_use, 65);
-    c3d_rans_dec_x8(in + r, rans_block_size, tbl_scratch, sub_symbols, n);
+    const c3d_rans_tables *tbl_for_decode;
+    if (cached_external_tbl && ftable_bytes == 0) {
+        /* Re-use the pre-built EXTERNAL table for this subband.  Saves the
+         * per-chunk cum2sym fill (~4-16 K writes). */
+        tbl_for_decode = cached_external_tbl;
+    } else {
+        c3d_rans_build_tables(tbl_scratch, denom_shift, freqs_to_use, 65);
+        tbl_for_decode = tbl_scratch;
+    }
+    c3d_rans_dec_x8(in + r, rans_block_size, tbl_for_decode, sub_symbols, n);
     r += rans_block_size;
 
     /* escape_stream spans [r..in_size). */
@@ -2000,6 +2018,27 @@ void c3d_decoder_chunk_decode_lod(c3d_decoder *d,
     c3d_rans_tables tbl;
     unsigned n_sb = c3d_n_subbands_for_lod[lod];
 
+    /* Warm the per-subband EXTERNAL-table cache when the ctx changes.  All
+     * 36 tables rebuild in one batch so the per-chunk decode loop below can
+     * skip c3d_rans_build_tables on any subband that uses ctx freqs. */
+    const c3d_rans_tables *cached_ext = NULL;
+    if (ctx && ctx->has_freq_tables) {
+        uint8_t ctx_id[16];
+        c3d_ctx_id(ctx, ctx_id);
+        if (!d->cached_valid || memcmp(d->cached_ctx_id, ctx_id, 16) != 0) {
+            if (!d->cached_tables)
+                d->cached_tables = calloc(C3D_N_SUBBANDS, sizeof *d->cached_tables);
+            c3d_assert(d->cached_tables);
+            for (unsigned sc = 0; sc < C3D_N_SUBBANDS; ++sc) {
+                c3d_rans_build_tables(&d->cached_tables[sc],
+                                      ctx->denom_shifts[sc], ctx->freqs[sc], 65);
+            }
+            memcpy(d->cached_ctx_id, ctx_id, 16);
+            d->cached_valid = true;
+        }
+        cached_ext = d->cached_tables;
+    }
+
     for (unsigned s = 0; s < n_sb; ++s) {
         c3d_subband_info sb;
         c3d_subband_info_of(s, &sb);
@@ -2022,7 +2061,8 @@ void c3d_decoder_chunk_decode_lod(c3d_decoder *d,
         c3d_decode_one_subband(entropy + sub_start, sub_end - sub_start,
                                step, alpha,
                                ext_freqs, ext_ds,
-                               d->coeff_buf, &sb, d->sub_symbols, &tbl);
+                               d->coeff_buf, &sb, d->sub_symbols, &tbl,
+                               cached_ext ? &cached_ext[s] : NULL);
     }
 
     unsigned n_synth = C3D_N_DWT_LEVELS - lod;
