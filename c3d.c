@@ -1092,23 +1092,31 @@ static void c3d_dwt3_inv_levels(float *buf, unsigned n_synth_levels, float *scra
  *  §F  Quantizer, symbol mapping (zigzag + escape), and subband info        *
  * ========================================================================= */
 
-/* Dead-zone uniform quantizer, dead zone = step, step width = step.
- *   |c| < step/2      → 0
- *   step/2 ≤ |c|      → sign(c) * (floor((|c| - step/2) / step) + 1) */
+/* Dead-zone widening: dz_half = C3D_DZ_RATIO * step.  0.55 gains +0.02 to
+ * +0.07 dB over the standard 0.50 across all ratios on scroll CT (per-ratio
+ * sweep).  Wavelet coefficients show a "spike at 0 + Laplacian tail" shape
+ * that a wider dead zone absorbs efficiently.  Regression past ~0.65. */
+#define C3D_DZ_RATIO 0.55f
+
+/* Dead-zone uniform quantizer.
+ *   |c| < dz_half     → 0
+ *   |c| ≥ dz_half     → sign(c) * (floor((|c| - dz_half) / step) + 1) */
 static inline int32_t c3d_quant(float c, float step) {
     float ac = (c < 0.0f) ? -c : c;
-    if (ac < 0.5f * step) return 0;
-    int32_t q = (int32_t)((ac - 0.5f * step) / step) + 1;
+    float dz_half = C3D_DZ_RATIO * step;
+    if (ac < dz_half) return 0;
+    int32_t q = (int32_t)((ac - dz_half) / step) + 1;
     return (c < 0.0f) ? -q : q;
 }
 
-/* Laplacian-optimal mid-tread dequantizer.
- *   q = 0 → 0
- *   q ≠ 0 → sign(q) * (|q| - 0.5 + alpha) * step */
+/* Mid-tread dequantizer.  Bin k (k≥1) spans [dz_half + (k-1)·step,
+ * dz_half + k·step]; reconstruction = dz_half + (k - 1 + α)·step
+ * where α∈[0.25,0.50] picks the Laplacian-optimal position in the bin. */
 static inline float c3d_dequant(int32_t q, float step, float alpha) {
     if (q == 0) return 0.0f;
-    float aq  = (float)((q < 0) ? -q : q);
-    float mag = (aq - 0.5f + alpha) * step;
+    float aq      = (float)((q < 0) ? -q : q);
+    float dz_half = C3D_DZ_RATIO * step;
+    float mag     = dz_half + (aq - 1.0f + alpha) * step;
     return (q < 0) ? -mag : mag;
 }
 
