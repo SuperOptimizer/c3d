@@ -737,16 +737,21 @@ Bytes on disk (format version 1, permanent during dev):
 
 ### Deferred — gated scaffolding on main
 
-- **Per-chunk R-D allocator (Q3).** Lagrangian allocator over a 10-point
-  per-subband log step grid is present in `c3d.c` (`c3d_rd_allocate`,
-  `c3d_rd_estimate_subband`) and gated behind the `C3D_RD_ALLOCATOR` env.
-  When enabled it misses rate targets by ~20–25 % because its fine-histogram
-  Shannon estimate systematically undercounts the quant-scan-based
-  `c3d_estimate_one_subband_bytes` even with LEB128-for-escape accounted
-  for.  Leaving code in place for a calibrated second pass — resuming
-  means reconciling the two estimators subband-by-subband, probably
-  re-deriving the Shannon computation directly on the dead-zone boundaries
-  the quant path actually uses.
+- **Per-chunk R-D allocator (Q3).** Two implementations gated off on main:
+  - `c3d_rd_allocate` (fine-histogram, v1, `C3D_RD_ALLOCATOR=1`): rate
+    estimate undercounts ~20–25 % vs the accurate quant-scan estimator,
+    so byte targets drift.
+  - `c3d_rd_allocate_hybrid` (v2, `C3D_RD_HYBRID=1`): rate accuracy is
+    fine (uses the same accurate estimator as global-q bisection, targets
+    the budget that estimator predicts at the converged q).  The
+    distortion metric regresses PSNR by 0.1–1.0 dB regardless of grid
+    width because weighted-coef-MSE + escape-bin mean-|q| approximation
+    doesn't match true pixel MSE under bi-orthogonal CDF 9/7.  The
+    perceptual softness=0.5 baseline already balances R-D slopes in pixel
+    space, so moves away from mult=1 need a more faithful distortion
+    model (closed-form Laplacian integral, or exact per-escape dequant
+    accounting).  Leave scaffolding, revisit when willing to derive the
+    full closed-form dist formula.
 
 - **Context-adaptive rANS (Q4).** Would use per-symbol freq tables keyed on
   the causal neighbour's class for another +0.3–1.0 dB.  Not attempted: the

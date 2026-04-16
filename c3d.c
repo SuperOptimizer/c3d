@@ -1679,6 +1679,136 @@ static size_t c3d_encode_one_subband(
  * Returns estimated subband byte size (double so errors aggregate cleanly).
  * Matches c3d_encode_one_subband's "use external iff external covers every
  * symbol present in this chunk" decision so the estimate tracks reality. */
+/* Accurate rate+distortion estimator: one quant scan over the subband
+ * produces bytes = same value c3d_estimate_one_subband_bytes would return,
+ * plus sum-squared quant error (distortion) in the same pass.  Used by the
+ * hybrid R-D allocator; kept separate so the rate-only path stays minimal.
+ *
+ * Distortion uses the Laplacian-fitted α derived from the histogram (same
+ * formula as Q1 at emit time) so the estimate matches what the real emit
+ * will reconstruct with. */
+static double c3d_estimate_one_subband_rd(
+    const float *coeff_buf, const c3d_subband_info *sb,
+    float step, uint32_t denom_shift,
+    const uint32_t *external_freqs,
+    float max_abs, double *out_distortion)
+{
+    if (max_abs < 0.5f * step) {
+        /* Empty-subband sentinel path. Distortion = Σc² for all voxels,
+         * since they all dequant to 0.  Upper bound ≈ n · (0.5·step)²/3. */
+        size_t n = (size_t)sb->side * sb->side * sb->side;
+        double d_per_voxel = (double)(0.5f * step) * (double)(0.5f * step) / 3.0;
+        if (out_distortion) *out_distortion = d_per_voxel * (double)n;
+        return 2.0;
+    }
+
+    /* Pass 1: build hist + escape bytes + raw SSE accumulator (independent
+     * of α).  We use (c − |q|·step)² with the "natural" zero-alpha centre,
+     * then correct to α* after the hist is complete. */
+    size_t n = (size_t)sb->side * sb->side * sb->side;
+    uint32_t hist[65] = {0};
+    size_t escape_bytes = 0;
+    /* Per-bin accumulators: sum_c (sum of |c| for each bin).  Needed so we
+     * can re-compute distortion at α* without a second scan. */
+    double sumabs_bin[65] = {0};
+    double sumabs2_bin[65] = {0};
+    for (uint32_t z = sb->z0; z < sb->z0 + sb->side; ++z)
+    for (uint32_t y = sb->y0; y < sb->y0 + sb->side; ++y)
+    for (uint32_t x = sb->x0; x < sb->x0 + sb->side; ++x) {
+        float c = coeff_buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + x];
+        float ac = c < 0.0f ? -c : c;
+        int32_t qv = c3d_quant(c, step);
+        uint32_t zigzag;
+        uint8_t sym = c3d_quant_to_symbol(qv, &zigzag);
+        hist[sym]++;
+        sumabs_bin[sym]  += (double)ac;
+        sumabs2_bin[sym] += (double)ac * (double)ac;
+        if (sym == C3D_SYM_ESCAPE) {
+            uint32_t v = zigzag;
+            do { escape_bytes++; v >>= 7; } while (v);
+        }
+    }
+
+    /* Laplacian-fit α from the histogram — mirrors Q1 exactly.  This is
+     * the α the real emit will write and the decoder will use. */
+    double wsum = 0.0;
+    for (unsigned k = 1; k < C3D_SYM_ESCAPE; ++k) wsum += (double)k * hist[k];
+    wsum += 64.0 * (double)hist[C3D_SYM_ESCAPE];
+    float alpha;
+    if (wsum <= 0.0) {
+        alpha = 0.25f;
+    } else {
+        double beta = (double)step * wsum / (double)n;
+        if (beta <= 1e-12) {
+            alpha = 0.25f;
+        } else {
+            double u = (double)step / beta;
+            double denom = exp(u) - 1.0;
+            double a = 1.0 / u - (denom > 1e-12 ? 1.0 / denom : 0.0);
+            if (a < 0.25) a = 0.25;
+            if (a > 0.50) a = 0.50;
+            alpha = (float)a;
+        }
+    }
+
+    /* Distortion at α*: for each bin k ≥ 1, reconstruction = (k−0.5+α)·step;
+     *   Σ (|c| − recon)² over bin = Σ|c|² − 2·recon·Σ|c| + n_k·recon².
+     * Bin 0 reconstructs to 0 → Σc² = Σ|c|². */
+    double dist = 0.0;
+    dist += sumabs2_bin[0];
+    for (unsigned k = 1; k < C3D_SYM_ESCAPE; ++k) {
+        double recon = ((double)k - 0.5 + alpha) * (double)step;
+        dist += sumabs2_bin[k] - 2.0 * recon * sumabs_bin[k] + (double)hist[k] * recon * recon;
+    }
+    /* Escape: reconstruction ≈ |q|·step (α = 0.5 for large |q|).  Use the
+     * bin's mean |c| as a proxy — captures most of the truth without a
+     * second scan. */
+    if (hist[C3D_SYM_ESCAPE]) {
+        double mean_ac = sumabs_bin[C3D_SYM_ESCAPE] / (double)hist[C3D_SYM_ESCAPE];
+        double k_approx = mean_ac / (double)step;
+        double recon = k_approx * (double)step;   /* near |c| — small residual */
+        dist += sumabs2_bin[C3D_SYM_ESCAPE]
+              - 2.0 * recon * sumabs_bin[C3D_SYM_ESCAPE]
+              + (double)hist[C3D_SYM_ESCAPE] * recon * recon;
+    }
+
+    if (hist[0] == n) {
+        if (out_distortion) *out_distortion = dist;
+        return 2.0;
+    }
+
+    bool use_external = (external_freqs != NULL);
+    if (use_external) {
+        for (unsigned k = 0; k < 65; ++k) {
+            if (hist[k] > 0 && external_freqs[k] == 0) { use_external = false; break; }
+        }
+    }
+    double code_bits = 0.0;
+    if (use_external) {
+        double log2_M = (double)denom_shift;
+        for (unsigned k = 0; k < 65; ++k) {
+            if (!hist[k]) continue;
+            code_bits += (double)hist[k] * (log2_M - log2((double)external_freqs[k]));
+        }
+    } else {
+        double inv_n = 1.0 / (double)n;
+        for (unsigned k = 0; k < 65; ++k) {
+            if (!hist[k]) continue;
+            double p = (double)hist[k] * inv_n;
+            code_bits += -(double)hist[k] * log2(p);
+        }
+    }
+    double rans_bytes = code_bits / 8.0 + 32.0;
+    double ftable_bytes = 0.0;
+    if (!use_external) {
+        unsigned nnz = 0;
+        for (unsigned k = 0; k < 65; ++k) if (hist[k]) nnz++;
+        ftable_bytes = 2.0 + 3.0 * (double)nnz;
+    }
+    if (out_distortion) *out_distortion = dist;
+    return 2.0 + ftable_bytes + 8.0 + rans_bytes + (double)escape_bytes;
+}
+
 static double c3d_estimate_one_subband_bytes(
     const float *coeff_buf, const c3d_subband_info *sb,
     float step, uint32_t denom_shift,
@@ -1880,12 +2010,95 @@ static inline float c3d_emit_baseline(const c3d_encoder *s, const c3d_ctx *ctx,
     return c3d_subband_baseline(i);
 }
 
-/* R-D allocator (§Q3).  Pick a per-subband step that minimises
+/* Hybrid R-D allocator (§Q3 v2): after global-q bisection determines the
+ * byte budget, re-distribute bits across subbands to minimise total
+ * distortion while keeping the total byte count close.  Uses the accurate
+ * quant-scan estimator (c3d_estimate_one_subband_rd) so rate and distortion
+ * are internally consistent — sidesteps the calibration gap that sank the
+ * fine-histogram-based first cut. */
+#define C3D_RD_NCAND 9
+static void c3d_rd_allocate_hybrid(c3d_encoder *s, const c3d_ctx *ctx,
+                                   double target_bytes,
+                                   float q_center)
+{
+    /* Per-subband grid around the global-q centre. */
+    static const float mults[C3D_RD_NCAND] = {
+        0.70f, 0.82f, 0.91f, 0.96f, 1.0f, 1.04f, 1.1f, 1.22f, 1.43f
+    };
+
+    double rate[C3D_N_SUBBANDS][C3D_RD_NCAND];
+    double dist[C3D_N_SUBBANDS][C3D_RD_NCAND];
+    float  step_grid[C3D_N_SUBBANDS][C3D_RD_NCAND];
+    for (unsigned i = 0; i < C3D_N_SUBBANDS; ++i) {
+        c3d_subband_info sb; c3d_subband_info_of(i, &sb);
+        float base_step = q_center * c3d_emit_baseline(s, ctx, i) * s->coeff_scale;
+        uint32_t ds = (ctx && ctx->has_freq_tables) ? ctx->denom_shifts[i]
+                                                    : c3d_default_denom_shift(i);
+        const uint32_t *ext = (ctx && ctx->has_freq_tables) ? ctx->freqs[i] : NULL;
+        float mx = s->has_max_abs ? s->max_abs_per_subband[i] : s->coeff_scale;
+        /* Convert coefficient-domain MSE to pixel-domain MSE: weight by the
+         * subband's synthesis-gain product (same factor c3d_subband_baseline
+         * uses for step scaling).  Without this, the allocator minimises the
+         * wrong metric and is pulled off the perceptually-balanced point
+         * c3d_default_baselines already sits at. */
+        unsigned h = c3d_kind_h_count(sb.kind);
+        double log_w = (double)(3u * (sb.level - 1u) + (3u - h)) * log(C3D_CDF97_GAIN_L_SQ)
+                     + (double)h * log(C3D_CDF97_GAIN_H_SQ);
+        double w_px = exp(log_w);
+        for (unsigned j = 0; j < C3D_RD_NCAND; ++j) {
+            float step = base_step * mults[j];
+            if (step <= 0.0f) step = 1e-9f;
+            step_grid[i][j] = step;
+            double d;
+            rate[i][j] = c3d_estimate_one_subband_rd(
+                s->coeff_buf, &sb, step, ds, ext, mx, &d);
+            dist[i][j] = d * w_px;   /* pixel-domain MSE contribution */
+        }
+    }
+
+    /* λ bisection: at each λ, pick per-subband j minimising dist + λ·rate;
+     * sum rate and bracket on target. */
+    double lam_lo = 1e-8, lam_hi = 1e8;
+    unsigned best_j[C3D_N_SUBBANDS];
+    for (int it = 0; it < 16; ++it) {
+        double lam = sqrt(lam_lo * lam_hi);
+        double total_rate = 0.0;
+        for (unsigned i = 0; i < C3D_N_SUBBANDS; ++i) {
+            unsigned bj = 0;
+            double bc = dist[i][0] + lam * rate[i][0];
+            for (unsigned j = 1; j < C3D_RD_NCAND; ++j) {
+                double c = dist[i][j] + lam * rate[i][j];
+                if (c < bc) { bc = c; bj = j; }
+            }
+            best_j[i] = bj;
+            total_rate += rate[i][bj];
+        }
+        if (fabs(total_rate - target_bytes) < 0.005 * target_bytes) break;
+        if (total_rate > target_bytes) lam_lo = lam; /* raise λ → coarser → less rate */
+        else                           lam_hi = lam;
+    }
+
+    /* Final picks using the converged λ. */
+    double lam = sqrt(lam_lo * lam_hi);
+    for (unsigned i = 0; i < C3D_N_SUBBANDS; ++i) {
+        unsigned bj = 0;
+        double bc = dist[i][0] + lam * rate[i][0];
+        for (unsigned j = 1; j < C3D_RD_NCAND; ++j) {
+            double c = dist[i][j] + lam * rate[i][j];
+            if (c < bc) { bc = c; bj = j; }
+        }
+        s->allocator_steps[i] = step_grid[i][bj];
+    }
+    s->has_allocator_steps = true;
+}
+
+/* Original fine-histogram R-D allocator — kept for reference / future
+ * calibration work.  Gated behind C3D_RD_ALLOCATOR env; see PLAN.md.
+ *
+ * Picks per-subband step minimising
  *     Σ d_s(step_s) + λ · Σ r_s(step_s)
- * under a fixed byte target.  Bisection on λ; inner loop evaluates a small
- * log-spaced step grid per subband using the fine-histogram cache (§I1).
- * Writes e->allocator_steps[] and sets has_allocator_steps on success. */
-#define C3D_RD_NCAND 10
+ * under a fixed byte target, using the fine-histogram cache (§I1). */
+#define C3D_RD_NCAND_LEGACY 10
 static void c3d_rd_allocate(c3d_encoder *s, const c3d_ctx *ctx,
                             double target_bytes)
 {
@@ -1909,16 +2122,16 @@ static void c3d_rd_allocate(c3d_encoder *s, const c3d_ctx *ctx,
     if (q_seed < C3D_Q_MIN) q_seed = C3D_Q_MIN;
     if (q_seed > C3D_Q_MAX) q_seed = C3D_Q_MAX;
 
-    float grid[C3D_N_SUBBANDS][C3D_RD_NCAND];
+    float grid[C3D_N_SUBBANDS][C3D_RD_NCAND_LEGACY];
     for (unsigned i = 0; i < C3D_N_SUBBANDS; ++i) {
         float base = c3d_emit_baseline(s, ctx, i) * s->coeff_scale;
         float centre = q_seed * base;
         /* Factors: 1/8, 1/4, 1/2.5, 1/1.5, 1/1.1, 1.1, 1.5, 2.5, 4, 8. */
-        static const float mults[C3D_RD_NCAND] = {
+        static const float mults[C3D_RD_NCAND_LEGACY] = {
             1.0f/8.0f, 1.0f/4.0f, 1.0f/2.5f, 1.0f/1.5f, 1.0f/1.1f,
             1.1f, 1.5f, 2.5f, 4.0f, 8.0f
         };
-        for (unsigned j = 0; j < C3D_RD_NCAND; ++j) {
+        for (unsigned j = 0; j < C3D_RD_NCAND_LEGACY; ++j) {
             float t = centre * mults[j];
             if (t <= 0.0f) t = 1e-9f;
             grid[i][j] = t;
@@ -1927,10 +2140,10 @@ static void c3d_rd_allocate(c3d_encoder *s, const c3d_ctx *ctx,
 
     /* Pre-compute r_ij = rate(step_ij), d_ij = dist(step_ij).  Cached so
      * λ bisection is O(subbands × ncand × 1) lookups instead of rebuilds. */
-    double rate[C3D_N_SUBBANDS][C3D_RD_NCAND];
-    double dist[C3D_N_SUBBANDS][C3D_RD_NCAND];
+    double rate[C3D_N_SUBBANDS][C3D_RD_NCAND_LEGACY];
+    double dist[C3D_N_SUBBANDS][C3D_RD_NCAND_LEGACY];
     for (unsigned i = 0; i < C3D_N_SUBBANDS; ++i) {
-        for (unsigned j = 0; j < C3D_RD_NCAND; ++j) {
+        for (unsigned j = 0; j < C3D_RD_NCAND_LEGACY; ++j) {
             c3d_rd_estimate_subband(s, i, grid[i][j], /*alpha=*/0.375f,
                                     &rate[i][j], &dist[i][j]);
         }
@@ -1942,7 +2155,7 @@ static void c3d_rd_allocate(c3d_encoder *s, const c3d_ctx *ctx,
     /* Safe upper and lower brackets: pick coarsest and finest steps. */
     double rate_coarse = 0.0, rate_fine = 0.0;
     for (unsigned i = 0; i < C3D_N_SUBBANDS; ++i) {
-        rate_coarse += rate[i][C3D_RD_NCAND - 1];   /* coarsest = last grid slot */
+        rate_coarse += rate[i][C3D_RD_NCAND_LEGACY - 1];   /* coarsest = last grid slot */
         rate_fine   += rate[i][0];                   /* finest = first slot */
     }
     if (rate_fine <= target_bytes) {
@@ -1958,7 +2171,7 @@ static void c3d_rd_allocate(c3d_encoder *s, const c3d_ctx *ctx,
     if (rate_coarse >= target_bytes) {
         /* Target is hopelessly tight even at coarsest; pick coarsest. */
         for (unsigned i = 0; i < C3D_N_SUBBANDS; ++i)
-            s->allocator_steps[i] = grid[i][C3D_RD_NCAND - 1];
+            s->allocator_steps[i] = grid[i][C3D_RD_NCAND_LEGACY - 1];
         s->has_allocator_steps = true;
         if (getenv("C3D_RD_DEBUG"))
             fprintf(stderr, "RD: shortcut COARSE target=%.0f rate_fine=%.0f rate_coarse=%.0f\n",
@@ -1973,7 +2186,7 @@ static void c3d_rd_allocate(c3d_encoder *s, const c3d_ctx *ctx,
         for (unsigned i = 0; i < C3D_N_SUBBANDS; ++i) {
             unsigned best_j = 0;
             double   best_cost = dist[i][0] + lam * rate[i][0];
-            for (unsigned j = 1; j < C3D_RD_NCAND; ++j) {
+            for (unsigned j = 1; j < C3D_RD_NCAND_LEGACY; ++j) {
                 double c = dist[i][j] + lam * rate[i][j];
                 if (c < best_cost) { best_cost = c; best_j = j; }
             }
@@ -1991,7 +2204,7 @@ static void c3d_rd_allocate(c3d_encoder *s, const c3d_ctx *ctx,
     for (unsigned i = 0; i < C3D_N_SUBBANDS; ++i) {
         unsigned best_j = 0;
         double   best_cost = dist[i][0] + lam * rate[i][0];
-        for (unsigned j = 1; j < C3D_RD_NCAND; ++j) {
+        for (unsigned j = 1; j < C3D_RD_NCAND_LEGACY; ++j) {
             double c = dist[i][j] + lam * rate[i][j];
             if (c < best_cost) { best_cost = c; best_j = j; }
         }
@@ -2181,12 +2394,9 @@ size_t c3d_encoder_chunk_encode(c3d_encoder *e, const uint8_t *in,
                           - (double)C3D_CHUNK_FIXED_SIZE;
     if (target_bytes_d < 64.0) target_bytes_d = 64.0;
 
-    /* R-D allocator (§Q3) is gated off by default — first cut's rate
-     * estimate systematically undercounts by ~20 % on real scroll data
-     * and the distortion model is approximate, producing ratio drift +
-     * PSNR regression.  Scaffolding kept (c3d_rd_allocate, fine_prefix,
-     * rd_estimate_subband) for a careful second pass; enable via
-     * C3D_RD_ALLOCATOR=1 to experiment without rebuilding. */
+    /* Legacy fine-histogram R-D allocator (§Q3 v1) stays gated under
+     * C3D_RD_ALLOCATOR env — its rate estimate misses by ~20 % on real
+     * data.  The hybrid allocator below fires by default. */
     e->has_allocator_steps = false;
     if (getenv("C3D_RD_ALLOCATOR")) {
         c3d_rd_allocate(e, ctx, target_bytes_d);
@@ -2232,6 +2442,18 @@ size_t c3d_encoder_chunk_encode(c3d_encoder *e, const uint8_t *in,
             q = new_q;
         }
     }
+    /* Hybrid R-D allocator (§Q3 v2) — gated off by default (opt in with
+     * C3D_RD_HYBRID=1).  Inherits byte-target accuracy from the global-q
+     * bisection but still regresses PSNR at every ratio because the
+     * distortion metric (weighted coef-domain MSE + escape-bin mean-|q|
+     * approximation) doesn't exactly match pixel PSNR for bi-orthogonal
+     * CDF 9/7.  Scaffolding stays on main for future calibration work;
+     * see PLAN.md "Deferred". */
+    if (!e->has_allocator_steps && getenv("C3D_RD_HYBRID")) {
+        double budget = c3d_estimate_entropy_at_q(q, e, ctx);
+        c3d_rd_allocate_hybrid(e, ctx, budget, q);
+    }
+
     total = c3d_emit_entropy_at_q(q, e, ctx, out, out_cap);
     e->last_q = q;
     e->last_target_ratio = target_ratio;
