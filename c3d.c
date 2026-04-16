@@ -448,6 +448,53 @@ static size_t c3d_rans_enc_x8(const uint8_t *symbols,     /* each < 65 */
     return total;
 }
 
+/* Context-aware variant of c3d_rans_enc_x8: each symbol selects between
+ * tbl_z (lane's previous symbol was 0) and tbl_nz (non-zero).  Context is
+ * derived from sub_symbols[idx-8] (same lane, previous batch), which is
+ * already written during the forward quant pass. */
+static size_t c3d_rans_enc_x8_ctx(const uint8_t *symbols, size_t n_symbols,
+                                   const c3d_rans_tables *tbl_z,
+                                   const c3d_rans_tables *tbl_nz,
+                                   uint8_t *scratch, size_t scratch_size,
+                                   uint8_t *out, size_t out_cap)
+{
+    c3d_assert((n_symbols & 7u) == 0);
+    c3d_assert(scratch_size >= n_symbols * 2u + 32u);
+    (void)scratch_size;
+
+    uint8_t       *buf_end = scratch + scratch_size;
+    uint8_t       *buf_ptr = buf_end;
+    const uint8_t *buf_beg = scratch;
+
+    uint32_t states[C3D_RANS_N_STATES];
+    for (unsigned i = 0; i < C3D_RANS_N_STATES; ++i)
+        c3d_rans_enc_init(&states[i]);
+
+    const uint32_t ds = tbl_z->denom_shift;  /* both tables share denom_shift */
+
+    for (size_t i = n_symbols; i >= 8; i -= 8) {
+        /* Process 8 symbols per step (backward). */
+        for (unsigned lane = 8; lane-- > 0; ) {
+            size_t idx = i - 8 + lane;
+            bool ctx = (idx >= 8) ? (symbols[idx - 8] != 0) : false;
+            const c3d_rans_tables *t = ctx ? tbl_nz : tbl_z;
+            uint8_t s = symbols[idx];
+            const c3d_rans_sym *sym = &t->syms[s];
+            c3d_assert(sym->freq > 0);
+            c3d_rans_enc_put(&states[lane], &buf_ptr, buf_beg,
+                             sym->start, sym->freq, ds);
+        }
+    }
+
+    size_t renorm_bytes = (size_t)(buf_end - buf_ptr);
+    size_t total = 32u + renorm_bytes;
+    c3d_assert(total <= out_cap);
+    for (unsigned i = 0; i < C3D_RANS_N_STATES; ++i)
+        c3d_write_u32_le(out + 4u * i, states[i]);
+    memcpy(out + 32, buf_ptr, renorm_bytes);
+    return total;
+}
+
 /* Decode n_symbols from the packed rans block at `in[0..in_len)`; writes
  * symbols[0..n_symbols).  Panics on truncation.
  *
@@ -525,6 +572,59 @@ static void c3d_rans_dec_x8(const uint8_t *in, size_t in_len,
     #undef RENORM
 
     c3d_assert(r == r_e);
+}
+
+/* Context-aware variant of c3d_rans_dec_x8: uses 2 tables selected by
+ * lane-local context (was previous symbol on this lane zero?). */
+static void c3d_rans_dec_x8_ctx(const uint8_t *in, size_t in_len,
+                                const c3d_rans_tables *tbl_z,
+                                const c3d_rans_tables *tbl_nz,
+                                uint8_t *symbols, size_t n_symbols)
+{
+    c3d_assert(in_len >= 32 && (n_symbols & 7u) == 0);
+    uint32_t s0 = c3d_read_u32_le(in +  0);
+    uint32_t s1 = c3d_read_u32_le(in +  4);
+    uint32_t s2 = c3d_read_u32_le(in +  8);
+    uint32_t s3 = c3d_read_u32_le(in + 12);
+    uint32_t s4 = c3d_read_u32_le(in + 16);
+    uint32_t s5 = c3d_read_u32_le(in + 20);
+    uint32_t s6 = c3d_read_u32_le(in + 24);
+    uint32_t s7 = c3d_read_u32_le(in + 28);
+    const uint8_t *rd   = in + 32;
+    const uint8_t *r_e = in + in_len;
+
+    bool ctx0=0,ctx1=0,ctx2=0,ctx3=0,ctx4=0,ctx5=0,ctx6=0,ctx7=0;
+
+    #define DEC_CTX(SREF, OUT, CTX) do {                                       \
+        const c3d_rans_tables *t_ = (CTX) ? tbl_nz : tbl_z;                   \
+        const uint32_t M_ = (1u << t_->denom_shift) - 1u;                     \
+        const uint32_t ds_ = t_->denom_shift;                                 \
+        uint32_t st_ = (SREF);                                                \
+        uint32_t slot_ = st_ & M_;                                            \
+        uint32_t sym_ = t_->cum2sym[slot_];                                   \
+        c3d_assert(sym_ < 65);                                                \
+        (OUT) = (uint8_t)sym_;                                                 \
+        (SREF) = t_->syms[sym_].freq * (st_ >> ds_) + slot_                   \
+               - t_->syms[sym_].start;                                        \
+        while ((SREF) < C3D_RANS_BYTE_L) {                                    \
+            c3d_assert(rd < r_e);                                              \
+            (SREF) = ((SREF) << 8) | *rd++;                                   \
+        }                                                                      \
+        (CTX) = (sym_ != 0);                                                   \
+    } while (0)
+
+    for (size_t i = 0; i < n_symbols; i += 8) {
+        DEC_CTX(s0, symbols[i+0], ctx0);
+        DEC_CTX(s1, symbols[i+1], ctx1);
+        DEC_CTX(s2, symbols[i+2], ctx2);
+        DEC_CTX(s3, symbols[i+3], ctx3);
+        DEC_CTX(s4, symbols[i+4], ctx4);
+        DEC_CTX(s5, symbols[i+5], ctx5);
+        DEC_CTX(s6, symbols[i+6], ctx6);
+        DEC_CTX(s7, symbols[i+7], ctx7);
+    }
+    #undef DEC_CTX
+    c3d_assert(rd == r_e);
 }
 
 /* ========================================================================= *
@@ -1594,9 +1694,11 @@ static size_t c3d_encode_one_subband(
 
     /* Pass 1: quantize + symbol + escape + histogram. */
     uint32_t hist[65] = {0};
+    uint32_t hist_ctx[2][65] = {{0}, {0}};  /* [0]=after-zero, [1]=after-nonzero */
     size_t escape_pos = 0;
     size_t idx = 0;
     bool sign_pred = true;
+    bool lane_ctx[8] = {false,false,false,false,false,false,false,false};
     for (uint32_t z = sb->z0; z < sb->z0 + sb->side; ++z)
     for (uint32_t y = sb->y0; y < sb->y0 + sb->side; ++y)
     for (uint32_t x = sb->x0; x < sb->x0 + sb->side; ++x) {
@@ -1604,8 +1706,12 @@ static size_t c3d_encode_one_subband(
         int32_t qv = c3d_quant(c, step);
         uint32_t escape_mag;
         uint8_t sym = c3d_quant_to_symbol(qv, &escape_mag, &sign_pred);
-        sub_symbols[idx++] = sym;
+        sub_symbols[idx] = sym;
         hist[sym]++;
+        unsigned lane = idx & 7u;
+        hist_ctx[lane_ctx[lane] ? 1 : 0][sym]++;
+        lane_ctx[lane] = (sym != 0);
+        idx++;
         if (C3D_SYM_IS_ESCAPE(sym)) {
             escape_pos += c3d_leb128_encode(escape_mag, sub_escapes + escape_pos, 5);
         }
@@ -1647,18 +1753,68 @@ static size_t c3d_encode_one_subband(
         return 2;
     }
 
+    /* Estimate 2-table (lane-local context) rate vs 1-table rate.
+     * 2-table encodes each symbol conditioned on whether the same lane's
+     * previous symbol was zero; the two histograms are more concentrated
+     * than the joint, giving lower entropy — but cost 2 freq tables.
+     * Only use 2-table when the entropy savings outweigh the extra table. */
+    bool use_2table = false;
+    uint32_t ctx_freqs[2][65];
+    {
+        uint32_t n_z = 0, n_nz = 0;
+        for (unsigned k = 0; k < 65; ++k) { n_z += hist_ctx[0][k]; n_nz += hist_ctx[1][k]; }
+        double bits_1t = 0.0;
+        { double inv = 1.0 / (double)n;
+          for (unsigned k = 0; k < 65; ++k) {
+              if (!hist[k]) continue;
+              double p = (double)hist[k] * inv;
+              bits_1t += -(double)hist[k] * log2(p);
+          }
+        }
+        double bits_2t = 0.0;
+        if (n_z > 0) {
+            double inv_z = 1.0 / (double)n_z;
+            for (unsigned k = 0; k < 65; ++k) {
+                if (!hist_ctx[0][k]) continue;
+                double p = (double)hist_ctx[0][k] * inv_z;
+                bits_2t += -(double)hist_ctx[0][k] * log2(p);
+            }
+        }
+        if (n_nz > 0) {
+            double inv_nz = 1.0 / (double)n_nz;
+            for (unsigned k = 0; k < 65; ++k) {
+                if (!hist_ctx[1][k]) continue;
+                double p = (double)hist_ctx[1][k] * inv_nz;
+                bits_2t += -(double)hist_ctx[1][k] * log2(p);
+            }
+        }
+        /* Overhead of 2nd freq table ≈ 2 + 3*nnz bytes.  Plus 1 ctx_mode byte. */
+        unsigned nnz_z = 0, nnz_nz = 0;
+        for (unsigned k = 0; k < 65; ++k) {
+            if (hist_ctx[0][k]) nnz_z++;
+            if (hist_ctx[1][k]) nnz_nz++;
+        }
+        double overhead_2t = 1.0 + (2.0 + 3.0*(double)nnz_z) + (2.0 + 3.0*(double)nnz_nz);
+        unsigned nnz_1t = 0;
+        for (unsigned k = 0; k < 65; ++k) if (hist[k]) nnz_1t++;
+        double overhead_1t = 1.0 + (2.0 + 3.0*(double)nnz_1t);
+        double cost_1t = bits_1t / 8.0 + overhead_1t;
+        double cost_2t = bits_2t / 8.0 + overhead_2t;
+        use_2table = (cost_2t < cost_1t - 8.0) && (n_z > 0) && (n_nz > 0);
+    }
+    if (use_2table) {
+        c3d_normalise_freqs(hist_ctx[0], denom_shift, ctx_freqs[0]);
+        c3d_normalise_freqs(hist_ctx[1], denom_shift, ctx_freqs[1]);
+    }
+
     /* Pick the frequency source per-subband.  When external freqs are
-     * available, compare actual byte cost against the SELF path:
-     *   ext_bytes  = cross-entropy(hist, external) / 8
-     *   self_bytes = Shannon(hist)/8 + ftable_serialised_size
-     * Pick the tighter one.  Without this comparison EXTERNAL can regress
-     * at moderate ratios when cross-entropy penalty (chunk's distribution
-     * drifts from the trained ctx) exceeds the ftable-bytes savings. */
+     * available, compare actual byte cost against the SELF path.
+     * 2-table mode overrides both (external ctx doesn't support it yet). */
     uint32_t local_freqs[65];
     const uint32_t *freqs_to_use;
     bool use_external = false;
     c3d_normalise_freqs(hist, denom_shift, local_freqs);
-    if (external_freqs) {
+    if (external_freqs && !use_2table) {
         bool ext_covers = true;
         for (unsigned k = 0; k < 65; ++k) {
             if (hist[k] > 0 && external_freqs[k] == 0) { ext_covers = false; break; }
@@ -1699,12 +1855,27 @@ static size_t c3d_encode_one_subband(
     size_t ftable_size_pos = w;
     w += 2;
 
-    /* [freq_table bytes] — only when falling back to in-band. */
+    /* [freq_table region] layout:
+     *   [ctx_mode u8] — 0 = 1 table, 1 = 2-table lane-local ctx
+     *   [freq_table_0 ...]
+     *   [freq_table_1 ...] (only if ctx_mode == 1)
+     * External mode: ftable_bytes = 0 (no ctx_mode byte either). */
     size_t ftable_bytes;
     if (use_external) {
         ftable_bytes = 0;
     } else {
-        ftable_bytes = c3d_freqs_serialise(denom_shift, local_freqs, out + w, out_cap - w);
+        out[w] = use_2table ? 1u : 0u;
+        size_t ft_w = 1;
+        if (use_2table) {
+            ft_w += c3d_freqs_serialise(denom_shift, ctx_freqs[0],
+                                        out + w + ft_w, out_cap - w - ft_w);
+            ft_w += c3d_freqs_serialise(denom_shift, ctx_freqs[1],
+                                        out + w + ft_w, out_cap - w - ft_w);
+        } else {
+            ft_w += c3d_freqs_serialise(denom_shift, local_freqs,
+                                        out + w + ft_w, out_cap - w - ft_w);
+        }
+        ftable_bytes = ft_w;
     }
     c3d_assert(ftable_bytes <= 65535);
     c3d_write_u16_le(out + ftable_size_pos, (uint16_t)ftable_bytes);
@@ -1716,11 +1887,24 @@ static size_t c3d_encode_one_subband(
     size_t rans_size_pos = w;
     w += 4;
 
-    /* [rans_header 32 B][rans_renorm variable] — emitted by c3d_rans_enc_x8. */
-    size_t rans_bytes = c3d_rans_enc_x8(
-        sub_symbols, n, &tbl,
-        rans_scratch, rans_scratch_size,
-        out + w, out_cap - w);
+    /* [rans_header 32 B][rans_renorm variable] */
+    size_t rans_bytes;
+    if (use_2table) {
+        /* Build 2 rANS tables and encode with per-lane context. */
+        c3d_rans_tables tbl_z, tbl_nz;
+        c3d_rans_build_tables(&tbl_z,  denom_shift, ctx_freqs[0], 65);
+        c3d_rans_build_tables(&tbl_nz, denom_shift, ctx_freqs[1], 65);
+        /* c3d_rans_enc_x8 with lane-local context selection. */
+        rans_bytes = c3d_rans_enc_x8_ctx(
+            sub_symbols, n, &tbl_z, &tbl_nz,
+            rans_scratch, rans_scratch_size,
+            out + w, out_cap - w);
+    } else {
+        rans_bytes = c3d_rans_enc_x8(
+            sub_symbols, n, &tbl,
+            rans_scratch, rans_scratch_size,
+            out + w, out_cap - w);
+    }
     c3d_write_u32_le(out + rans_size_pos, (uint32_t)rans_bytes);
     w += rans_bytes;
 
@@ -1885,8 +2069,11 @@ static double c3d_estimate_one_subband_bytes(
 
     size_t n = (size_t)sb->side * sb->side * sb->side;
     uint32_t hist[65] = {0};
+    uint32_t hist_ctx[2][65] = {{0},{0}};
     size_t escape_bytes = 0;
     bool sign_pred_est = true;
+    bool lane_ctx_est[8] = {false,false,false,false,false,false,false,false};
+    size_t est_idx = 0;
     for (uint32_t z = sb->z0; z < sb->z0 + sb->side; ++z)
     for (uint32_t y = sb->y0; y < sb->y0 + sb->side; ++y)
     for (uint32_t x = sb->x0; x < sb->x0 + sb->side; ++x) {
@@ -1895,6 +2082,10 @@ static double c3d_estimate_one_subband_bytes(
         uint32_t escape_mag;
         uint8_t sym = c3d_quant_to_symbol(qv, &escape_mag, &sign_pred_est);
         hist[sym]++;
+        unsigned lane = est_idx & 7u;
+        hist_ctx[lane_ctx_est[lane] ? 1 : 0][sym]++;
+        lane_ctx_est[lane] = (sym != 0);
+        est_idx++;
         if (C3D_SYM_IS_ESCAPE(sym)) {
             uint32_t v = escape_mag;
             do { escape_bytes++; v >>= 7; } while (v);
@@ -1904,8 +2095,7 @@ static double c3d_estimate_one_subband_bytes(
     /* All-zero subband fast path matches c3d_encode_one_subband. */
     if (hist[0] == n) return 2.0;
 
-    /* Compute rate for both SELF and EXTERNAL paths, pick the cheaper —
-     * mirrors the smart fallback in c3d_encode_one_subband. */
+    /* Compute 1-table rate. */
     double inv_n = 1.0 / (double)n;
     double self_bits = 0.0;
     for (unsigned k = 0; k < 65; ++k) {
@@ -1915,8 +2105,27 @@ static double c3d_estimate_one_subband_bytes(
     }
     unsigned nnz = 0;
     for (unsigned k = 0; k < 65; ++k) if (hist[k]) nnz++;
-    double self_ftable = 2.0 + 3.0 * (double)nnz;
+    double self_ftable = 1.0 + 2.0 + 3.0 * (double)nnz;  /* ctx_mode + ftable */
     double self_total = 2.0 + self_ftable + 8.0 + self_bits / 8.0 + 32.0 + (double)escape_bytes;
+
+    /* Compute 2-table (lane-local context) rate; pick min. */
+    {
+        uint32_t n_z = 0, n_nz = 0;
+        for (unsigned k = 0; k < 65; ++k) { n_z += hist_ctx[0][k]; n_nz += hist_ctx[1][k]; }
+        if (n_z > 0 && n_nz > 0) {
+            double bits_2t = 0.0;
+            double inv_z = 1.0/(double)n_z, inv_nz = 1.0/(double)n_nz;
+            for (unsigned k = 0; k < 65; ++k) {
+                if (hist_ctx[0][k]) { double p=(double)hist_ctx[0][k]*inv_z; bits_2t += -(double)hist_ctx[0][k]*log2(p); }
+                if (hist_ctx[1][k]) { double p=(double)hist_ctx[1][k]*inv_nz; bits_2t += -(double)hist_ctx[1][k]*log2(p); }
+            }
+            unsigned nnz_z=0, nnz_nz=0;
+            for (unsigned k=0;k<65;++k) { if(hist_ctx[0][k])nnz_z++; if(hist_ctx[1][k])nnz_nz++; }
+            double ft2 = 1.0 + (2.0+3.0*(double)nnz_z) + (2.0+3.0*(double)nnz_nz);
+            double total_2t = 2.0 + ft2 + 8.0 + bits_2t/8.0 + 32.0 + (double)escape_bytes;
+            if (total_2t < self_total) self_total = total_2t;
+        }
+    }
 
     if (external_freqs) {
         bool ext_covers = true;
@@ -2671,18 +2880,30 @@ static void c3d_decode_one_subband(
 
     uint32_t denom_shift;
     uint32_t local_freqs[65];
-    const uint32_t *freqs_to_use;
+    bool ctx_2table = false;
+    uint32_t ctx_freqs_z[65], ctx_freqs_nz[65];
+
     if (ftable_bytes == 0) {
         /* EXTERNAL: require ctx to have provided tables. */
         c3d_assert(external_freqs != NULL);
-        freqs_to_use = external_freqs;
-        denom_shift  = external_denom_shift;
+        denom_shift = external_denom_shift;
     } else {
         c3d_assert(r + ftable_bytes <= in_size);
-        size_t consumed = c3d_freqs_parse(in + r, ftable_bytes, &denom_shift, local_freqs);
-        c3d_assert(consumed == ftable_bytes);
-        freqs_to_use = local_freqs;
-        r += ftable_bytes;
+        /* First byte = ctx_mode: 0 = single table, 1 = 2-table lane-local. */
+        uint8_t ctx_mode = in[r];
+        r++;
+        if (ctx_mode == 1) {
+            ctx_2table = true;
+            size_t c1 = c3d_freqs_parse(in + r, ftable_bytes - 1, &denom_shift, ctx_freqs_z);
+            r += c1;
+            uint32_t ds2;
+            size_t c2 = c3d_freqs_parse(in + r, ftable_bytes - 1 - c1, &ds2, ctx_freqs_nz);
+            c3d_assert(ds2 == denom_shift);
+            r += c2;
+        } else {
+            size_t consumed = c3d_freqs_parse(in + r, ftable_bytes - 1, &denom_shift, local_freqs);
+            r += consumed;
+        }
     }
 
     /* n_symbols + rans_block_size */
@@ -2692,16 +2913,18 @@ static void c3d_decode_one_subband(
     c3d_assert(n_symbols == n);
     c3d_assert(r + rans_block_size <= in_size);
 
-    const c3d_rans_tables *tbl_for_decode;
-    if (cached_external_tbl && ftable_bytes == 0) {
-        /* Re-use the pre-built EXTERNAL table for this subband.  Saves the
-         * per-chunk cum2sym fill (~4-16 K writes). */
-        tbl_for_decode = cached_external_tbl;
+    if (ctx_2table) {
+        c3d_rans_tables tbl_z, tbl_nz;
+        c3d_rans_build_tables(&tbl_z,  denom_shift, ctx_freqs_z, 65);
+        c3d_rans_build_tables(&tbl_nz, denom_shift, ctx_freqs_nz, 65);
+        c3d_rans_dec_x8_ctx(in + r, rans_block_size, &tbl_z, &tbl_nz, sub_symbols, n);
+    } else if (cached_external_tbl && ftable_bytes == 0) {
+        c3d_rans_dec_x8(in + r, rans_block_size, cached_external_tbl, sub_symbols, n);
     } else {
-        c3d_rans_build_tables(tbl_scratch, denom_shift, freqs_to_use, 65);
-        tbl_for_decode = tbl_scratch;
+        const uint32_t *ftu = (ftable_bytes == 0) ? external_freqs : local_freqs;
+        c3d_rans_build_tables(tbl_scratch, denom_shift, ftu, 65);
+        c3d_rans_dec_x8(in + r, rans_block_size, tbl_scratch, sub_symbols, n);
     }
-    c3d_rans_dec_x8(in + r, rans_block_size, tbl_for_decode, sub_symbols, n);
     r += rans_block_size;
 
     /* escape_stream spans [r..in_size). */
