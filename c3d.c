@@ -1400,6 +1400,8 @@ static void c3d_add_parent_prediction(float *buf,
 
 #define C3D_CHUNK_FIXED_SIZE 388u
 #define C3D_CHUNK_ALPHA_OFFSET 352u
+#define C3D_CHUNK_FLAGS_OFFSET 16u
+#define C3D_FLAG_LL_PREDICTED  0x01u   /* LL_5 is a residual vs ctx->ll_reference */
 
 /* uint8 <-> α float in [0.40, 0.50] — clamp + linear map.  Q1 writes one
  * byte per subband; decoder reads it back for the Laplacian-optimal
@@ -1558,6 +1560,15 @@ struct c3d_ctx {
     bool     has_freq_tables;
     uint32_t denom_shifts[C3D_N_SUBBANDS];
     uint32_t freqs[C3D_N_SUBBANDS][65];
+
+    /* §T1b LL_5 inter-chunk reference: 8³=512 f32 coefficients averaged
+     * across the training corpus.  When set, encoders subtract this
+     * reference from their own LL_5 (subband 0) before quantisation,
+     * lowering the LL_5 rate by ~30-50% on smooth CT data.  Decoder
+     * adds it back after dequant.  Applied only when chunk header
+     * flags bit 0 is set. */
+    bool     has_ll_reference;
+    float    ll_reference[512];        /* 8 × 8 × 8 — matches LL_5 size */
 };
 
 /* Number of subbands required to decode each LOD (prefix of canonical order). */
@@ -1621,6 +1632,11 @@ struct c3d_encoder {
      * directly instead of step = q*baseline*coeff_scale. */
     float    allocator_steps[C3D_N_SUBBANDS];
     bool     has_allocator_steps;
+
+    /* §T1b — set by prepare_chunk when LL_5 reference was actually
+     * subtracted (prediction helped for this chunk).  Read by the
+     * outer encode function to set the chunk header flag. */
+    bool     ll_prediction_active;
 };
 
 struct c3d_decoder {
@@ -1679,7 +1695,7 @@ void c3d_decoder_free(c3d_decoder *d) {
  * Returns true if the chunk is nonempty (needs entropy payload); false if
  * uniform-after-centering (just emit the 352 B header with all-zero tables). */
 static bool c3d_prepare_chunk(const uint8_t *in, uint8_t *out,
-                              c3d_encoder *s,
+                              c3d_encoder *s, const c3d_ctx *ctx,
                               float *out_dc_offset, float *out_coeff_scale)
 {
     /* Header skeleton. */
@@ -1721,6 +1737,50 @@ static bool c3d_prepare_chunk(const uint8_t *in, uint8_t *out,
         }
         s->max_abs_per_subband[i] = mx;
         if (mx > max_abs) max_abs = mx;
+    }
+
+    /* §T1b — LL_5 inter-chunk reference subtraction.  Runs AFTER the
+     * max_abs scan so that coeff_scale reflects the pre-subtraction
+     * magnitudes (otherwise zeroing LL_5 would drop coeff_scale and
+     * oversquash every other subband's step).
+     *
+     * Applied only when the residual is actually smaller than the raw
+     * LL_5 (opportunistic): for heterogeneous corpora the corpus-average
+     * reference is a poor match, and subtracting would inflate the
+     * residual vs the original.  The encoder signals success by writing
+     * the C3D_FLAG_LL_PREDICTED flag at the caller. */
+    if (ctx && ctx->has_ll_reference) {
+        size_t k = 0;
+        float mx_pred = 0.0f;
+        float scratch_ll[512];
+        for (unsigned z = 0; z < 8; ++z)
+        for (unsigned y = 0; y < 8; ++y)
+        for (unsigned x = 0; x < 8; ++x) {
+            size_t pos = z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + x;
+            float resid = s->coeff_buf[pos] - ctx->ll_reference[k];
+            scratch_ll[k] = resid;
+            float a = fabsf(resid);
+            if (a > mx_pred) mx_pred = a;
+            k++;
+        }
+        if (mx_pred < s->max_abs_per_subband[0]) {
+            /* Prediction helps — commit the residuals and flag via
+             * s->ll_prediction_active so emit_entropy_at_q's caller can
+             * set the chunk header flag. */
+            k = 0;
+            for (unsigned z = 0; z < 8; ++z)
+            for (unsigned y = 0; y < 8; ++y)
+            for (unsigned x = 0; x < 8; ++x) {
+                s->coeff_buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + x]
+                    = scratch_ll[k++];
+            }
+            s->max_abs_per_subband[0] = mx_pred;
+            s->ll_prediction_active = true;
+        } else {
+            s->ll_prediction_active = false;
+        }
+    } else {
+        s->ll_prediction_active = false;
     }
 
     c3d_write_f32_le(out + 8, dc_offset);
@@ -2747,8 +2807,9 @@ size_t c3d_encoder_chunk_encode_at_q(c3d_encoder *e, const uint8_t *in, float q,
     e->has_dyn_baselines = false;
 
     float dc, cs;
-    bool has_entropy = c3d_prepare_chunk(in, out, e, &dc, &cs);
+    bool has_entropy = c3d_prepare_chunk(in, out, e, ctx, &dc, &cs);
     c3d_write_ctx_header_fields(out, ctx);
+    if (e->ll_prediction_active) out[C3D_CHUNK_FLAGS_OFFSET] |= C3D_FLAG_LL_PREDICTED;
     if (!has_entropy) return C3D_CHUNK_FIXED_SIZE;
     return c3d_emit_entropy_at_q(q, e, ctx, out, out_cap);
 }
@@ -2787,8 +2848,9 @@ size_t c3d_encoder_chunk_encode(c3d_encoder *e, const uint8_t *in,
     e->has_dyn_baselines = true;
 
     float dc, cs;
-    bool has_entropy = c3d_prepare_chunk(in, out, e, &dc, &cs);
+    bool has_entropy = c3d_prepare_chunk(in, out, e, ctx, &dc, &cs);
     c3d_write_ctx_header_fields(out, ctx);
+    if (e->ll_prediction_active) out[C3D_CHUNK_FLAGS_OFFSET] |= C3D_FLAG_LL_PREDICTED;
     size_t total;
     if (!has_entropy) {
         return C3D_CHUNK_FIXED_SIZE;
@@ -3243,6 +3305,18 @@ void c3d_decoder_chunk_decode_lod(c3d_decoder *d,
                                ext_freqs, ext_ds,
                                d->coeff_buf, &sb, d->sub_symbols, &tbl,
                                cached_ext ? &cached_ext[s] : NULL);
+    }
+
+    /* §T1b — add LL_5 reference back when the chunk header flags it. */
+    if ((in[C3D_CHUNK_FLAGS_OFFSET] & C3D_FLAG_LL_PREDICTED) && ctx
+        && ctx->has_ll_reference) {
+        size_t k = 0;
+        for (unsigned z = 0; z < 8; ++z)
+        for (unsigned y = 0; y < 8; ++y)
+        for (unsigned x = 0; x < 8; ++x) {
+            d->coeff_buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + x]
+                += ctx->ll_reference[k++];
+        }
     }
 
     unsigned n_synth = C3D_N_DWT_LEVELS - lod;
@@ -3731,6 +3805,7 @@ size_t c3d_ctx_max_size(void) { return 65535; }
 #define C3D_TAG_LAPLACIAN_ALPHA     1u
 #define C3D_TAG_QUANTIZER_BASELINE  2u
 #define C3D_TAG_SUBBAND_FREQ_TABLES 3u
+#define C3D_TAG_LL_REFERENCE        4u   /* 512 × f32 = 2048 B = 512 quads */
 /* struct c3d_ctx defined in §G above. */
 
 /* --- Serialization helpers ----------------------------------------------- */
@@ -3765,6 +3840,12 @@ static size_t c3d_ctx_write_body(const c3d_ctx *ctx, uint8_t *out, size_t out_ca
         w = c3d_write_tlv_header(out, out_cap, w, C3D_TAG_QUANTIZER_BASELINE, 36);
         for (unsigned i = 0; i < C3D_N_SUBBANDS; ++i) {
             c3d_write_f32_le(out + w, ctx->quantizer_baseline[i]); w += 4;
+        }
+    }
+    if (ctx->has_ll_reference) {
+        w = c3d_write_tlv_header(out, out_cap, w, C3D_TAG_LL_REFERENCE, 512);
+        for (unsigned i = 0; i < 512; ++i) {
+            c3d_write_f32_le(out + w, ctx->ll_reference[i]); w += 4;
         }
     }
     if (ctx->has_freq_tables) {
@@ -3860,6 +3941,13 @@ c3d_ctx *c3d_ctx_parse(const uint8_t *in, size_t in_len) {
                 ctx->quantizer_baseline[i] = c3d_read_f32_le(v + 4 * i);
             }
             break;
+        case C3D_TAG_LL_REFERENCE:
+            c3d_assert(vbytes == 512u * 4u);
+            ctx->has_ll_reference = true;
+            for (unsigned i = 0; i < 512; ++i) {
+                ctx->ll_reference[i] = c3d_read_f32_le(v + 4 * i);
+            }
+            break;
         case C3D_TAG_SUBBAND_FREQ_TABLES: {
             ctx->has_freq_tables = true;
             size_t rr = 0;
@@ -3894,6 +3982,13 @@ struct c3d_ctx_builder {
      * fixed reference quantizer scalar (q_ref). */
     uint32_t histograms[C3D_N_SUBBANDS][65];
     float    q_ref;
+
+    /* §T1b — running sum of LL_5 coefficients across observed chunks.
+     * At builder_finish we divide by n_observed_nonempty to get the
+     * corpus-average LL_5 reference that chunks use for inter-chunk
+     * prediction. */
+    double   ll_sum[512];
+    uint64_t ll_n;
 };
 
 /* A moderate compression point used by the builder when accumulating histograms.
@@ -3918,8 +4013,20 @@ void c3d_ctx_builder_observe_chunk(c3d_ctx_builder *b, const uint8_t *in) {
     c3d_encoder *e = c3d_encoder_new();
     uint8_t hdr_scratch[C3D_CHUNK_FIXED_SIZE];
     float dc, cs;
-    bool nonempty = c3d_prepare_chunk(in, hdr_scratch, e, &dc, &cs);
+    bool nonempty = c3d_prepare_chunk(in, hdr_scratch, e, NULL, &dc, &cs);
     if (nonempty) {
+        /* §T1b — accumulate the LL_5 subband (8³ block at origin) for
+         * the corpus-average reference.  coeff_buf has the raw post-DWT
+         * coefficients since ctx was NULL in prepare_chunk. */
+        size_t k = 0;
+        for (unsigned z = 0; z < 8; ++z)
+        for (unsigned y = 0; y < 8; ++y)
+        for (unsigned x = 0; x < 8; ++x) {
+            b->ll_sum[k++] += (double)e->coeff_buf[
+                z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + x];
+        }
+        b->ll_n++;
+
         for (unsigned sidx = 0; sidx < C3D_N_SUBBANDS; ++sidx) {
             c3d_subband_info sb;
             c3d_subband_info_of(sidx, &sb);
@@ -3949,6 +4056,17 @@ c3d_ctx *c3d_ctx_builder_finish(c3d_ctx_builder *b, bool include_freq_tables) {
     c3d_assert(b);
     c3d_ctx *ctx = calloc(1, sizeof *ctx);
     c3d_assert(ctx);
+
+    /* §T1b — corpus-average LL_5 reference (enabled whenever any nonempty
+     * chunk was observed).  Applied at encode/decode time iff the chunk
+     * header sets C3D_FLAG_LL_PREDICTED. */
+    if (b->ll_n > 0) {
+        ctx->has_ll_reference = true;
+        double inv = 1.0 / (double)b->ll_n;
+        for (unsigned i = 0; i < 512; ++i) {
+            ctx->ll_reference[i] = (float)(b->ll_sum[i] * inv);
+        }
+    }
 
     if (include_freq_tables && b->n_observed > 0) {
         ctx->has_freq_tables = true;
