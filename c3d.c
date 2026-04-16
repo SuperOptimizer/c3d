@@ -1798,12 +1798,17 @@ static size_t c3d_encode_one_subband(
         return 2;
     }
 
-    /* Pass 1: quantize + symbol + escape + histogram. */
+    /* Pass 1: quantize + symbol + escape + histogram.
+     * §T1c spatial sign prediction: prev_sign_zy[(y-y0)*side + (x-x0)]
+     * tracks the last non-zero sign seen at this (y, x) column as we
+     * iterate z.  Each new (z, y, x) predicts from (z-1, y, x) — wavelet
+     * coefficients in CT data correlate strongly across slice (z) so
+     * sign prediction accuracy improves vs the old raster-prev scheme. */
     uint32_t hist[65] = {0};
     uint32_t hist_ctx[2][65] = {{0}, {0}};  /* [0]=after-zero, [1]=after-nonzero */
     size_t escape_pos = 0;
     size_t idx = 0;
-    bool sign_pred = true;
+    bool prev_sign_zy[128 * 128] = {0};   /* max side = 128 */
     bool lane_ctx[8] = {false,false,false,false,false,false,false,false};
     for (uint32_t z = sb->z0; z < sb->z0 + sb->side; ++z)
     for (uint32_t y = sb->y0; y < sb->y0 + sb->side; ++y)
@@ -1811,7 +1816,8 @@ static size_t c3d_encode_one_subband(
         float c = coeff_buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + x];
         int32_t qv = c3d_quant(c, step, dz_half);
         uint32_t escape_mag;
-        uint8_t sym = c3d_quant_to_symbol(qv, &escape_mag, &sign_pred);
+        bool *sp = &prev_sign_zy[(y - sb->y0) * sb->side + (x - sb->x0)];
+        uint8_t sym = c3d_quant_to_symbol(qv, &escape_mag, sp);
         sub_symbols[idx] = sym;
         hist[sym]++;
         unsigned lane = idx & 7u;
@@ -2063,7 +2069,7 @@ static double c3d_estimate_one_subband_rd(
      * can re-compute distortion at α* without a second scan. */
     double sumabs_bin[65] = {0};
     double sumabs2_bin[65] = {0};
-    bool sign_pred_rd = true;
+    bool prev_sign_zy[128 * 128] = {0};
     for (uint32_t z = sb->z0; z < sb->z0 + sb->side; ++z)
     for (uint32_t y = sb->y0; y < sb->y0 + sb->side; ++y)
     for (uint32_t x = sb->x0; x < sb->x0 + sb->side; ++x) {
@@ -2071,7 +2077,8 @@ static double c3d_estimate_one_subband_rd(
         float ac = c < 0.0f ? -c : c;
         int32_t qv = c3d_quant(c, step, dz_half);
         uint32_t escape_mag;
-        uint8_t sym = c3d_quant_to_symbol(qv, &escape_mag, &sign_pred_rd);
+        bool *sp = &prev_sign_zy[(y - sb->y0) * sb->side + (x - sb->x0)];
+        uint8_t sym = c3d_quant_to_symbol(qv, &escape_mag, sp);
         hist[sym]++;
         sumabs_bin[sym]  += (double)ac;
         sumabs2_bin[sym] += (double)ac * (double)ac;
@@ -2179,7 +2186,7 @@ static double c3d_estimate_one_subband_bytes(
     uint32_t hist[65] = {0};
     uint32_t hist_ctx[2][65] = {{0},{0}};
     size_t escape_bytes = 0;
-    bool sign_pred_est = true;
+    bool prev_sign_zy[128 * 128] = {0};
     bool lane_ctx_est[8] = {false,false,false,false,false,false,false,false};
     size_t est_idx = 0;
     for (uint32_t z = sb->z0; z < sb->z0 + sb->side; ++z)
@@ -2188,7 +2195,8 @@ static double c3d_estimate_one_subband_bytes(
         float c = coeff_buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + x];
         int32_t qv = c3d_quant(c, step, dz_half);
         uint32_t escape_mag;
-        uint8_t sym = c3d_quant_to_symbol(qv, &escape_mag, &sign_pred_est);
+        bool *sp = &prev_sign_zy[(y - sb->y0) * sb->side + (x - sb->x0)];
+        uint8_t sym = c3d_quant_to_symbol(qv, &escape_mag, sp);
         hist[sym]++;
         unsigned lane = est_idx & 7u;
         hist_ctx[lane_ctx_est[lane] ? 1 : 0][sym]++;
@@ -3070,7 +3078,7 @@ static void c3d_decode_one_subband(
 
     /* Dequantize + scatter into coeff_buf (sign-predictive symbols). */
     float dz_half = c3d_dz_half_for_kind(sb->kind, step);
-    bool sign_pred_dec = true;
+    bool prev_sign_zy[128 * 128] = {0};
     size_t idx = 0;
     for (uint32_t z = sb->z0; z < sb->z0 + sb->side; ++z)
     for (uint32_t y = sb->y0; y < sb->y0 + sb->side; ++y)
@@ -3085,7 +3093,8 @@ static void c3d_decode_one_subband(
             esc_ptr += c;
             esc_remaining -= c;
         }
-        int32_t qv = c3d_symbol_to_quant(sym, escape_mag, &sign_pred_dec);
+        bool *sp = &prev_sign_zy[(y - sb->y0) * sb->side + (x - sb->x0)];
+        int32_t qv = c3d_symbol_to_quant(sym, escape_mag, sp);
         coeff_buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + x]
             = c3d_dequant(qv, step, dz_half, alpha);
     }
@@ -3871,14 +3880,15 @@ void c3d_ctx_builder_observe_chunk(c3d_ctx_builder *b, const uint8_t *in) {
              * same space. */
             float step = b->q_ref * c3d_subband_baseline(sidx) * e->coeff_scale;
             float dz_half = c3d_dz_half_for_kind(sb.kind, step);
-            bool sign_pred_obs = true;
+            bool prev_sign_zy[128 * 128] = {0};
             for (uint32_t z = sb.z0; z < sb.z0 + sb.side; ++z)
             for (uint32_t y = sb.y0; y < sb.y0 + sb.side; ++y)
             for (uint32_t x = sb.x0; x < sb.x0 + sb.side; ++x) {
                 float c = e->coeff_buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + x];
                 int32_t qv = c3d_quant(c, step, dz_half);
                 uint32_t esc_unused;
-                uint8_t sym = c3d_quant_to_symbol(qv, &esc_unused, &sign_pred_obs);
+                bool *sp = &prev_sign_zy[(y - sb.y0) * sb.side + (x - sb.x0)];
+                uint8_t sym = c3d_quant_to_symbol(qv, &esc_unused, sp);
                 b->histograms[sidx][sym]++;
             }
         }
