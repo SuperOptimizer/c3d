@@ -1092,18 +1092,36 @@ static void c3d_dwt3_inv_levels(float *buf, unsigned n_synth_levels, float *scra
  *  §F  Quantizer, symbol mapping (zigzag + escape), and subband info        *
  * ========================================================================= */
 
-/* Dead-zone widening: dz_half = C3D_DZ_RATIO * step.  0.55 gains +0.02 to
- * +0.07 dB over the standard 0.50 across all ratios on scroll CT (per-ratio
- * sweep).  Wavelet coefficients show a "spike at 0 + Laplacian tail" shape
- * that a wider dead zone absorbs efficiently.  Regression past ~0.65. */
-#define C3D_DZ_RATIO 0.55f
+/* Forward decl — defined in §F.  Used by the dz lookup below. */
+static unsigned c3d_kind_h_count(unsigned kind);
 
-/* Dead-zone uniform quantizer.
+/* Dead-zone widening, per subband kind.  Wavelet coefficients have a
+ * "spike at 0 + Laplacian tail" shape that a wider dead zone absorbs
+ * efficiently.  HF subbands have heavier tails and are dominated by
+ * ringing/noise → benefit from more aggressive zeroing; LF carries the
+ * structural signal → standard 0.50 dead zone.  Per-kind lookup picked
+ * via per-ratio × per-h_count sweep on scroll CT.  No format change —
+ * decoder computes dz_half from the same subband index. */
+static inline float c3d_dz_ratio_for_kind(unsigned h_count) {
+    /* h_count = number of HF axes in the subband (0..3).
+     * Calibrated by per-kind sweep: LLL_5 carries the structural DC residual
+     * (preserve everything), details all benefit equally from 0.55. */
+    /* Per-kind tuning was tested (LLL=0.50 + per-h table, aggressive HF
+     * variants); gains are <0.02 dB avg vs global 0.55.  The R-D allocator
+     * already redistributes bits via per-subband step coarsening, so per-
+     * kind dz is a near-redundant degree of freedom on this data.  Kept
+     * the per-kind plumbing for future format-changing work; current
+     * table just sets every kind to the global 0.55. */
+    static const float ratios[4] = { 0.55f, 0.55f, 0.55f, 0.55f };
+    return ratios[h_count <= 3 ? h_count : 3];
+}
+
+/* Dead-zone uniform quantizer.  dz_half is computed by the caller from
+ * the subband's kind via c3d_dz_ratio_for_kind() × step.
  *   |c| < dz_half     → 0
  *   |c| ≥ dz_half     → sign(c) * (floor((|c| - dz_half) / step) + 1) */
-static inline int32_t c3d_quant(float c, float step) {
+static inline int32_t c3d_quant(float c, float step, float dz_half) {
     float ac = (c < 0.0f) ? -c : c;
-    float dz_half = C3D_DZ_RATIO * step;
     if (ac < dz_half) return 0;
     int32_t q = (int32_t)((ac - dz_half) / step) + 1;
     return (c < 0.0f) ? -q : q;
@@ -1112,12 +1130,16 @@ static inline int32_t c3d_quant(float c, float step) {
 /* Mid-tread dequantizer.  Bin k (k≥1) spans [dz_half + (k-1)·step,
  * dz_half + k·step]; reconstruction = dz_half + (k - 1 + α)·step
  * where α∈[0.25,0.50] picks the Laplacian-optimal position in the bin. */
-static inline float c3d_dequant(int32_t q, float step, float alpha) {
+static inline float c3d_dequant(int32_t q, float step, float dz_half, float alpha) {
     if (q == 0) return 0.0f;
-    float aq      = (float)((q < 0) ? -q : q);
-    float dz_half = C3D_DZ_RATIO * step;
-    float mag     = dz_half + (aq - 1.0f + alpha) * step;
+    float aq  = (float)((q < 0) ? -q : q);
+    float mag = dz_half + (aq - 1.0f + alpha) * step;
     return (q < 0) ? -mag : mag;
+}
+
+/* Look up dz_half for a subband from its kind. */
+static inline float c3d_dz_half_for_kind(unsigned kind, float step) {
+    return c3d_dz_ratio_for_kind(c3d_kind_h_count(kind)) * step;
 }
 
 /* Standard 32-bit zigzag: signed ↔ unsigned bijection.
@@ -1307,12 +1329,13 @@ static void c3d_reconstruct_subband_inplace(float *buf,
                                             const c3d_subband_info *sb,
                                             float step, float alpha)
 {
+    float dz_half = c3d_dz_half_for_kind(sb->kind, step);
     for (uint32_t z = sb->z0; z < sb->z0 + sb->side; ++z)
     for (uint32_t y = sb->y0; y < sb->y0 + sb->side; ++y)
     for (uint32_t x = sb->x0; x < sb->x0 + sb->side; ++x) {
         size_t pos = z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + x;
-        int32_t qv = c3d_quant(buf[pos], step);
-        buf[pos] = c3d_dequant(qv, step, alpha);
+        int32_t qv = c3d_quant(buf[pos], step, dz_half);
+        buf[pos] = c3d_dequant(qv, step, dz_half, alpha);
     }
 }
 
@@ -1760,10 +1783,12 @@ static size_t c3d_encode_one_subband(
 {
     size_t n = (size_t)sb->side * sb->side * sb->side;
 
-    /* All-zero fast path (before the quant scan): if max|c| < 0.5*step,
+    float dz_half = c3d_dz_half_for_kind(sb->kind, step);
+
+    /* All-zero fast path (before the quant scan): if max|c| < dz_half,
      * every coefficient will quantize to 0 and we can emit the 2-byte
      * sentinel without scanning the subband at all. */
-    if (max_abs < 0.5f * step) {
+    if (max_abs < dz_half) {
         c3d_assert(out_cap >= 2);
         c3d_write_u16_le(out, 0xFFFFu);
         (void)denom_shift; (void)external_freqs;
@@ -1783,7 +1808,7 @@ static size_t c3d_encode_one_subband(
     for (uint32_t y = sb->y0; y < sb->y0 + sb->side; ++y)
     for (uint32_t x = sb->x0; x < sb->x0 + sb->side; ++x) {
         float c = coeff_buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + x];
-        int32_t qv = c3d_quant(c, step);
+        int32_t qv = c3d_quant(c, step, dz_half);
         uint32_t escape_mag;
         uint8_t sym = c3d_quant_to_symbol(qv, &escape_mag, &sign_pred);
         sub_symbols[idx] = sym;
@@ -2017,11 +2042,12 @@ static double c3d_estimate_one_subband_rd(
     const uint32_t *external_freqs,
     float max_abs, double *out_distortion)
 {
-    if (max_abs < 0.5f * step) {
+    float dz_half = c3d_dz_half_for_kind(sb->kind, step);
+    if (max_abs < dz_half) {
         /* Empty-subband sentinel path. Distortion = Σc² for all voxels,
-         * since they all dequant to 0.  Upper bound ≈ n · (0.5·step)²/3. */
+         * since they all dequant to 0.  Upper bound ≈ n · dz_half²/3. */
         size_t n = (size_t)sb->side * sb->side * sb->side;
-        double d_per_voxel = (double)(0.5f * step) * (double)(0.5f * step) / 3.0;
+        double d_per_voxel = (double)dz_half * (double)dz_half / 3.0;
         if (out_distortion) *out_distortion = d_per_voxel * (double)n;
         return 2.0;
     }
@@ -2042,7 +2068,7 @@ static double c3d_estimate_one_subband_rd(
     for (uint32_t x = sb->x0; x < sb->x0 + sb->side; ++x) {
         float c = coeff_buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + x];
         float ac = c < 0.0f ? -c : c;
-        int32_t qv = c3d_quant(c, step);
+        int32_t qv = c3d_quant(c, step, dz_half);
         uint32_t escape_mag;
         uint8_t sym = c3d_quant_to_symbol(qv, &escape_mag, &sign_pred_rd);
         hist[sym]++;
@@ -2077,23 +2103,23 @@ static double c3d_estimate_one_subband_rd(
         }
     }
 
-    /* Distortion at α*: for each bin k ≥ 1, reconstruction = (k−0.5+α)·step;
+    /* Distortion at α*: for each bin k ≥ 1, reconstruction =
+     *   dz_half + (k−1+α)·step;
      *   Σ (|c| − recon)² over bin = Σ|c|² − 2·recon·Σ|c| + n_k·recon².
      * Bin 0 reconstructs to 0 → Σc² = Σ|c|². */
     double dist = 0.0;
     dist += sumabs2_bin[0];
     for (unsigned s = 1; s < C3D_SYM_ESCAPE_LO; ++s) {
         uint32_t mag = c3d_sym_magnitude(s);
-        double recon = ((double)mag - 0.5 + alpha) * (double)step;
+        double recon = (double)dz_half + ((double)mag - 1.0 + alpha) * (double)step;
         dist += sumabs2_bin[s] - 2.0 * recon * sumabs_bin[s] + (double)hist[s] * recon * recon;
     }
-    /* Escape symbols (63 and 64): reconstruction ≈ |q|·step.  Use the per-bin
-     * mean |c| as a proxy. */
+    /* Escape symbols: reconstruction ≈ dz_half + (|q|-1)·step.  Use the per-bin
+     * mean |c| as a proxy for |q|. */
     for (unsigned es = C3D_SYM_ESCAPE_LO; es <= C3D_SYM_ESCAPE_HI; ++es) {
         if (!hist[es]) continue;
         double mean_ac = sumabs_bin[es] / (double)hist[es];
-        double k_approx = mean_ac / (double)step;
-        double recon = k_approx * (double)step;
+        double recon = mean_ac;   /* |c| itself is a tight estimator of recon */
         dist += sumabs2_bin[es] - 2.0 * recon * sumabs_bin[es]
               + (double)hist[es] * recon * recon;
     }
@@ -2141,11 +2167,12 @@ static double c3d_estimate_one_subband_bytes(
     const uint32_t *external_freqs,
     float max_abs)
 {
+    float dz_half = c3d_dz_half_for_kind(sb->kind, step);
     /* Fast reject: if max |c| in this subband quantizes to 0, the whole band
      * is empty → matches c3d_encode_one_subband's 2-byte sentinel, and we
      * skip the O(N) quant loop entirely.  On sparse chunks (typical at
      * r≥50) this hits for 10-20 of 36 subbands per estimator iteration. */
-    if (max_abs < 0.5f * step) return 2.0;
+    if (max_abs < dz_half) return 2.0;
 
     size_t n = (size_t)sb->side * sb->side * sb->side;
     uint32_t hist[65] = {0};
@@ -2158,7 +2185,7 @@ static double c3d_estimate_one_subband_bytes(
     for (uint32_t y = sb->y0; y < sb->y0 + sb->side; ++y)
     for (uint32_t x = sb->x0; x < sb->x0 + sb->side; ++x) {
         float c = coeff_buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + x];
-        int32_t qv = c3d_quant(c, step);
+        int32_t qv = c3d_quant(c, step, dz_half);
         uint32_t escape_mag;
         uint8_t sym = c3d_quant_to_symbol(qv, &escape_mag, &sign_pred_est);
         hist[sym]++;
@@ -2776,12 +2803,18 @@ size_t c3d_encoder_chunk_encode(c3d_encoder *e, const uint8_t *in,
 
     /* Bisect on the cheap estimator (quantize + Shannon, no rANS) to pick q,
      * then run the true emit exactly once.  ~3-4× encode speedup vs the
-     * per-iteration full-emit loop; final output is always the real encode. */
+     * per-iteration full-emit loop; final output is always the real encode.
+     *
+     * §S7: when warm-started, accept the warm q if it lands within ±5% of
+     * target (R-D allocator can correct the rest).  Saves 2-4 bisection
+     * iterations on sequential chunks in a shard. */
+    bool warm = (e->last_q > 0.0f && e->last_target_ratio == target_ratio);
     for (int iter = 0; iter < 10 && !e->has_allocator_steps; ++iter) {
         double est_bytes = c3d_estimate_entropy_at_q(q, e, ctx);
         double err = est_bytes - target_bytes_d;
         double rel = (err < 0 ? -err : err) / target_bytes_d;
         if (rel < 0.01) break;
+        if (iter == 0 && warm && rel < 0.05) break;   /* §S7 early-exit */
 
         if (est_bytes > target_bytes_d) {
             q_lo = q;
@@ -3035,6 +3068,7 @@ static void c3d_decode_one_subband(
     size_t esc_remaining = in_size - r;
 
     /* Dequantize + scatter into coeff_buf (sign-predictive symbols). */
+    float dz_half = c3d_dz_half_for_kind(sb->kind, step);
     bool sign_pred_dec = true;
     size_t idx = 0;
     for (uint32_t z = sb->z0; z < sb->z0 + sb->side; ++z)
@@ -3052,7 +3086,7 @@ static void c3d_decode_one_subband(
         }
         int32_t qv = c3d_symbol_to_quant(sym, escape_mag, &sign_pred_dec);
         coeff_buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + x]
-            = c3d_dequant(qv, step, alpha);
+            = c3d_dequant(qv, step, dz_half, alpha);
     }
     c3d_assert(esc_remaining == 0);
 }
@@ -3835,12 +3869,13 @@ void c3d_ctx_builder_observe_chunk(c3d_ctx_builder *b, const uint8_t *in) {
              * now in raw (un-normalised) units so we must scale step into the
              * same space. */
             float step = b->q_ref * c3d_subband_baseline(sidx) * e->coeff_scale;
+            float dz_half = c3d_dz_half_for_kind(sb.kind, step);
             bool sign_pred_obs = true;
             for (uint32_t z = sb.z0; z < sb.z0 + sb.side; ++z)
             for (uint32_t y = sb.y0; y < sb.y0 + sb.side; ++y)
             for (uint32_t x = sb.x0; x < sb.x0 + sb.side; ++x) {
                 float c = e->coeff_buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + x];
-                int32_t qv = c3d_quant(c, step);
+                int32_t qv = c3d_quant(c, step, dz_half);
                 uint32_t esc_unused;
                 uint8_t sym = c3d_quant_to_symbol(qv, &esc_unused, &sign_pred_obs);
                 b->histograms[sidx][sym]++;

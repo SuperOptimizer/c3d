@@ -555,22 +555,27 @@ static void test_dwt_3d_lod_partial(void) {
 
 static void test_quant_roundtrip(void) {
     const float alpha = 0.375f;
+    /* Use the per-kind table: dz_ratio = 0.55 here is the h=1 case. */
+    const float dz_ratio = 0.55f;
     float steps[] = {0.5f, 1.0f, 2.0f, 4.0f, 16.0f, 128.0f};
     for (size_t si = 0; si < sizeof steps / sizeof steps[0]; ++si) {
-        float step = steps[si];
+        float step    = steps[si];
+        float dz_half = dz_ratio * step;
         float worst = 0.0f;
         for (float c = -1000.0f; c <= 1000.0f; c += 0.123f) {
-            int32_t q   = c3d_quant(c, step);
-            float   chi = c3d_dequant(q, step, alpha);
+            int32_t q   = c3d_quant(c, step, dz_half);
+            float   chi = c3d_dequant(q, step, dz_half, alpha);
             float   err = chi - c;
             if (err < 0) err = -err;
             if (err > worst) worst = err;
         }
-        /* Max error bound: dead-zone centroid for q=0 is 0, span is [-step/2, step/2],
-         * so error up to step/2.  For q≠0, centroid is (|q| - 0.5 + α)*step;
-         * worst is at bin edges, error up to step * (1.5 - α).  Take a loose
-         * ceiling of 1.0 * step. */
-        CHECK(worst <= step * (1.1f - alpha + 0.5f));
+        /* Max error bound: bin 0 spans [-dz_half, dz_half] with centroid 0,
+         * so error up to dz_half.  Bin k≥1 spans [dz_half + (k-1)·step,
+         * dz_half + k·step] with centroid offset α·step from low end, so
+         * worst is at bin edges with error up to (1-α)·step or α·step.
+         * Loose ceiling: max(dz_half, step). */
+        float ceiling = step > dz_half ? step : dz_half;
+        CHECK(worst <= ceiling * 1.1f);
     }
 }
 
