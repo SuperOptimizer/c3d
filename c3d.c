@@ -2241,6 +2241,87 @@ size_t c3d_encoder_chunk_encode(c3d_encoder *e, const uint8_t *in,
 size_t c3d_chunk_encode_max_size(void) { return C3D_CHUNK_ENCODE_MAX_SIZE; }
 
 /* ------------------------------------------------------------------------- *
+ *  §Q2  Post-decode denoiser                                                *
+ * ------------------------------------------------------------------------- *
+ *
+ * Separable 3×3×3 box blur blended with the identity at strength α:
+ *   out = (1−α)·in + α · mean3( ... ) applied independently on each axis.
+ * Three single-pass in-place 1D passes, no extra scratch buffer.  Cumulative
+ * smoothing is roughly proportional to α.  Called from the decoder at LOD 0
+ * after IDWT, before the u8 denormalise — strength chosen from encoded/input
+ * byte ratio so the filter is a no-op at near-lossless and a mild blur at
+ * high ratios where quantisation ringing dominates. */
+
+static inline void c3d_denoise_blur_x_row(float *row, size_t N, float alpha)
+{
+    if (N < 3) return;
+    float one_minus_a = 1.0f - alpha;
+    float l = row[0];   /* boundary: replicate */
+    float c = row[0];
+    for (size_t i = 0; i < N; ++i) {
+        float r = (i + 1 < N) ? row[i + 1] : c;
+        row[i] = one_minus_a * c + alpha * (l + c + r) * (1.0f / 3.0f);
+        l = c;
+        c = r;
+    }
+}
+
+static void c3d_denoise_3d(float *buf, size_t side, float alpha)
+{
+    if (alpha <= 0.0f || side < 3) return;
+    const size_t SY = C3D_STRIDE_Y;
+    const size_t SZ = C3D_STRIDE_Z;
+
+    /* X pass — contiguous rows. */
+    for (size_t z = 0; z < side; ++z)
+    for (size_t y = 0; y < side; ++y)
+        c3d_denoise_blur_x_row(&buf[z * SZ + y * SY], side, alpha);
+
+    /* Y pass — per column, use 3 scalar registers of state. */
+    float one_minus_a = 1.0f - alpha;
+    for (size_t z = 0; z < side; ++z) {
+        for (size_t x = 0; x < side; ++x) {
+            float *col0 = &buf[z * SZ + 0 * SY + x];
+            float l = col0[0];
+            float c = col0[0];
+            for (size_t y = 0; y < side; ++y) {
+                float r = (y + 1 < side) ? col0[(y + 1) * SY] : c;
+                col0[y * SY] = one_minus_a * c + alpha * (l + c + r) * (1.0f / 3.0f);
+                l = c;
+                c = r;
+            }
+        }
+    }
+
+    /* Z pass — same idea, stride SZ. */
+    for (size_t y = 0; y < side; ++y) {
+        for (size_t x = 0; x < side; ++x) {
+            float *col0 = &buf[0 * SZ + y * SY + x];
+            float l = col0[0];
+            float c = col0[0];
+            for (size_t z = 0; z < side; ++z) {
+                float r = (z + 1 < side) ? col0[(z + 1) * SZ] : c;
+                col0[z * SZ] = one_minus_a * c + alpha * (l + c + r) * (1.0f / 3.0f);
+                l = c;
+                c = r;
+            }
+        }
+    }
+}
+
+/* Denoiser strength driven by the encoded/input byte ratio.  No-op below
+ * r=20:1 (near-lossless, no ringing to clean up); ramp to a moderate blur
+ * (α=0.25) by r=100:1.  α is capped so the filter never over-blurs. */
+static float c3d_denoise_strength(size_t in_len)
+{
+    double ratio = (double)C3D_VOXELS_PER_CHUNK / (double)in_len;
+    if (ratio <= 20.0) return 0.0f;
+    double t = (ratio - 20.0) / 80.0;
+    if (t > 1.0) t = 1.0;
+    return (float)(0.25 * t);
+}
+
+/* ------------------------------------------------------------------------- *
  *  §I  Chunk decoder (SELF mode)                                            *
  * ------------------------------------------------------------------------- */
 
@@ -2443,6 +2524,16 @@ void c3d_decoder_chunk_decode_lod(c3d_decoder *d,
 
     unsigned n_synth = C3D_N_DWT_LEVELS - lod;
     c3d_dwt3_inv_levels(d->coeff_buf, n_synth, d->dwt_scratch);
+
+    /* Q2 post-decode denoiser at LOD 0 only — coarser LODs are already
+     * low-pass enough that ringing is invisible and the denoiser would
+     * just over-blur.  Opt-out via C3D_DENOISE=0 for bench comparisons. */
+    if (lod == 0) {
+        float denoise_alpha = c3d_denoise_strength(in_len);
+        const char *env = getenv("C3D_DENOISE");
+        if (env && env[0] == '0') denoise_alpha = 0.0f;
+        c3d_denoise_3d(d->coeff_buf, C3D_CHUNK_SIDE, denoise_alpha);
+    }
 
     /* Encoder v2: coeff_scale is already absorbed into per-subband step, so
      * dequant produces raw-magnitude coefficients.  coeff_scale in the header

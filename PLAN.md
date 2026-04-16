@@ -734,3 +734,16 @@ Bytes on disk (format version 1, permanent during dev):
 - Fuzzing harness.
 - Forward / backward compatibility.
 - Compile-time corpus-baked priors (corpus-learned parameters only travel as `.c3dx`).
+
+### Deferred — gated scaffolding on main
+
+- **Per-chunk R-D allocator (Q3).** Lagrangian allocator over a 10-point
+  per-subband log step grid is present in `c3d.c` (`c3d_rd_allocate`,
+  `c3d_rd_estimate_subband`) and gated behind the `C3D_RD_ALLOCATOR` env.
+  When enabled it misses rate targets by ~20–25 % because its fine-histogram
+  Shannon estimate systematically undercounts the quant-scan-based
+  `c3d_estimate_one_subband_bytes` even with LEB128-for-escape accounted
+  for.  Leaving code in place for a calibrated second pass — resuming
+  means reconciling the two estimators subband-by-subband, probably
+  re-deriving the Shannon computation directly on the dead-zone boundaries
+  the quant path actually uses.
