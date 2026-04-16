@@ -747,3 +747,15 @@ Bytes on disk (format version 1, permanent during dev):
   means reconciling the two estimators subband-by-subband, probably
   re-deriving the Shannon computation directly on the dead-zone boundaries
   the quant path actually uses.
+
+- **Context-adaptive rANS (Q4).** Would use per-symbol freq tables keyed on
+  the causal neighbour's class for another +0.3–1.0 dB.  Not attempted: the
+  8-lane interleaved decode fundamentally relies on a single shared freq
+  table so all lanes advance independently.  Per-symbol table selection
+  introduces a read-after-write dependency (the current symbol's table
+  needs the previous symbol, which the adjacent lane just wrote) and
+  serialises the 8 lanes, costing ~3× decode rANS time.  Net effect would
+  likely regress end-to-end decode throughput before the dB win paid off.
+  Revisit only if willing to move to a single-state rANS path for the
+  context-adaptive subbands, or to rework the interleave so the causal
+  dependency is lane-local.

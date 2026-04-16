@@ -813,6 +813,62 @@ static void test_chunk_deterministic_encode(void) {
     free(in); free(a); free(b); free(dec_a); free(dec_b);
 }
 
+static void test_chunks_batched(void) {
+    /* I3: multi-chunk batched encode/decode must produce output byte-identical
+     * to calling the single-chunk API in sequence.  Exercises the shared
+     * encoder/decoder state that backs the batch. */
+    const size_t N = 3;
+    uint8_t *ins[3], *outs_batch[3], *outs_one[3], *decs_batch[3], *decs_one[3];
+    size_t sizes_batch[3], sizes_one[3];
+    const uint8_t *ins_const[3];
+    const size_t  *sizes_const;
+    for (size_t i = 0; i < N; ++i) {
+        ins[i]        = aligned_alloc(C3D_ALIGN, C3D_VOXELS_PER_CHUNK);
+        outs_batch[i] = aligned_alloc(C3D_ALIGN, C3D_CHUNK_ENCODE_MAX_SIZE);
+        outs_one[i]   = aligned_alloc(C3D_ALIGN, C3D_CHUNK_ENCODE_MAX_SIZE);
+        decs_batch[i] = aligned_alloc(C3D_ALIGN, C3D_VOXELS_PER_CHUNK);
+        decs_one[i]   = aligned_alloc(C3D_ALIGN, C3D_VOXELS_PER_CHUNK);
+        c3d_assert(ins[i] && outs_batch[i] && outs_one[i]);
+        make_test_chunk(ins[i]);
+        /* Perturb slightly so chunks aren't identical. */
+        ins[i][0] = (uint8_t)(i * 17);
+        ins_const[i] = ins[i];
+    }
+    sizes_const = sizes_batch;
+    (void)sizes_const;
+
+    c3d_encoder *e = c3d_encoder_new();
+    c3d_decoder *dc = c3d_decoder_new();
+
+    /* Batched path. */
+    c3d_encoder_chunks_encode(e, ins_const, N, 25.0f, NULL,
+                              outs_batch, sizes_batch);
+    const uint8_t *batch_ins[3] = { outs_batch[0], outs_batch[1], outs_batch[2] };
+    c3d_decoder_chunks_decode(dc, batch_ins, sizes_batch, N, NULL, decs_batch);
+
+    /* Reference path — same encoder/decoder, called per chunk. */
+    c3d_encoder *e2 = c3d_encoder_new();
+    c3d_decoder *dc2 = c3d_decoder_new();
+    for (size_t i = 0; i < N; ++i) {
+        sizes_one[i] = c3d_encoder_chunk_encode(
+            e2, ins[i], 25.0f, NULL, outs_one[i], C3D_CHUNK_ENCODE_MAX_SIZE);
+        c3d_decoder_chunk_decode(dc2, outs_one[i], sizes_one[i], NULL, decs_one[i]);
+    }
+
+    for (size_t i = 0; i < N; ++i) {
+        CHECK_EQ(sizes_batch[i], sizes_one[i]);
+        CHECK(memcmp(outs_batch[i], outs_one[i], sizes_batch[i]) == 0);
+        CHECK(memcmp(decs_batch[i], decs_one[i], C3D_VOXELS_PER_CHUNK) == 0);
+    }
+
+    c3d_encoder_free(e); c3d_encoder_free(e2);
+    c3d_decoder_free(dc); c3d_decoder_free(dc2);
+    for (size_t i = 0; i < N; ++i) {
+        free(ins[i]); free(outs_batch[i]); free(outs_one[i]);
+        free(decs_batch[i]); free(decs_one[i]);
+    }
+}
+
 static void test_chunk_lod_decode(void) {
     uint8_t *in  = aligned_alloc(C3D_ALIGN, C3D_VOXELS_PER_CHUNK);
     uint8_t *enc = aligned_alloc(C3D_ALIGN, C3D_CHUNK_ENCODE_MAX_SIZE);
@@ -1241,6 +1297,7 @@ int main(void) {
     test_chunk_encode_decode_at_q();
     test_chunk_rate_control();
     test_chunk_deterministic_encode();
+    test_chunks_batched();
     test_chunk_lod_decode();
 
     printf("§J shard + downsample\n");

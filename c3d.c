@@ -2240,6 +2240,21 @@ size_t c3d_encoder_chunk_encode(c3d_encoder *e, const uint8_t *in,
 
 size_t c3d_chunk_encode_max_size(void) { return C3D_CHUNK_ENCODE_MAX_SIZE; }
 
+/* §I3.  Batched multi-chunk encode — loop the single-chunk API. */
+void c3d_encoder_chunks_encode(c3d_encoder *e,
+                               const uint8_t *const *inputs,
+                               size_t n_chunks,
+                               float target_ratio, const c3d_ctx *ctx,
+                               uint8_t *const *outs,
+                               size_t *out_sizes)
+{
+    c3d_assert(e && inputs && outs && out_sizes);
+    for (size_t i = 0; i < n_chunks; ++i) {
+        out_sizes[i] = c3d_encoder_chunk_encode(
+            e, inputs[i], target_ratio, ctx, outs[i], C3D_CHUNK_ENCODE_MAX_SIZE);
+    }
+}
+
 /* ------------------------------------------------------------------------- *
  *  §Q2  Post-decode denoiser                                                *
  * ------------------------------------------------------------------------- *
@@ -2554,6 +2569,22 @@ void c3d_decoder_chunk_decode(c3d_decoder *d, const uint8_t *in, size_t in_len,
                               const c3d_ctx *ctx, uint8_t *out)
 {
     c3d_decoder_chunk_decode_lod(d, in, in_len, 0, ctx, out);
+}
+
+/* §I3.  Batched multi-chunk decode — loop the single-chunk API.  When all
+ * chunks share the same EXTERNAL ctx, the decoder's per-ctx rANS table
+ * cache (S2) stays warm across the batch. */
+void c3d_decoder_chunks_decode(c3d_decoder *d,
+                               const uint8_t *const *ins,
+                               const size_t *in_sizes,
+                               size_t n_chunks,
+                               const c3d_ctx *ctx,
+                               uint8_t *const *outs)
+{
+    c3d_assert(d && ins && in_sizes && outs);
+    for (size_t i = 0; i < n_chunks; ++i) {
+        c3d_decoder_chunk_decode_lod(d, ins[i], in_sizes[i], 0, ctx, outs[i]);
+    }
 }
 
 void c3d_chunk_decode_lod(const uint8_t *in, size_t in_len, uint8_t lod,

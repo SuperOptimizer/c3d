@@ -133,6 +133,30 @@ void   c3d_decoder_chunk_decode(c3d_decoder *, const uint8_t *in, size_t in_len,
 void   c3d_decoder_chunk_decode_lod(c3d_decoder *, const uint8_t *in, size_t in_len,
                                     uint8_t lod, const c3d_ctx *ctx, uint8_t *out);
 
+/* Multi-chunk batched encode — thin wrapper around c3d_encoder_chunk_encode
+ * that runs n_chunks encodes back-to-back on the same encoder and writes
+ * the per-chunk output sizes to out_sizes[].  Same output as calling the
+ * single-chunk API n_chunks times (warm-start kicks in after the first
+ * chunk).  Exists so callers can express shard-style work in one call and
+ * so future versions can overlap DWT / rANS across chunks without changing
+ * the API shape.  All `inputs` must be C3D_ALIGN-aligned, all `outs` must
+ * each point to a buffer of at least C3D_CHUNK_ENCODE_MAX_SIZE bytes. */
+void c3d_encoder_chunks_encode(c3d_encoder *e,
+                               const uint8_t *const *inputs,
+                               size_t n_chunks,
+                               float target_ratio, const c3d_ctx *ctx,
+                               uint8_t *const *outs,
+                               size_t *out_sizes);
+
+/* Multi-chunk batched decode — analogous to the encode batch.  Each chunk's
+ * encoded size is taken from in_sizes[i]; each out must be 256³ bytes. */
+void c3d_decoder_chunks_decode(c3d_decoder *d,
+                               const uint8_t *const *ins,
+                               const size_t *in_sizes,
+                               size_t n_chunks,
+                               const c3d_ctx *ctx,
+                               uint8_t *const *outs);
+
 size_t c3d_chunk_encode_max_size(void);   /* returns C3D_CHUNK_ENCODE_MAX_SIZE */
 
 /* target_ratio must be > 1.0; ctx may be NULL (→ SELF chunk), else EXTERNAL.
