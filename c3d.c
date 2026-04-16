@@ -1610,22 +1610,45 @@ static size_t c3d_encode_one_subband(
         return 2;
     }
 
-    /* Pick the frequency source per-subband.  Prefer external (saves the
-     * in-band freq table bytes) when it covers every symbol in this chunk;
-     * otherwise fall back to a locally-built table. */
+    /* Pick the frequency source per-subband.  When external freqs are
+     * available, compare actual byte cost against the SELF path:
+     *   ext_bytes  = cross-entropy(hist, external) / 8
+     *   self_bytes = Shannon(hist)/8 + ftable_serialised_size
+     * Pick the tighter one.  Without this comparison EXTERNAL can regress
+     * at moderate ratios when cross-entropy penalty (chunk's distribution
+     * drifts from the trained ctx) exceeds the ftable-bytes savings. */
     uint32_t local_freqs[65];
     const uint32_t *freqs_to_use;
     bool use_external = false;
+    c3d_normalise_freqs(hist, denom_shift, local_freqs);
     if (external_freqs) {
-        use_external = true;
+        bool ext_covers = true;
         for (unsigned k = 0; k < 65; ++k) {
-            if (hist[k] > 0 && external_freqs[k] == 0) { use_external = false; break; }
+            if (hist[k] > 0 && external_freqs[k] == 0) { ext_covers = false; break; }
+        }
+        if (ext_covers) {
+            /* Both paths are decodable; compare actual rate. */
+            double log2_M = (double)denom_shift;
+            double ext_bits = 0.0, self_bits = 0.0;
+            double inv_n = 1.0 / (double)n;
+            for (unsigned k = 0; k < 65; ++k) {
+                if (!hist[k]) continue;
+                ext_bits  += (double)hist[k] * (log2_M - log2((double)external_freqs[k]));
+                double p = (double)hist[k] * inv_n;
+                self_bits += -(double)hist[k] * log2(p);
+            }
+            /* SELF pays ftable_serialised_size extra bytes; ~2 + 3*nnz. */
+            unsigned nnz = 0;
+            for (unsigned k = 0; k < 65; ++k) if (hist[k]) nnz++;
+            double self_overhead_bytes = 2.0 + 3.0 * (double)nnz;
+            double ext_bytes  = ext_bits / 8.0;
+            double self_bytes = self_bits / 8.0 + self_overhead_bytes;
+            use_external = ext_bytes <= self_bytes;
         }
     }
     if (use_external) {
         freqs_to_use = external_freqs;
     } else {
-        c3d_normalise_freqs(hist, denom_shift, local_freqs);
         freqs_to_use = local_freqs;
     }
     c3d_rans_tables tbl;
@@ -1842,45 +1865,37 @@ static double c3d_estimate_one_subband_bytes(
     /* All-zero subband fast path matches c3d_encode_one_subband. */
     if (hist[0] == n) return 2.0;
 
-    bool use_external = (external_freqs != NULL);
-    if (use_external) {
+    /* Compute rate for both SELF and EXTERNAL paths, pick the cheaper —
+     * mirrors the smart fallback in c3d_encode_one_subband. */
+    double inv_n = 1.0 / (double)n;
+    double self_bits = 0.0;
+    for (unsigned k = 0; k < 65; ++k) {
+        if (!hist[k]) continue;
+        double p = (double)hist[k] * inv_n;
+        self_bits += -(double)hist[k] * log2(p);
+    }
+    unsigned nnz = 0;
+    for (unsigned k = 0; k < 65; ++k) if (hist[k]) nnz++;
+    double self_ftable = 2.0 + 3.0 * (double)nnz;
+    double self_total = 2.0 + self_ftable + 8.0 + self_bits / 8.0 + 32.0 + (double)escape_bytes;
+
+    if (external_freqs) {
+        bool ext_covers = true;
         for (unsigned k = 0; k < 65; ++k) {
-            if (hist[k] > 0 && external_freqs[k] == 0) { use_external = false; break; }
+            if (hist[k] > 0 && external_freqs[k] == 0) { ext_covers = false; break; }
+        }
+        if (ext_covers) {
+            double log2_M = (double)denom_shift;
+            double ext_bits = 0.0;
+            for (unsigned k = 0; k < 65; ++k) {
+                if (!hist[k]) continue;
+                ext_bits += (double)hist[k] * (log2_M - log2((double)external_freqs[k]));
+            }
+            double ext_total = 2.0 + 0.0 + 8.0 + ext_bits / 8.0 + 32.0 + (double)escape_bytes;
+            if (ext_total < self_total) return ext_total;
         }
     }
-
-    double code_bits = 0.0;
-    if (use_external) {
-        double log2_M = (double)denom_shift;
-        for (unsigned k = 0; k < 65; ++k) {
-            if (!hist[k]) continue;
-            code_bits += (double)hist[k] * (log2_M - log2((double)external_freqs[k]));
-        }
-    } else {
-        /* Shannon H(hist).  rANS renorm adds <1 % in practice. */
-        double inv_n = 1.0 / (double)n;
-        for (unsigned k = 0; k < 65; ++k) {
-            if (!hist[k]) continue;
-            double p = (double)hist[k] * inv_n;
-            code_bits += -(double)hist[k] * log2(p);
-        }
-    }
-
-    /* rANS overhead: 32 B header + <1 % renorm slack (rounded up). */
-    double rans_bytes = code_bits / 8.0 + 32.0;
-
-    /* Approximate ftable_bytes (SELF only): 2 fixed + per-nonzero (1 sym +
-     * LEB128 freq; freq up to 2^denom_shift so 1-3 bytes). */
-    double ftable_bytes = 0.0;
-    if (!use_external) {
-        unsigned nnz = 0;
-        for (unsigned k = 0; k < 65; ++k) if (hist[k]) nnz++;
-        ftable_bytes = 2.0 + 3.0 * (double)nnz;
-    }
-
-    /* Per-subband framing: 2 (ftable_size) + ftable + 4 (n_symbols)
-     * + 4 (rans_block_size) + rans + escape. */
-    return 2.0 + ftable_bytes + 8.0 + rans_bytes + (double)escape_bytes;
+    return self_total;
 }
 
 /* Rate-distortion estimate for a single subband at a trial step, using the

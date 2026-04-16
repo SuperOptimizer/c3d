@@ -28,14 +28,15 @@ static double now_s(void) {
 }
 
 typedef struct {
-    int       tid;
-    char    **paths;
-    size_t    n_paths;
-    float     target_ratio;
-    double    elapsed_s;
-    size_t    total_bytes_in;
-    size_t    total_bytes_enc;
-    double    avg_psnr;
+    int              tid;
+    char           **paths;
+    size_t           n_paths;
+    float            target_ratio;
+    const c3d_ctx   *ctx;       /* NULL → SELF mode; non-NULL → EXTERNAL mode */
+    double           elapsed_s;
+    size_t           total_bytes_in;
+    size_t           total_bytes_enc;
+    double           avg_psnr;
 } worker_arg;
 
 static double psnr_u8(const uint8_t *a, const uint8_t *b, size_t n) {
@@ -60,9 +61,9 @@ static void *worker(void *p) {
         if (!fp) continue;
         if (fread(in, 1, CHUNK_BYTES, fp) != CHUNK_BYTES) { fclose(fp); continue; }
         fclose(fp);
-        size_t n = c3d_encoder_chunk_encode(enc_ctx, in, a->target_ratio, NULL,
+        size_t n = c3d_encoder_chunk_encode(enc_ctx, in, a->target_ratio, a->ctx,
                                             enc, c3d_chunk_encode_max_size());
-        c3d_decoder_chunk_decode(dec_ctx, enc, n, NULL, dec);
+        c3d_decoder_chunk_decode(dec_ctx, enc, n, a->ctx, dec);
         psnr_sum += psnr_u8(in, dec, CHUNK_BYTES);
         enc_bytes_sum += n;
     }
@@ -100,6 +101,29 @@ int main(int argc, char **argv) {
     printf("corpus: %zu chunks, %d threads, target %.1f:1\n", n_paths, n_threads, (double)target);
     if (n_paths == 0) { fprintf(stderr, "no chunks\n"); return 1; }
 
+    /* Optionally build an EXTERNAL ctx from the first up-to-16 chunks.
+     * Enable with C3D_USE_CTX=1.  Encoder and decoder both use this ctx —
+     * the per-chunk in-band freq tables shrink or vanish, saving ~100-500 B
+     * per chunk at moderate ratios. */
+    c3d_ctx *ctx = NULL;
+    if (getenv("C3D_USE_CTX")) {
+        c3d_ctx_builder *bld = c3d_ctx_builder_new();
+        size_t n_obs = n_paths < 16 ? n_paths : 16;
+        uint8_t *obs = aligned_alloc(32, CHUNK_BYTES);
+        for (size_t i = 0; i < n_obs; ++i) {
+            FILE *fp = fopen(paths[i], "rb");
+            if (!fp) continue;
+            if (fread(obs, 1, CHUNK_BYTES, fp) == CHUNK_BYTES) {
+                c3d_ctx_builder_observe_chunk(bld, obs);
+            }
+            fclose(fp);
+        }
+        free(obs);
+        ctx = c3d_ctx_builder_finish(bld, /*include_freq_tables=*/true);
+        printf("ctx: trained on %zu chunks, size=%zu B\n",
+               n_obs, c3d_ctx_serialized_size(ctx));
+    }
+
     pthread_t *thr = calloc(n_threads, sizeof *thr);
     worker_arg *args = calloc(n_threads, sizeof *args);
     /* Round-robin assignment. */
@@ -110,6 +134,7 @@ int main(int argc, char **argv) {
         args[t].n_paths = (t * per >= n_paths) ? 0
                         : (((t + 1) * per <= n_paths) ? per : n_paths - t * per);
         args[t].target_ratio = target;
+        args[t].ctx = ctx;
     }
 
     double t0 = now_s();
@@ -142,5 +167,6 @@ int main(int argc, char **argv) {
 
     for (size_t i = 0; i < n_paths; ++i) free(paths[i]);
     free(paths); free(thr); free(args);
+    if (ctx) c3d_ctx_free(ctx);
     return 0;
 }
