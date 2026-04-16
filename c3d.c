@@ -1143,10 +1143,11 @@ static void c3d_subband_scatter(float *buf,
  *
  * Chunk layout (PLAN §2.2):
  *    0     chunk header (40 B)
- *   40     qmul[36]      (144 B)
- *  184     subband_offset[36] (144 B)
- *  328     lod_offset[6]   (24 B)
- *  352     entropy payload (variable, resolution-first)
+ *   40     qmul[36]            (144 B)
+ *  184     subband_offset[36]  (144 B)
+ *  328     lod_offset[6]       (24 B)
+ *  352     alpha_per_subband[36] (36 B)  — per-chunk Laplacian dequant α
+ *  388     entropy payload (variable, resolution-first)
  *
  * Per-subband bitstream (PLAN §3.4):
  *    0   u16 freq_table_size
@@ -1157,7 +1158,22 @@ static void c3d_subband_scatter(float *buf,
  *    ?   escape_stream (variable)
  */
 
-#define C3D_CHUNK_FIXED_SIZE 352u
+#define C3D_CHUNK_FIXED_SIZE 388u
+#define C3D_CHUNK_ALPHA_OFFSET 352u
+
+/* uint8 <-> α float in [0.25, 0.50] — clamp + linear map.  Q1 writes one
+ * byte per subband; decoder reads it back for the Laplacian-optimal
+ * dequant offset (c3d_default_alpha is the fallback when no per-subband
+ * α is available, e.g. for the empty-subband sentinel or ctx overrides). */
+static inline uint8_t c3d_alpha_to_u8(float a) {
+    if (a < 0.25f) a = 0.25f;
+    if (a > 0.50f) a = 0.50f;
+    float v = (a - 0.25f) * (255.0f / 0.25f) + 0.5f;
+    return (uint8_t)v;
+}
+static inline float c3d_alpha_from_u8(uint8_t v) {
+    return 0.25f + (float)v * (0.25f / 255.0f);
+}
 #define C3D_Q_MIN            (1.0f / 4096.0f) /* 2^-12 (was 2^-6 — wider range
                                                   needed to reach big target
                                                   budgets under perceptual
@@ -1517,7 +1533,7 @@ static size_t c3d_encode_one_subband(
     uint8_t *sub_symbols, uint8_t *sub_escapes,
     uint8_t *rans_scratch, size_t rans_scratch_size,
     uint8_t *out, size_t out_cap,
-    float max_abs)
+    float max_abs, float *out_alpha)
 {
     size_t n = (size_t)sb->side * sb->side * sb->side;
 
@@ -1552,6 +1568,31 @@ static size_t c3d_encode_one_subband(
         }
     }
     c3d_assert(idx == n);
+
+    /* Laplacian-α fit (Q1).  Closed form:
+     *   β_hat  = step * Σ(|q|·hist[q]) / Σ(hist[q])
+     *   u      = step / β_hat
+     *   α_opt  = 1/u - 1/(exp(u) - 1)         (independent of bin k)
+     * Clamped to [0.25, 0.50].  When escapes are rare, β_hat from the
+     * direct-symbol histogram is a tight estimate (bin-0 bias is small).
+     * For every-bin-0 chunks we never reach this path (all-zero sentinel). */
+    {
+        double wsum = 0.0;
+        for (unsigned k = 1; k < C3D_SYM_ESCAPE; ++k) wsum += (double)k * hist[k];
+        /* Escape contributes |q| ≥ 64 each — rare in practice; approximate with 64. */
+        wsum += 64.0 * (double)hist[C3D_SYM_ESCAPE];
+        double beta = (double)step * wsum / (double)n;
+        if (beta <= 1e-12) {
+            *out_alpha = 0.25f;
+        } else {
+            double u = (double)step / beta;
+            double denom = exp(u) - 1.0;
+            double a = 1.0 / u - (denom > 1e-12 ? 1.0 / denom : 0.0);
+            if (a < 0.25) a = 0.25;
+            if (a > 0.50) a = 0.50;
+            *out_alpha = (float)a;
+        }
+    }
 
     /* All-zero fast path: every coefficient quantizes to symbol 0.  Emit a
      * 2-byte sentinel (freq_table_size = 0xFFFF) and stop — decoder zero-fills
@@ -1745,6 +1786,7 @@ static size_t c3d_emit_entropy_at_q(float q, const c3d_encoder *s,
     uint8_t *qmul_ptr   = out + 40;
     uint8_t *suboff_ptr = out + 40 + 144;
     uint8_t *lodoff_ptr = out + 40 + 144 + 144;
+    uint8_t *alpha_ptr  = out + C3D_CHUNK_ALPHA_OFFSET;
 
     size_t entropy_pos = 0;
     const size_t entropy_cap = out_cap - C3D_CHUNK_FIXED_SIZE;
@@ -1765,6 +1807,7 @@ static size_t c3d_emit_entropy_at_q(float q, const c3d_encoder *s,
         c3d_write_u32_le(suboff_ptr + 4 * i, (uint32_t)entropy_pos);
 
         float max_abs = s->has_max_abs ? s->max_abs_per_subband[i] : s->coeff_scale;
+        float fitted_alpha = c3d_default_alpha(i);  /* fallback for sentinel path */
         size_t bytes = c3d_encode_one_subband(
             s->coeff_buf, &sb, step, denom_shift,
             (ctx && ctx->has_freq_tables) ? ctx->freqs[i] : NULL,
@@ -1772,7 +1815,8 @@ static size_t c3d_emit_entropy_at_q(float q, const c3d_encoder *s,
             s->rans_scratch, rans_scratch_size,
             out + C3D_CHUNK_FIXED_SIZE + entropy_pos,
             entropy_cap - entropy_pos,
-            max_abs);
+            max_abs, &fitted_alpha);
+        alpha_ptr[i] = c3d_alpha_to_u8(fitted_alpha);
         entropy_pos += bytes;
     }
 
@@ -2048,6 +2092,7 @@ void c3d_decoder_chunk_decode_lod(c3d_decoder *d,
     const uint8_t *qmul_ptr   = in + 40;
     const uint8_t *suboff_ptr = in + 40 + 144;
     const uint8_t *lodoff_ptr = in + 40 + 144 + 144;
+    const uint8_t *alpha_ptr  = in + C3D_CHUNK_ALPHA_OFFSET;
     const uint8_t *entropy    = in + C3D_CHUNK_FIXED_SIZE;
 
     uint32_t lod_end = c3d_read_u32_le(lodoff_ptr + 4 * lod);
@@ -2090,8 +2135,18 @@ void c3d_decoder_chunk_decode_lod(c3d_decoder *d,
         c3d_subband_info sb;
         c3d_subband_info_of(s, &sb);
         float step  = c3d_read_f32_le(qmul_ptr + 4 * s);
-        float alpha = (ctx && ctx->has_laplacian_alpha) ? ctx->laplacian_alpha[s]
-                                                        : c3d_default_alpha(s);
+        /* Decode order (first match wins):
+         *   ctx override (explicit training)
+         *   per-chunk α byte from header (Q1 Laplacian fit)
+         *   static default (c3d_default_alpha) — fallback for old-format or
+         *   when the encoder left the byte zero (also maps to 0.25). */
+        float alpha;
+        if (ctx && ctx->has_laplacian_alpha) {
+            alpha = ctx->laplacian_alpha[s];
+        } else {
+            uint8_t av = alpha_ptr[s];
+            alpha = av ? c3d_alpha_from_u8(av) : c3d_default_alpha(s);
+        }
         const uint32_t *ext_freqs = (ctx && ctx->has_freq_tables) ? ctx->freqs[s] : NULL;
         uint32_t ext_ds           = (ctx && ctx->has_freq_tables) ? ctx->denom_shifts[s] : 0u;
 

@@ -807,7 +807,7 @@ static void test_chunk_empty(void) {
 
     memset(in, 77, C3D_VOXELS_PER_CHUNK);   /* uniform */
     size_t sz = c3d_chunk_encode_at_q(in, 1.0f / 32.0f, NULL, enc, C3D_CHUNK_ENCODE_MAX_SIZE);
-    CHECK_EQ(sz, 352u);
+    CHECK_EQ(sz, (size_t)C3D_CHUNK_FIXED_SIZE);
 
     c3d_chunk_info info;
     c3d_chunk_inspect(enc, sz, &info);

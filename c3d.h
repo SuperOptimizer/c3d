@@ -36,9 +36,11 @@ extern "C" {
 #define C3D_ALIGN          32u     /* required alignment for raw voxel buffers   */
 
 /* Upper bound on a c3d_chunk_encode output: raw u8 + fixed header + tables
- * + a small range-coder safety margin.  Small enough to stack-allocate. */
+ * + a small range-coder safety margin.  Small enough to stack-allocate.
+ * (Fixed header = 388 B: 40 B base + 144 B qmul + 144 B subband_offset
+ *  + 24 B lod_offset + 36 B per-subband Laplacian α.) */
 #define C3D_CHUNK_ENCODE_MAX_SIZE \
-    ((size_t)16 * 1024 * 1024 + 352 + 4096)
+    ((size_t)16 * 1024 * 1024 + 388 + 4096)
 
 /* ─── panic / assert ─────────────────────────────────────────────────────── */
 
