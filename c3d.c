@@ -1401,18 +1401,28 @@ static void c3d_add_parent_prediction(float *buf,
 #define C3D_CHUNK_FIXED_SIZE 388u
 #define C3D_CHUNK_ALPHA_OFFSET 352u
 
-/* uint8 <-> α float in [0.25, 0.50] — clamp + linear map.  Q1 writes one
+/* uint8 <-> α float in [0.40, 0.50] — clamp + linear map.  Q1 writes one
  * byte per subband; decoder reads it back for the Laplacian-optimal
  * dequant offset (c3d_default_alpha is the fallback when no per-subband
- * α is available, e.g. for the empty-subband sentinel or ctx overrides). */
+ * α is available, e.g. for the empty-subband sentinel or ctx overrides).
+ *
+ * Range was [0.25, 0.50] — narrowed to [0.40, 0.50] after empirical
+ * sweep showed scroll CT data is NOT pure Laplacian.  The Laplacian fit
+ * formula α* = 1/u - 1/(exp(u)-1) drives toward 0 for HF subbands at
+ * high ratios, biasing reconstruction toward dz_half (bin start).  But
+ * the actual NON-ZERO coefficients in HF subbands cluster nearer the
+ * bin midpoint (real edges, not noise) — so the fit underestimates α.
+ * Floor at 0.40 forces reconstructions closer to bin midpoint; gives
+ * +0.02 dB at r=25-100 with no regression at low ratios.  Format
+ * change — old-chunk α bytes decode to a different physical value. */
 static inline uint8_t c3d_alpha_to_u8(float a) {
-    if (a < 0.25f) a = 0.25f;
+    if (a < 0.40f) a = 0.40f;
     if (a > 0.50f) a = 0.50f;
-    float v = (a - 0.25f) * (255.0f / 0.25f) + 0.5f;
+    float v = (a - 0.40f) * (255.0f / 0.10f) + 0.5f;
     return (uint8_t)v;
 }
 static inline float c3d_alpha_from_u8(uint8_t v) {
-    return 0.25f + (float)v * (0.25f / 255.0f);
+    return 0.40f + (float)v * (0.10f / 255.0f);
 }
 #define C3D_Q_MIN            (1.0f / 4096.0f) /* 2^-12 (was 2^-6 — wider range
                                                   needed to reach big target
@@ -1849,7 +1859,7 @@ static size_t c3d_encode_one_subband(
             double u = (double)step / beta;
             double denom = exp(u) - 1.0;
             double a = 1.0 / u - (denom > 1e-12 ? 1.0 / denom : 0.0);
-            if (a < 0.25) a = 0.25;
+            if (a < 0.40) a = 0.40;
             if (a > 0.50) a = 0.50;
             *out_alpha = (float)a;
         }
@@ -2105,7 +2115,7 @@ static double c3d_estimate_one_subband_rd(
             double u = (double)step / beta;
             double denom = exp(u) - 1.0;
             double a = 1.0 / u - (denom > 1e-12 ? 1.0 / denom : 0.0);
-            if (a < 0.25) a = 0.25;
+            if (a < 0.40) a = 0.40;
             if (a > 0.50) a = 0.50;
             alpha = (float)a;
         }
