@@ -591,22 +591,40 @@ static void test_zigzag32(void) {
 }
 
 static void test_symbol_mapping(void) {
-    uint32_t esc;
-    /* Direct range: q ∈ [-32, 31] → symbol = zigzag(q) < 64, no escape. */
-    for (int32_t q = -32; q <= 31; ++q) {
-        uint8_t s = c3d_quant_to_symbol(q, &esc);
-        CHECK(s < 64);
+    /* Sign-predictive mapping: test that round-tripping through
+     * c3d_quant_to_symbol → c3d_symbol_to_quant recovers the original qv
+     * for both direct (|qv| < 32) and escape (|qv| ≥ 32) ranges.
+     * Both encoder and decoder must use matching sign prediction state. */
+    /* Direct range: |q| ∈ [0, 31]. */
+    for (int32_t q = -31; q <= 31; ++q) {
+        bool sp_enc = true, sp_dec = true;
+        uint32_t esc;
+        uint8_t s = c3d_quant_to_symbol(q, &esc, &sp_enc);
+        CHECK(!C3D_SYM_IS_ESCAPE(s));
         CHECK_EQ(esc, 0u);
-        CHECK_EQ(c3d_symbol_to_quant(s, 0u), q);
+        int32_t q2 = c3d_symbol_to_quant(s, 0u, &sp_dec);
+        CHECK_EQ(q2, q);
     }
-    /* Escape range. */
+    /* Escape range: |q| ≥ 32. */
     int32_t esc_samples[] = {32, -33, 100, -1000, 100000, -100000};
     for (size_t i = 0; i < sizeof esc_samples/sizeof esc_samples[0]; ++i) {
         int32_t q = esc_samples[i];
-        uint8_t s = c3d_quant_to_symbol(q, &esc);
-        CHECK_EQ((int)s, (int)C3D_SYM_ESCAPE);
-        CHECK(esc >= 64u);
-        CHECK_EQ(c3d_symbol_to_quant(s, esc), q);
+        bool sp_enc = true, sp_dec = true;
+        uint32_t esc;
+        uint8_t s = c3d_quant_to_symbol(q, &esc, &sp_enc);
+        CHECK(C3D_SYM_IS_ESCAPE(s));
+        CHECK(esc >= 32u);
+        int32_t q2 = c3d_symbol_to_quant(s, esc, &sp_dec);
+        CHECK_EQ(q2, q);
+    }
+    /* Sequential sign prediction: encode a sequence, decode it, verify. */
+    int32_t seq[] = {0, 3, -2, 5, -5, 0, 1, -1, 32, -100};
+    bool sp_enc = true, sp_dec = true;
+    for (size_t i = 0; i < sizeof seq / sizeof seq[0]; ++i) {
+        uint32_t esc;
+        uint8_t s = c3d_quant_to_symbol(seq[i], &esc, &sp_enc);
+        int32_t q2 = c3d_symbol_to_quant(s, esc, &sp_dec);
+        CHECK_EQ(q2, seq[i]);
     }
 }
 

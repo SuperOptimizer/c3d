@@ -1021,30 +1021,67 @@ static inline int32_t c3d_unzigzag32(uint32_t z) {
     return (int32_t)((z >> 1) ^ -(int32_t)(z & 1u));
 }
 
-/* Map a quantized integer to a c3d alphabet symbol.
- *   If |q| ≤ 31 (i.e. zigzag(q) ≤ 62) and zigzag(q) = 63 is -32 — the direct
- *   range is zigzag ∈ [0, 63], covering signed q ∈ [-32, 31].
- *   Escape symbol is 64; escape payload (LEB128 varint of the zigzag value)
- *   is written by the caller to the subband's escape stream. */
-#define C3D_SYM_ESCAPE 64u
-#define C3D_N_SYMBOLS  65u   /* 0..63 direct + 1 escape                        */
+/* --- Sign-predictive symbol mapping ---
+ *
+ * Encodes (magnitude, sign_prediction_error) instead of zigzag:
+ *   sym 0:     |qv| = 0  (zero coeff, no sign)
+ *   sym 2k-1:  |qv| = k, sign prediction CORRECT  (k = 1..31)
+ *   sym 2k:    |qv| = k, sign prediction WRONG     (k = 1..31)
+ *   sym 63:    escape (|qv| ≥ 32), sign CORRECT
+ *   sym 64:    escape (|qv| ≥ 32), sign WRONG
+ *
+ * Prediction = sign of previous non-zero coeff in raster order (default +).
+ * At ~65-75 % accuracy on scroll CT, "correct" symbols get higher probability
+ * → lower rANS bits → ~5-15 % tighter at r ≥ 25.  Same 65-symbol alphabet
+ * and rANS infrastructure; only the mapping changes.
+ *
+ * Escape payload: LEB128 of |qv| (unsigned magnitude). */
+#define C3D_SYM_ESCAPE_LO 63u  /* escape + sign correct */
+#define C3D_SYM_ESCAPE_HI 64u  /* escape + sign wrong   */
+#define C3D_N_SYMBOLS      65u
 
-/* Returns symbol; if the symbol is C3D_SYM_ESCAPE, writes the full zigzag
- * value to *escape_zigzag_out so the caller can emit it as a LEB128 varint. */
-static inline uint8_t c3d_quant_to_symbol(int32_t q, uint32_t *escape_zigzag_out) {
-    uint32_t z = c3d_zigzag32(q);
-    if (z < 64u) {
-        *escape_zigzag_out = 0;
-        return (uint8_t)z;
+#define C3D_SYM_IS_ESCAPE(s)  ((s) >= C3D_SYM_ESCAPE_LO)
+
+static inline uint8_t c3d_quant_to_symbol(int32_t q, uint32_t *escape_mag_out,
+                                          bool *sign_pred)
+{
+    if (q == 0) { *escape_mag_out = 0; return 0; }
+    uint32_t mag = (uint32_t)(q < 0 ? -q : q);
+    bool actual_pos = (q > 0);
+    bool correct = (actual_pos == *sign_pred);
+    *sign_pred = actual_pos;
+    if (mag < 32u) {
+        *escape_mag_out = 0;
+        return (uint8_t)(1u + (mag - 1u) * 2u + (correct ? 0u : 1u));
     }
-    *escape_zigzag_out = z;
-    return (uint8_t)C3D_SYM_ESCAPE;
+    *escape_mag_out = mag;
+    return correct ? (uint8_t)C3D_SYM_ESCAPE_LO : (uint8_t)C3D_SYM_ESCAPE_HI;
 }
 
-/* Inverse: given a symbol and (when escape) a zigzag payload, recover q. */
-static inline int32_t c3d_symbol_to_quant(uint8_t sym, uint32_t escape_zigzag) {
-    uint32_t z = (sym == C3D_SYM_ESCAPE) ? escape_zigzag : (uint32_t)sym;
-    return c3d_unzigzag32(z);
+static inline int32_t c3d_symbol_to_quant(uint8_t sym, uint32_t escape_mag,
+                                          bool *sign_pred)
+{
+    if (sym == 0) return 0;
+    bool correct; int32_t mag;
+    if (C3D_SYM_IS_ESCAPE(sym)) {
+        correct = (sym == C3D_SYM_ESCAPE_LO);
+        mag = (int32_t)escape_mag;
+    } else {
+        uint32_t s1 = (uint32_t)(sym - 1u);
+        correct = ((s1 & 1u) == 0u);
+        mag = (int32_t)(s1 / 2u + 1u);
+    }
+    bool actual_pos = correct ? *sign_pred : !*sign_pred;
+    *sign_pred = actual_pos;
+    return actual_pos ? mag : -mag;
+}
+
+/* Helper: extract |qv| from a sign-predictive symbol (for α fit / wsum).
+ * Does NOT update sign_pred — read-only convenience. */
+static inline uint32_t c3d_sym_magnitude(uint8_t sym) {
+    if (sym == 0) return 0;
+    if (C3D_SYM_IS_ESCAPE(sym)) return 32u; /* approximate; real mag in escape stream */
+    return ((uint32_t)(sym - 1u)) / 2u + 1u;
 }
 
 /* --- Subband descriptor --------------------------------------------------- *
@@ -1559,18 +1596,18 @@ static size_t c3d_encode_one_subband(
     uint32_t hist[65] = {0};
     size_t escape_pos = 0;
     size_t idx = 0;
+    bool sign_pred = true;
     for (uint32_t z = sb->z0; z < sb->z0 + sb->side; ++z)
     for (uint32_t y = sb->y0; y < sb->y0 + sb->side; ++y)
     for (uint32_t x = sb->x0; x < sb->x0 + sb->side; ++x) {
         float c = coeff_buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + x];
         int32_t qv = c3d_quant(c, step);
-        uint32_t zigzag;
-        uint8_t sym = c3d_quant_to_symbol(qv, &zigzag);
+        uint32_t escape_mag;
+        uint8_t sym = c3d_quant_to_symbol(qv, &escape_mag, &sign_pred);
         sub_symbols[idx++] = sym;
         hist[sym]++;
-        if (sym == C3D_SYM_ESCAPE) {
-            /* LEB128: u32 zigzag needs at most 5 bytes. */
-            escape_pos += c3d_leb128_encode(zigzag, sub_escapes + escape_pos, 5);
+        if (C3D_SYM_IS_ESCAPE(sym)) {
+            escape_pos += c3d_leb128_encode(escape_mag, sub_escapes + escape_pos, 5);
         }
     }
     c3d_assert(idx == n);
@@ -1584,9 +1621,9 @@ static size_t c3d_encode_one_subband(
      * For every-bin-0 chunks we never reach this path (all-zero sentinel). */
     {
         double wsum = 0.0;
-        for (unsigned k = 1; k < C3D_SYM_ESCAPE; ++k) wsum += (double)k * hist[k];
-        /* Escape contributes |q| ≥ 64 each — rare in practice; approximate with 64. */
-        wsum += 64.0 * (double)hist[C3D_SYM_ESCAPE];
+        for (unsigned s = 1; s < C3D_SYM_ESCAPE_LO; ++s)
+            wsum += (double)c3d_sym_magnitude(s) * hist[s];
+        wsum += 32.0 * (double)(hist[C3D_SYM_ESCAPE_LO] + hist[C3D_SYM_ESCAPE_HI]);
         double beta = (double)step * wsum / (double)n;
         if (beta <= 1e-12) {
             *out_alpha = 0.25f;
@@ -1735,19 +1772,20 @@ static double c3d_estimate_one_subband_rd(
      * can re-compute distortion at α* without a second scan. */
     double sumabs_bin[65] = {0};
     double sumabs2_bin[65] = {0};
+    bool sign_pred_rd = true;
     for (uint32_t z = sb->z0; z < sb->z0 + sb->side; ++z)
     for (uint32_t y = sb->y0; y < sb->y0 + sb->side; ++y)
     for (uint32_t x = sb->x0; x < sb->x0 + sb->side; ++x) {
         float c = coeff_buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + x];
         float ac = c < 0.0f ? -c : c;
         int32_t qv = c3d_quant(c, step);
-        uint32_t zigzag;
-        uint8_t sym = c3d_quant_to_symbol(qv, &zigzag);
+        uint32_t escape_mag;
+        uint8_t sym = c3d_quant_to_symbol(qv, &escape_mag, &sign_pred_rd);
         hist[sym]++;
         sumabs_bin[sym]  += (double)ac;
         sumabs2_bin[sym] += (double)ac * (double)ac;
-        if (sym == C3D_SYM_ESCAPE) {
-            uint32_t v = zigzag;
+        if (C3D_SYM_IS_ESCAPE(sym)) {
+            uint32_t v = escape_mag;
             do { escape_bytes++; v >>= 7; } while (v);
         }
     }
@@ -1755,8 +1793,9 @@ static double c3d_estimate_one_subband_rd(
     /* Laplacian-fit α from the histogram — mirrors Q1 exactly.  This is
      * the α the real emit will write and the decoder will use. */
     double wsum = 0.0;
-    for (unsigned k = 1; k < C3D_SYM_ESCAPE; ++k) wsum += (double)k * hist[k];
-    wsum += 64.0 * (double)hist[C3D_SYM_ESCAPE];
+    for (unsigned s = 1; s < C3D_SYM_ESCAPE_LO; ++s)
+        wsum += (double)c3d_sym_magnitude(s) * hist[s];
+    wsum += 32.0 * (double)(hist[C3D_SYM_ESCAPE_LO] + hist[C3D_SYM_ESCAPE_HI]);
     float alpha;
     if (wsum <= 0.0) {
         alpha = 0.25f;
@@ -1779,20 +1818,20 @@ static double c3d_estimate_one_subband_rd(
      * Bin 0 reconstructs to 0 → Σc² = Σ|c|². */
     double dist = 0.0;
     dist += sumabs2_bin[0];
-    for (unsigned k = 1; k < C3D_SYM_ESCAPE; ++k) {
-        double recon = ((double)k - 0.5 + alpha) * (double)step;
-        dist += sumabs2_bin[k] - 2.0 * recon * sumabs_bin[k] + (double)hist[k] * recon * recon;
+    for (unsigned s = 1; s < C3D_SYM_ESCAPE_LO; ++s) {
+        uint32_t mag = c3d_sym_magnitude(s);
+        double recon = ((double)mag - 0.5 + alpha) * (double)step;
+        dist += sumabs2_bin[s] - 2.0 * recon * sumabs_bin[s] + (double)hist[s] * recon * recon;
     }
-    /* Escape: reconstruction ≈ |q|·step (α = 0.5 for large |q|).  Use the
-     * bin's mean |c| as a proxy — captures most of the truth without a
-     * second scan. */
-    if (hist[C3D_SYM_ESCAPE]) {
-        double mean_ac = sumabs_bin[C3D_SYM_ESCAPE] / (double)hist[C3D_SYM_ESCAPE];
+    /* Escape symbols (63 and 64): reconstruction ≈ |q|·step.  Use the per-bin
+     * mean |c| as a proxy. */
+    for (unsigned es = C3D_SYM_ESCAPE_LO; es <= C3D_SYM_ESCAPE_HI; ++es) {
+        if (!hist[es]) continue;
+        double mean_ac = sumabs_bin[es] / (double)hist[es];
         double k_approx = mean_ac / (double)step;
-        double recon = k_approx * (double)step;   /* near |c| — small residual */
-        dist += sumabs2_bin[C3D_SYM_ESCAPE]
-              - 2.0 * recon * sumabs_bin[C3D_SYM_ESCAPE]
-              + (double)hist[C3D_SYM_ESCAPE] * recon * recon;
+        double recon = k_approx * (double)step;
+        dist += sumabs2_bin[es] - 2.0 * recon * sumabs_bin[es]
+              + (double)hist[es] * recon * recon;
     }
 
     if (hist[0] == n) {
@@ -1847,17 +1886,17 @@ static double c3d_estimate_one_subband_bytes(
     size_t n = (size_t)sb->side * sb->side * sb->side;
     uint32_t hist[65] = {0};
     size_t escape_bytes = 0;
+    bool sign_pred_est = true;
     for (uint32_t z = sb->z0; z < sb->z0 + sb->side; ++z)
     for (uint32_t y = sb->y0; y < sb->y0 + sb->side; ++y)
     for (uint32_t x = sb->x0; x < sb->x0 + sb->side; ++x) {
         float c = coeff_buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + x];
         int32_t qv = c3d_quant(c, step);
-        uint32_t zigzag;
-        uint8_t sym = c3d_quant_to_symbol(qv, &zigzag);
+        uint32_t escape_mag;
+        uint8_t sym = c3d_quant_to_symbol(qv, &escape_mag, &sign_pred_est);
         hist[sym]++;
-        if (sym == C3D_SYM_ESCAPE) {
-            /* LEB128 byte count for zigzag value. */
-            uint32_t v = zigzag;
+        if (C3D_SYM_IS_ESCAPE(sym)) {
+            uint32_t v = escape_mag;
             do { escape_bytes++; v >>= 7; } while (v);
         }
     }
@@ -2649,24 +2688,23 @@ static void c3d_decode_one_subband(
     const uint8_t *esc_ptr = in + r;
     size_t esc_remaining = in_size - r;
 
-    /* Dequantize + scatter into coeff_buf. */
+    /* Dequantize + scatter into coeff_buf (sign-predictive symbols). */
+    bool sign_pred_dec = true;
     size_t idx = 0;
     for (uint32_t z = sb->z0; z < sb->z0 + sb->side; ++z)
     for (uint32_t y = sb->y0; y < sb->y0 + sb->side; ++y)
     for (uint32_t x = sb->x0; x < sb->x0 + sb->side; ++x) {
         uint8_t sym = sub_symbols[idx++];
-        uint32_t zigzag;
-        if (sym == C3D_SYM_ESCAPE) {
+        uint32_t escape_mag = 0;
+        if (C3D_SYM_IS_ESCAPE(sym)) {
             uint64_t zv = 0;
             size_t c = c3d_leb128_decode(esc_ptr, esc_remaining, &zv);
             c3d_assert(zv <= 0xffffffffull);
-            zigzag = (uint32_t)zv;
+            escape_mag = (uint32_t)zv;
             esc_ptr += c;
             esc_remaining -= c;
-        } else {
-            zigzag = sym;
         }
-        int32_t qv = c3d_unzigzag32(zigzag);
+        int32_t qv = c3d_symbol_to_quant(sym, escape_mag, &sign_pred_dec);
         coeff_buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + x]
             = c3d_dequant(qv, step, alpha);
     }
@@ -3453,13 +3491,14 @@ void c3d_ctx_builder_observe_chunk(c3d_ctx_builder *b, const uint8_t *in) {
              * now in raw (un-normalised) units so we must scale step into the
              * same space. */
             float step = b->q_ref * c3d_subband_baseline(sidx) * e->coeff_scale;
+            bool sign_pred_obs = true;
             for (uint32_t z = sb.z0; z < sb.z0 + sb.side; ++z)
             for (uint32_t y = sb.y0; y < sb.y0 + sb.side; ++y)
             for (uint32_t x = sb.x0; x < sb.x0 + sb.side; ++x) {
                 float c = e->coeff_buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + x];
                 int32_t qv = c3d_quant(c, step);
-                uint32_t z_unused;
-                uint8_t sym = c3d_quant_to_symbol(qv, &z_unused);
+                uint32_t esc_unused;
+                uint8_t sym = c3d_quant_to_symbol(qv, &esc_unused, &sign_pred_obs);
                 b->histograms[sidx][sym]++;
             }
         }
