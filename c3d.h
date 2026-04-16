@@ -120,6 +120,20 @@ void         c3d_encoder_free(c3d_encoder *);
 c3d_decoder *c3d_decoder_new(void);
 void         c3d_decoder_free(c3d_decoder *);
 
+/* Reset inter-chunk prediction state (Morton-neighbour LL_5 cache +
+ * rate-control warm-start).  Call at the start of a fresh shard or
+ * when switching to non-sequential decode. */
+void c3d_encoder_reset_inter_chunk(c3d_encoder *);
+void c3d_decoder_reset_inter_chunk(c3d_decoder *);
+
+/* Enable / disable inter-chunk Morton-neighbour LL_5 prediction on an
+ * encoder.  Disabled by default — the stateless chunk API is
+ * byte-deterministic across reused-vs-fresh encoders.  Enable inside
+ * a shard-level sequential encode loop; the encoder will use its
+ * running prev_ll5 as a prediction reference for each subsequent
+ * chunk.  c3d_shard_encode_all enables this automatically. */
+void c3d_encoder_enable_inter_chunk(c3d_encoder *, bool enabled);
+
 /* Reusable-context variants — same semantics as the stateless calls below
  * but allocate-once-reuse-many.  Recommended for any caller doing >1 chunk. */
 size_t c3d_encoder_chunk_encode(c3d_encoder *, const uint8_t *in,

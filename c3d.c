@@ -1401,7 +1401,9 @@ static void c3d_add_parent_prediction(float *buf,
 #define C3D_CHUNK_FIXED_SIZE 388u
 #define C3D_CHUNK_ALPHA_OFFSET 352u
 #define C3D_CHUNK_FLAGS_OFFSET 16u
-#define C3D_FLAG_LL_PREDICTED  0x01u   /* LL_5 is a residual vs ctx->ll_reference */
+#define C3D_FLAG_LL_PREDICTED  0x01u   /* LL_5 is a residual; any reference source */
+#define C3D_FLAG_LL_FROM_CTX   0x02u   /* reference source = ctx->ll_reference */
+#define C3D_FLAG_LL_FROM_PREV  0x04u   /* reference source = decoded Morton-prev chunk */
 
 /* uint8 <-> α float in [0.40, 0.50] — clamp + linear map.  Q1 writes one
  * byte per subband; decoder reads it back for the Laplacian-optimal
@@ -1633,10 +1635,22 @@ struct c3d_encoder {
     float    allocator_steps[C3D_N_SUBBANDS];
     bool     has_allocator_steps;
 
-    /* §T1b — set by prepare_chunk when LL_5 reference was actually
-     * subtracted (prediction helped for this chunk).  Read by the
-     * outer encode function to set the chunk header flag. */
+    /* §T1b/§S2 — set by prepare_chunk when LL_5 reference was
+     * subtracted (prediction helped).  ll_prediction_source records
+     * which reference was used so the outer encode function can set
+     * the right chunk header flag bit (FROM_CTX vs FROM_PREV). */
     bool     ll_prediction_active;
+    uint8_t  ll_prediction_source;   /* 1=ctx, 2=prev */
+
+    /* §S2 — Morton-neighbor LL_5 prediction state.  Opt-in via
+     * c3d_encoder_enable_inter_chunk().  When enabled, the encoder
+     * populates prev_ll5 after each encode and uses it as the
+     * reference for the next chunk (takes precedence over
+     * ctx->ll_reference).  Default OFF so the standalone chunk API
+     * stays byte-deterministic across reused-vs-fresh encoders. */
+    bool     inter_chunk_enabled;
+    float    prev_ll5[512];
+    bool     has_prev_ll5;
 };
 
 struct c3d_decoder {
@@ -1649,6 +1663,14 @@ struct c3d_decoder {
     c3d_rans_tables *cached_tables;
     uint8_t          cached_ctx_id[16];
     bool             cached_valid;
+
+    /* §S2 — Morton-neighbor LL_5 prediction state.  Populated after
+     * each decode with the reconstructed LL_5 of that chunk.  Next
+     * chunk's decode uses this as the reference when its header flag
+     * C3D_FLAG_LL_PREDICTED is set.  Reset via
+     * c3d_decoder_reset_inter_chunk() when starting a fresh shard. */
+    float    prev_ll5[512];
+    bool     has_prev_ll5;
 };
 
 c3d_encoder *c3d_encoder_new(void) {
@@ -1665,6 +1687,10 @@ c3d_encoder *c3d_encoder_new(void) {
     e->last_target_ratio = 0.0f;
     e->has_fine_hist = false;
     e->has_allocator_steps = false;
+    e->ll_prediction_active = false;
+    e->ll_prediction_source = 0;
+    e->inter_chunk_enabled = false;
+    e->has_prev_ll5 = false;
     return e;
 }
 void c3d_encoder_free(c3d_encoder *e) {
@@ -1683,6 +1709,7 @@ c3d_decoder *c3d_decoder_new(void) {
     d->cached_tables = NULL;
     memset(d->cached_ctx_id, 0, 16);
     d->cached_valid = false;
+    d->has_prev_ll5 = false;
     return d;
 }
 void c3d_decoder_free(c3d_decoder *d) {
@@ -1760,17 +1787,32 @@ static bool c3d_prepare_chunk(const uint8_t *in, uint8_t *out,
         if (mx > max_abs) max_abs = mx;
     }
 
-    /* §T1b — LL_5 inter-chunk reference subtraction.  Runs AFTER the
-     * max_abs scan so that coeff_scale reflects the pre-subtraction
-     * magnitudes (otherwise zeroing LL_5 would drop coeff_scale and
-     * oversquash every other subband's step).
+    /* §T1b + §S2 — LL_5 inter-chunk reference subtraction.
      *
-     * Applied only when the residual is actually smaller than the raw
-     * LL_5 (opportunistic): for heterogeneous corpora the corpus-average
-     * reference is a poor match, and subtracting would inflate the
-     * residual vs the original.  The encoder signals success by writing
-     * the C3D_FLAG_LL_PREDICTED flag at the caller. */
-    if (ctx && ctx->has_ll_reference) {
+     * Reference source (priority order):
+     *   §S2: s->prev_ll5 — Morton-neighbour's decoded LL_5, updated
+     *        after each encode.  Only set during shard-level sequential
+     *        encoding via c3d_shard_encode_all.
+     *   §T1b: ctx->ll_reference — corpus-average from ctx_builder.
+     *
+     * Applied only when the residual is smaller than the raw LL_5
+     * (opportunistic): for non-matching references (heterogeneous data,
+     * first chunk of a sequence with no prev_ll5), the raw values are
+     * kept and the flag stays off.  Runs AFTER max_abs scan so
+     * coeff_scale tracks the PRE-subtraction magnitudes (otherwise
+     * zeroing LL_5 drops coeff_scale and oversquashes every subband). */
+    const float *ll_ref = NULL;
+    uint8_t ll_source = 0;
+    if (s->inter_chunk_enabled && s->has_prev_ll5) {
+        ll_ref = s->prev_ll5;
+        ll_source = 2;  /* §S2 Morton-prev */
+    } else if (ctx && ctx->has_ll_reference) {
+        ll_ref = ctx->ll_reference;
+        ll_source = 1;  /* §T1b ctx-reference */
+    }
+    s->ll_prediction_active = false;
+    s->ll_prediction_source = 0;
+    if (ll_ref) {
         size_t k = 0;
         float mx_pred = 0.0f;
         float scratch_ll[512];
@@ -1778,16 +1820,13 @@ static bool c3d_prepare_chunk(const uint8_t *in, uint8_t *out,
         for (unsigned y = 0; y < 8; ++y)
         for (unsigned x = 0; x < 8; ++x) {
             size_t pos = z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + x;
-            float resid = s->coeff_buf[pos] - ctx->ll_reference[k];
+            float resid = s->coeff_buf[pos] - ll_ref[k];
             scratch_ll[k] = resid;
             float a = fabsf(resid);
             if (a > mx_pred) mx_pred = a;
             k++;
         }
         if (mx_pred < s->max_abs_per_subband[0]) {
-            /* Prediction helps — commit the residuals and flag via
-             * s->ll_prediction_active so emit_entropy_at_q's caller can
-             * set the chunk header flag. */
             k = 0;
             for (unsigned z = 0; z < 8; ++z)
             for (unsigned y = 0; y < 8; ++y)
@@ -1797,11 +1836,8 @@ static bool c3d_prepare_chunk(const uint8_t *in, uint8_t *out,
             }
             s->max_abs_per_subband[0] = mx_pred;
             s->ll_prediction_active = true;
-        } else {
-            s->ll_prediction_active = false;
+            s->ll_prediction_source = ll_source;
         }
-    } else {
-        s->ll_prediction_active = false;
     }
 
     c3d_write_f32_le(out + 8, dc_offset);
@@ -2830,7 +2866,12 @@ size_t c3d_encoder_chunk_encode_at_q(c3d_encoder *e, const uint8_t *in, float q,
     float dc, cs;
     bool has_entropy = c3d_prepare_chunk(in, out, e, ctx, &dc, &cs);
     c3d_write_ctx_header_fields(out, ctx);
-    if (e->ll_prediction_active) out[C3D_CHUNK_FLAGS_OFFSET] |= C3D_FLAG_LL_PREDICTED;
+    if (e->ll_prediction_active) {
+        out[C3D_CHUNK_FLAGS_OFFSET] |= C3D_FLAG_LL_PREDICTED;
+        out[C3D_CHUNK_FLAGS_OFFSET] |= (e->ll_prediction_source == 2)
+                                      ? C3D_FLAG_LL_FROM_PREV
+                                      : C3D_FLAG_LL_FROM_CTX;
+    }
     if (!has_entropy) return C3D_CHUNK_FIXED_SIZE;
     return c3d_emit_entropy_at_q(q, e, ctx, out, out_cap);
 }
@@ -2871,7 +2912,12 @@ size_t c3d_encoder_chunk_encode(c3d_encoder *e, const uint8_t *in,
     float dc, cs;
     bool has_entropy = c3d_prepare_chunk(in, out, e, ctx, &dc, &cs);
     c3d_write_ctx_header_fields(out, ctx);
-    if (e->ll_prediction_active) out[C3D_CHUNK_FLAGS_OFFSET] |= C3D_FLAG_LL_PREDICTED;
+    if (e->ll_prediction_active) {
+        out[C3D_CHUNK_FLAGS_OFFSET] |= C3D_FLAG_LL_PREDICTED;
+        out[C3D_CHUNK_FLAGS_OFFSET] |= (e->ll_prediction_source == 2)
+                                      ? C3D_FLAG_LL_FROM_PREV
+                                      : C3D_FLAG_LL_FROM_CTX;
+    }
     size_t total;
     if (!has_entropy) {
         return C3D_CHUNK_FIXED_SIZE;
@@ -3004,7 +3050,52 @@ size_t c3d_encoder_chunk_encode(c3d_encoder *e, const uint8_t *in,
 
     e->last_q = q;
     e->last_target_ratio = target_ratio;
+
+    /* §S2 — update prev_ll5 with this chunk's decoder-equivalent
+     * reconstructed LL_5, so the next chunk in Morton order can use
+     * it as a prediction reference.  Only runs when inter-chunk
+     * prediction has been explicitly enabled (shard-sequential mode)
+     * — standalone encodes stay byte-deterministic. */
+    if (e->inter_chunk_enabled && total > C3D_CHUNK_FIXED_SIZE) {
+        float step0   = c3d_read_f32_le(out + 40);   /* qmul[0] */
+        uint8_t av    = out[C3D_CHUNK_ALPHA_OFFSET + 0];
+        float alpha0  = av ? c3d_alpha_from_u8(av) : c3d_default_alpha(0);
+        float dz0     = c3d_dz_half_for_kind(0, step0);
+        const float *ref_used = NULL;
+        if (e->ll_prediction_active) {
+            ref_used = (e->ll_prediction_source == 2) ? e->prev_ll5
+                     : (e->ll_prediction_source == 1 && ctx) ? ctx->ll_reference
+                     : NULL;
+        }
+        float new_ll5[512];
+        size_t k = 0;
+        for (unsigned z = 0; z < 8; ++z)
+        for (unsigned y = 0; y < 8; ++y)
+        for (unsigned x = 0; x < 8; ++x) {
+            float resid = e->coeff_buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + x];
+            int32_t qv = c3d_quant(resid, step0, dz0);
+            float recon_resid = c3d_dequant(qv, step0, dz0, alpha0);
+            new_ll5[k] = ref_used ? recon_resid + ref_used[k] : recon_resid;
+            k++;
+        }
+        memcpy(e->prev_ll5, new_ll5, sizeof new_ll5);
+        e->has_prev_ll5 = true;
+    }
+
     return total;
+}
+
+void c3d_encoder_reset_inter_chunk(c3d_encoder *e) {
+    c3d_assert(e);
+    e->has_prev_ll5 = false;
+    e->last_q = 0.0f;
+    e->last_target_ratio = 0.0f;
+}
+
+void c3d_encoder_enable_inter_chunk(c3d_encoder *e, bool enabled) {
+    c3d_assert(e);
+    e->inter_chunk_enabled = enabled;
+    if (!enabled) e->has_prev_ll5 = false;
 }
 
 size_t c3d_chunk_encode_max_size(void) { return C3D_CHUNK_ENCODE_MAX_SIZE; }
@@ -3328,16 +3419,44 @@ void c3d_decoder_chunk_decode_lod(c3d_decoder *d,
                                cached_ext ? &cached_ext[s] : NULL);
     }
 
-    /* §T1b — add LL_5 reference back when the chunk header flags it. */
-    if ((in[C3D_CHUNK_FLAGS_OFFSET] & C3D_FLAG_LL_PREDICTED) && ctx
-        && ctx->has_ll_reference) {
+    /* §T1b + §S2 — add LL_5 reference back per the chunk's flag bits.
+     * FROM_PREV: decoder must have consumed the Morton-prev chunk
+     * already (shard-sequential decode).  FROM_CTX: decoder must have
+     * the ctx with has_ll_reference set.  Missing source → panic. */
+    uint8_t flags = in[C3D_CHUNK_FLAGS_OFFSET];
+    const float *ll_ref = NULL;
+    if (flags & C3D_FLAG_LL_PREDICTED) {
+        if (flags & C3D_FLAG_LL_FROM_PREV) {
+            c3d_assert(d->has_prev_ll5);
+            ll_ref = d->prev_ll5;
+        } else if (flags & C3D_FLAG_LL_FROM_CTX) {
+            c3d_assert(ctx && ctx->has_ll_reference);
+            ll_ref = ctx->ll_reference;
+        }
+    }
+    if (ll_ref) {
         size_t k = 0;
         for (unsigned z = 0; z < 8; ++z)
         for (unsigned y = 0; y < 8; ++y)
         for (unsigned x = 0; x < 8; ++x) {
             d->coeff_buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + x]
-                += ctx->ll_reference[k++];
+                += ll_ref[k++];
         }
+    }
+
+    /* §S2 — snapshot this chunk's fully-reconstructed LL_5 for the next
+     * chunk's Morton-neighbor prediction.  Taken BEFORE IDWT so the
+     * residual + reference sum is available in coeff_buf at subband 0
+     * positions; after IDWT those positions would hold spatial data. */
+    if (lod == 0) {
+        size_t k = 0;
+        for (unsigned z = 0; z < 8; ++z)
+        for (unsigned y = 0; y < 8; ++y)
+        for (unsigned x = 0; x < 8; ++x) {
+            d->prev_ll5[k++] = d->coeff_buf[
+                z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + x];
+        }
+        d->has_prev_ll5 = true;
     }
 
     unsigned n_synth = C3D_N_DWT_LEVELS - lod;
@@ -3375,6 +3494,11 @@ void c3d_decoder_chunk_decode(c3d_decoder *d, const uint8_t *in, size_t in_len,
                               const c3d_ctx *ctx, uint8_t *out)
 {
     c3d_decoder_chunk_decode_lod(d, in, in_len, 0, ctx, out);
+}
+
+void c3d_decoder_reset_inter_chunk(c3d_decoder *d) {
+    c3d_assert(d);
+    d->has_prev_ll5 = false;
 }
 
 /* §I3.  Batched multi-chunk decode — loop the single-chunk API.  When all
@@ -3782,18 +3906,45 @@ void c3d_shard_encode_all(c3d_shard *s,
         c3d_shard_auto_train_ctx(s, chunks, n_train);
     }
 
-    /* Encode all chunks via the shard's ctx. */
+    /* §S2 — sort into Morton order and encode sequentially so each chunk's
+     * encode sees the previous chunk's decoded LL_5 as a neighbour
+     * prediction reference.  The encoder's prev_ll5 is reset at the start
+     * so the first chunk falls back to ctx->ll_reference (if any). */
+    size_t *order = malloc(n_chunks * sizeof *order);
+    uint32_t *morton = malloc(n_chunks * sizeof *morton);
+    c3d_assert(order && morton);
+    for (size_t i = 0; i < n_chunks; ++i) {
+        order[i]  = i;
+        morton[i] = c3d_morton12(coords[i][0], coords[i][1], coords[i][2]);
+    }
+    /* Insertion sort — plenty fast for 4096 entries, zero deps. */
+    for (size_t i = 1; i < n_chunks; ++i) {
+        size_t k = order[i];
+        uint32_t m = morton[k];
+        size_t j = i;
+        while (j > 0 && morton[order[j - 1]] > m) {
+            order[j] = order[j - 1];
+            --j;
+        }
+        order[j] = k;
+    }
+
     c3d_encoder *enc = c3d_encoder_new();
+    c3d_encoder_enable_inter_chunk(enc, true);
+    c3d_encoder_reset_inter_chunk(enc);
     uint8_t *buf = aligned_alloc(C3D_ALIGN, C3D_CHUNK_ENCODE_MAX_SIZE);
     c3d_assert(buf);
     const c3d_ctx *ctx = c3d_shard_ctx(s);
     for (size_t i = 0; i < n_chunks; ++i) {
-        size_t n = c3d_encoder_chunk_encode(enc, chunks[i], target_ratio, ctx,
+        size_t ci = order[i];
+        size_t n = c3d_encoder_chunk_encode(enc, chunks[ci], target_ratio, ctx,
                                              buf, C3D_CHUNK_ENCODE_MAX_SIZE);
-        c3d_shard_put_chunk(s, coords[i][0], coords[i][1], coords[i][2], buf, n);
+        c3d_shard_put_chunk(s, coords[ci][0], coords[ci][1], coords[ci][2], buf, n);
     }
     free(buf);
     c3d_encoder_free(enc);
+    free(order);
+    free(morton);
 }
 
 void c3d_shard_decode_chunk_lod(const c3d_shard *s,
