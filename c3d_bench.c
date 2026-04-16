@@ -57,18 +57,25 @@ static size_t openh264_encode_decode(const uint8_t *in, int qp, uint8_t *out_yuv
     ep.iPicWidth = W; ep.iPicHeight = H;
     ep.iRCMode = RC_OFF_MODE; ep.iTargetBitrate = 0;
     ep.fMaxFrameRate = 30;
-    ep.iUsageType = CAMERA_VIDEO_REAL_TIME;
+    ep.iUsageType = SCREEN_CONTENT_REAL_TIME;  /* enables more expensive intra tools */
     ep.iSpatialLayerNum = 1;
     ep.sSpatialLayers[0].iVideoWidth  = W;
     ep.sSpatialLayers[0].iVideoHeight = H;
     ep.sSpatialLayers[0].fFrameRate   = 30;
-    ep.sSpatialLayers[0].iDLayerQp    = qp;   /* actual QP under RC_OFF_MODE */
+    ep.sSpatialLayers[0].iDLayerQp    = qp;
     ep.iTemporalLayerNum = 1;
-    ep.uiIntraPeriod = 1;
+    ep.uiIntraPeriod = 0;  /* single-GOP: 1 I-frame + 255 P-frames per chunk,
+                            * letting H.264 exploit z-axis (temporal) correlation
+                            * the same way c3d's 3D DWT does.  All-I handicaps
+                            * H.264 by discarding inter-slice redundancy. */
     ep.eSpsPpsIdStrategy = CONSTANT_ID;
     ep.iMultipleThreadIdc = 1;
     ep.iComplexityMode = HIGH_COMPLEXITY;
     ep.iMaxQp = qp; ep.iMinQp = qp;
+    ep.iEntropyCodingModeFlag = 1;             /* CABAC (+10-15 % over CAVLC) */
+    ep.bEnableAdaptiveQuant = true;            /* per-MB QP adaptation */
+    ep.bEnableBackgroundDetection = false;     /* irrelevant for all-intra */
+    ep.bEnableFrameCroppingFlag = false;
 
     if ((*enc)->InitializeExt(enc, &ep) != 0) { fprintf(stderr, "enc init\n"); exit(1); }
     int pf = videoFormatI420;
