@@ -8,6 +8,10 @@ c3d ("compress3d") is a custom compression codec for very-large-than-RAM/disk 3D
 
 See `PLAN.md` for the full design spec; CLAUDE.md only summarises what shapes day-to-day editing.
 
+## Editing rules
+
+- **Never use `sed` for code edits.** Always use the Edit tool to make changes manually and iteratively, one site at a time. Bulk sed replacements across a large file like `c3d.c` silently break surrounding context (wrong variable names, mismatched braces, inconsistent state threading) and the damage is hard to diagnose. Read each call site, understand its context, edit it individually.
+
 ## Hard constraints (non-negotiable, see `PLAN.md` §0)
 
 - **C23**, single `c3d.h` + `c3d.c`, libc only. `openh264` permitted in the benchmark harness only; the rANS reference (`ryg_rans`) is inlined into `c3d.c`.
