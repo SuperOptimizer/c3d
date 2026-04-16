@@ -2873,7 +2873,28 @@ size_t c3d_encoder_chunk_encode(c3d_encoder *e, const uint8_t *in,
 
         /* Pass 2: calibrated R-D optimization + re-emit. */
         c3d_rd_allocate_hybrid(e, ctx, target_entropy, q, actual_sb);
-        total = c3d_emit_entropy_at_q(q, e, ctx, out, out_cap);
+
+        /* §T3b: skip the second emit when the allocator's steps are within
+         * ±1% of the global step everywhere — pass 1's output already
+         * matches what pass 2 would produce.  Common on uniform chunks
+         * where the global-q allocation is already R-D optimal. */
+        bool degenerate = true;
+        for (unsigned s = 0; s < C3D_N_SUBBANDS; ++s) {
+            float baseline = (ctx && ctx->has_quantizer_baseline)
+                            ? ctx->quantizer_baseline[s]
+                            : (e->has_dyn_baselines ? e->dyn_baselines[s]
+                                                    : c3d_subband_baseline(s));
+            float global_step = q * baseline * e->coeff_scale;
+            float ratio = (global_step > 0.0f)
+                        ? e->allocator_steps[s] / global_step : 1.0f;
+            if (ratio < 0.99f || ratio > 1.01f) { degenerate = false; break; }
+        }
+        if (degenerate) {
+            e->has_allocator_steps = false;
+            /* total + out are already from pass 1 with global steps. */
+        } else {
+            total = c3d_emit_entropy_at_q(q, e, ctx, out, out_cap);
+        }
     } else {
         total = c3d_emit_entropy_at_q(q, e, ctx, out, out_cap);
     }
