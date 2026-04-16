@@ -2396,7 +2396,7 @@ static void c3d_rd_allocate_hybrid(c3d_encoder *s, const c3d_ctx *ctx,
     c3d_build_fine_hist(s);
 
     static const float mults[C3D_RD_NCAND] = {
-        0.80f, 0.85f, 0.90f, 0.95f, 1.0f, 1.05f, 1.10f, 1.15f, 1.20f
+        0.70f, 0.78f, 0.86f, 0.93f, 1.0f, 1.07f, 1.16f, 1.27f, 1.43f
     };
 
     double rate[C3D_N_SUBBANDS][C3D_RD_NCAND];
