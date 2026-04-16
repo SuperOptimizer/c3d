@@ -256,6 +256,35 @@ void c3d_shard_decode_chunk_lod (const c3d_shard *,
                                  uint32_t cx, uint32_t cy, uint32_t cz,
                                  uint8_t lod, uint8_t *out);
 
+/* ─── shard-level batch helpers ──────────────────────────────────────────── *
+ *
+ * These wrap c3d_shard_set_ctx + per-chunk encode/decode in a single call so
+ * callers who have the full shard up-front get the inter-chunk wins (per-
+ * shard freq tables, LL_5 reference) without having to wire ctx training
+ * themselves.  The per-chunk APIs above remain fully supported — these
+ * helpers are pure additions for the shard-level workflow.
+ *
+ * c3d_shard_auto_train_ctx: build a ctx from a sample of training chunks
+ *   and embed it in the shard.  Subsequent c3d_shard_encode_chunk / decode
+ *   calls automatically use the embedded ctx.  When the training chunks
+ *   are spatially close (same shard), the corpus-average LL_5 reference
+ *   inside the ctx tightens the LL_5 entropy by 5-15 %.
+ */
+void c3d_shard_auto_train_ctx(c3d_shard *,
+                              const uint8_t *const *training_chunks,
+                              size_t n_training);
+
+/* c3d_shard_encode_all: auto-train the ctx from the input chunks (or use
+ * the shard's existing ctx), then encode every chunk.  `coords[i]` holds
+ * (cx, cy, cz) for chunk i.  All chunks must be valid 256³ u8 buffers
+ * (32-byte aligned).  After return the shard contains all chunks; serialise
+ * with c3d_shard_serialize. */
+void c3d_shard_encode_all(c3d_shard *,
+                          const uint8_t *const *chunks,
+                          const uint32_t (*coords)[3],
+                          size_t n_chunks,
+                          float target_ratio);
+
 #ifdef __cplusplus
 }
 #endif

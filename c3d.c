@@ -1710,10 +1710,31 @@ static bool c3d_prepare_chunk(const uint8_t *in, uint8_t *out,
     /* Ingest: u8 → f32 − 128 − dc_offset.  Two passes over `in` (integer
      * accumulator on the first, no coeff_buf write) + one pass that writes
      * coeff_buf exactly once.  Saves one 64 MiB coeff_buf round-trip vs the
-     * naive (write f32-128 then subtract dc) ordering. */
+     * naive (write f32-128 then subtract dc) ordering.
+     *
+     * Uniform-chunk fast path: scan tracks min/max alongside sum.  If
+     * min == max, every voxel is the same and the DWT of the centred
+     * buffer is exactly zero — skip DWT (~80 ms saved per uniform chunk).
+     * Critical for masked scroll shards where 75-85 % of chunks are
+     * either all-air or all-material. */
     uint64_t u8_sum = 0;
-    for (size_t i = 0; i < C3D_VOXELS_PER_CHUNK; ++i) u8_sum += in[i];
-    float dc_offset = (float)u8_sum / (float)C3D_VOXELS_PER_CHUNK - 128.0f;
+    uint8_t  u8_min = 255, u8_max = 0;
+    for (size_t i = 0; i < C3D_VOXELS_PER_CHUNK; ++i) {
+        uint8_t v = in[i];
+        u8_sum += v;
+        if (v < u8_min) u8_min = v;
+        if (v > u8_max) u8_max = v;
+    }
+    float dc_offset;
+    if (u8_min == u8_max) {
+        dc_offset = (float)u8_min - 128.0f;
+        c3d_write_f32_le(out + 8, dc_offset);
+        c3d_write_f32_le(out + 12, 1.0f);
+        *out_dc_offset = dc_offset;
+        *out_coeff_scale = 1.0f;
+        return false;   /* empty entropy: 388 B header reconstructs uniform u8 */
+    }
+    dc_offset = (float)u8_sum / (float)C3D_VOXELS_PER_CHUNK - 128.0f;
     for (size_t i = 0; i < C3D_VOXELS_PER_CHUNK; ++i) {
         s->coeff_buf[i] = (float)in[i] - 128.0f - dc_offset;
     }
@@ -3726,6 +3747,53 @@ void c3d_shard_encode_chunk(c3d_shard *s,
     size_t n = c3d_chunk_encode(in, target_ratio, shard_ctx, buf, C3D_CHUNK_ENCODE_MAX_SIZE);
     c3d_shard_put_chunk(s, cx, cy, cz, buf, n);
     free(buf);
+}
+
+/* --- Shard-level batch helpers ------------------------------------------- */
+
+void c3d_shard_auto_train_ctx(c3d_shard *s,
+                              const uint8_t *const *training_chunks,
+                              size_t n_training)
+{
+    c3d_assert(s && training_chunks);
+    if (n_training == 0) return;
+    c3d_ctx_builder *b = c3d_ctx_builder_new();
+    for (size_t i = 0; i < n_training; ++i) {
+        if (training_chunks[i]) c3d_ctx_builder_observe_chunk(b, training_chunks[i]);
+    }
+    c3d_ctx *ctx = c3d_ctx_builder_finish(b, /*include_freq_tables=*/true);
+    c3d_shard_set_ctx(s, ctx);
+    c3d_ctx_free(ctx);
+}
+
+void c3d_shard_encode_all(c3d_shard *s,
+                          const uint8_t *const *chunks,
+                          const uint32_t (*coords)[3],
+                          size_t n_chunks,
+                          float target_ratio)
+{
+    c3d_assert(s && chunks && coords);
+    /* Auto-train ctx if the caller hasn't provided one.  Use up to 64 of the
+     * input chunks as the training set — large enough to get stable freq
+     * tables and a representative LL_5 reference, small enough that ctx
+     * training is a small fraction of total encode time. */
+    if (!c3d_shard_ctx(s) && n_chunks > 0) {
+        size_t n_train = n_chunks < 64 ? n_chunks : 64;
+        c3d_shard_auto_train_ctx(s, chunks, n_train);
+    }
+
+    /* Encode all chunks via the shard's ctx. */
+    c3d_encoder *enc = c3d_encoder_new();
+    uint8_t *buf = aligned_alloc(C3D_ALIGN, C3D_CHUNK_ENCODE_MAX_SIZE);
+    c3d_assert(buf);
+    const c3d_ctx *ctx = c3d_shard_ctx(s);
+    for (size_t i = 0; i < n_chunks; ++i) {
+        size_t n = c3d_encoder_chunk_encode(enc, chunks[i], target_ratio, ctx,
+                                             buf, C3D_CHUNK_ENCODE_MAX_SIZE);
+        c3d_shard_put_chunk(s, coords[i][0], coords[i][1], coords[i][2], buf, n);
+    }
+    free(buf);
+    c3d_encoder_free(enc);
 }
 
 void c3d_shard_decode_chunk_lod(const c3d_shard *s,
