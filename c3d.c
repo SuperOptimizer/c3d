@@ -1365,6 +1365,11 @@ struct c3d_encoder {
      * out-of-bounds. */
     uint32_t fine_prefix[C3D_N_SUBBANDS][C3D_FINE_BINS + 1];
     bool     has_fine_hist;
+    /* Per-subband step chosen by the R-D allocator (§Q3).  When
+     * has_allocator_steps is set, c3d_emit_entropy_at_q uses these values
+     * directly instead of step = q*baseline*coeff_scale. */
+    float    allocator_steps[C3D_N_SUBBANDS];
+    bool     has_allocator_steps;
 };
 
 struct c3d_decoder {
@@ -1392,6 +1397,7 @@ c3d_encoder *c3d_encoder_new(void) {
     e->last_q = 0.0f;
     e->last_target_ratio = 0.0f;
     e->has_fine_hist = false;
+    e->has_allocator_steps = false;
     return e;
 }
 void c3d_encoder_free(c3d_encoder *e) {
@@ -1747,6 +1753,250 @@ static double c3d_estimate_one_subband_bytes(
     return 2.0 + ftable_bytes + 8.0 + rans_bytes + (double)escape_bytes;
 }
 
+/* Rate-distortion estimate for a single subband at a trial step, using the
+ * pre-built fine histogram (§I1).  Rate returned in bytes (Shannon + a
+ * constant per-subband framing overhead).  Distortion estimated by treating
+ * each fine bin's count as concentrated at the bin midpoint, then summing
+ * (c_mid - dequant(quant(c_mid, step), step, α))².  Used by the R-D
+ * allocator (§Q3) to pick per-subband optimal steps. */
+static void c3d_rd_estimate_subband(const c3d_encoder *s, unsigned sidx,
+                                    float step, float alpha,
+                                    double *out_rate_bytes, double *out_dist)
+{
+    c3d_subband_info sb; c3d_subband_info_of(sidx, &sb);
+    size_t n = (size_t)sb.side * sb.side * sb.side;
+    float mx = s->max_abs_per_subband[sidx];
+
+    /* All-zero fast path: every coef quantizes to 0 → 2 B sentinel. */
+    if (mx < 0.5f * step) {
+        if (out_rate_bytes) *out_rate_bytes = 2.0;
+        if (out_dist) {
+            /* Quantization error = c² for all voxels ≤ 0.5*step.  Use an
+             * upper bound = n * (0.5*step)² / 3 (uniform on [0, 0.5*step]). */
+            double d_per = (double)(0.5f * step) * (double)(0.5f * step) / 3.0;
+            *out_dist = d_per * (double)n;
+        }
+        return;
+    }
+
+    const uint32_t *pref = s->fine_prefix[sidx];
+    float w = mx / (float)C3D_FINE_BINS;
+    float inv_w = (float)C3D_FINE_BINS / mx;
+
+    /* Build trial histogram via range sums over the fine prefix. */
+    uint32_t trial_hist[65];
+    uint32_t idx_last;
+    {
+        /* Bin 0: |c| < 0.5*step (dead zone, dequants to 0). */
+        float c0 = 0.5f * step;
+        uint32_t i0 = (c0 <= 0.0f) ? 0u : (uint32_t)(c0 * inv_w);
+        if (i0 > C3D_FINE_BINS) i0 = C3D_FINE_BINS;
+        trial_hist[0] = pref[i0];
+        idx_last = i0;
+    }
+    for (unsigned k = 1; k < 64; ++k) {
+        float chi = ((float)k + 0.5f) * step;
+        uint32_t ihi = (chi <= 0.0f) ? 0u : (uint32_t)(chi * inv_w);
+        if (ihi > C3D_FINE_BINS) ihi = C3D_FINE_BINS;
+        trial_hist[k] = pref[ihi] - pref[idx_last];
+        idx_last = ihi;
+    }
+    /* Escape (|q| ≥ 64): everything past 63.5*step. */
+    trial_hist[64] = pref[C3D_FINE_BINS] - pref[idx_last];
+
+    /* Shannon entropy, in bits. */
+    double rate_bits = 0.0;
+    double inv_n = 1.0 / (double)n;
+    unsigned nnz = 0;
+    for (unsigned k = 0; k < 65; ++k) {
+        if (!trial_hist[k]) continue;
+        nnz++;
+        double p = (double)trial_hist[k] * inv_n;
+        rate_bits += -(double)trial_hist[k] * log2(p);
+    }
+    /* Per-subband framing (matches c3d_estimate_one_subband_bytes):
+     *   2  freq_table_size u16
+     *   ~2 + 3*nnz  ftable_bytes (SELF mode; encoder chooses this for us)
+     *   8  n_symbols + rans_block_size u32s
+     *   32 rANS initial state header
+     * Escape LEB128 bytes vary with zigzag size.  For step values that push
+     * coefficients well past |q|=64, zigzag ≈ 2·|c|/step reaches ~128-1000,
+     * LEB128 = 2-3 bytes typical.  Use a per-escape estimate of 3 B plus a
+     * growth term based on mean |c|/step for escapes. */
+    double ftable_bytes = 2.0 + 3.0 * (double)nnz;
+    /* Mean |c| within escape fine bins ≈ 63.5*step + half_escape_range. */
+    double esc_mean_zigzag = 128.0;  /* safe mid estimate */
+    double esc_leb_per = 1.0 + ceil(log2(esc_mean_zigzag + 1.0) / 7.0);
+    double rate_bytes = rate_bits / 8.0
+                      + 2.0 + ftable_bytes + 8.0 + 32.0
+                      + esc_leb_per * (double)trial_hist[64];
+
+    /* Distortion: sum over fine bins of count × (c_mid - reconstruction)².
+     * For bin i with count h_i at midpoint c_mid = (i+0.5)*w, reconstruction
+     * depends on which trial quantizer bin c_mid lands in. */
+    double dist = 0.0;
+    for (unsigned i = 0; i < C3D_FINE_BINS; ++i) {
+        uint32_t h = pref[i + 1] - pref[i];
+        if (!h) continue;
+        float c_mid = ((float)i + 0.5f) * w;
+        float recon;
+        if (c_mid < 0.5f * step) {
+            recon = 0.0f;
+        } else {
+            uint32_t k = (uint32_t)((c_mid - 0.5f * step) / step) + 1u;
+            if (k >= 64u) {
+                /* Escape: assume exact reconstruction up to step resolution. */
+                recon = ((float)k - 0.5f + 0.5f) * step;   /* alpha≈0.5 for escape */
+            } else {
+                recon = ((float)k - 0.5f + alpha) * step;
+            }
+        }
+        float e = c_mid - recon;
+        dist += (double)h * (double)e * (double)e;
+    }
+
+    if (out_rate_bytes) *out_rate_bytes = rate_bytes;
+    if (out_dist) *out_dist = dist;
+}
+
+/* Lookup the effective "baseline step" for a subband — mirrors the emit-time
+ * selection between ctx override, dynamic softness table, and the cached
+ * default.  Used by the R-D allocator to centre its per-subband step grid. */
+static inline float c3d_emit_baseline(const c3d_encoder *s, const c3d_ctx *ctx,
+                                      unsigned i)
+{
+    if (ctx && ctx->has_quantizer_baseline) return ctx->quantizer_baseline[i];
+    if (s->has_dyn_baselines)               return s->dyn_baselines[i];
+    return c3d_subband_baseline(i);
+}
+
+/* R-D allocator (§Q3).  Pick a per-subband step that minimises
+ *     Σ d_s(step_s) + λ · Σ r_s(step_s)
+ * under a fixed byte target.  Bisection on λ; inner loop evaluates a small
+ * log-spaced step grid per subband using the fine-histogram cache (§I1).
+ * Writes e->allocator_steps[] and sets has_allocator_steps on success. */
+#define C3D_RD_NCAND 10
+static void c3d_rd_allocate(c3d_encoder *s, const c3d_ctx *ctx,
+                            double target_bytes)
+{
+    c3d_build_fine_hist(s);
+
+    /* Per-subband trial step grid, centred on q_seed * baseline_s *
+     * coeff_scale, log-spaced from /8 to ×8 so the allocator can reallocate
+     * bits freely.  q_seed from warm-start if the caller is re-using the
+     * encoder at the same target ratio; else the classic sqrt(ratio)/64
+     * heuristic, which centres the grid near the true optimum. */
+    float q_seed;
+    if (s->last_q > 0.0f && target_bytes > 0.0) {
+        q_seed = s->last_q;
+    } else {
+        /* ratio ≈ C3D_VOXELS / (target + fixed_header); solve for q heuristic. */
+        double target_ratio = (double)C3D_VOXELS_PER_CHUNK
+                            / (target_bytes + (double)C3D_CHUNK_FIXED_SIZE);
+        if (target_ratio < 1.0) target_ratio = 1.0;
+        q_seed = (float)(sqrt(target_ratio) / 64.0);
+    }
+    if (q_seed < C3D_Q_MIN) q_seed = C3D_Q_MIN;
+    if (q_seed > C3D_Q_MAX) q_seed = C3D_Q_MAX;
+
+    float grid[C3D_N_SUBBANDS][C3D_RD_NCAND];
+    for (unsigned i = 0; i < C3D_N_SUBBANDS; ++i) {
+        float base = c3d_emit_baseline(s, ctx, i) * s->coeff_scale;
+        float centre = q_seed * base;
+        /* Factors: 1/8, 1/4, 1/2.5, 1/1.5, 1/1.1, 1.1, 1.5, 2.5, 4, 8. */
+        static const float mults[C3D_RD_NCAND] = {
+            1.0f/8.0f, 1.0f/4.0f, 1.0f/2.5f, 1.0f/1.5f, 1.0f/1.1f,
+            1.1f, 1.5f, 2.5f, 4.0f, 8.0f
+        };
+        for (unsigned j = 0; j < C3D_RD_NCAND; ++j) {
+            float t = centre * mults[j];
+            if (t <= 0.0f) t = 1e-9f;
+            grid[i][j] = t;
+        }
+    }
+
+    /* Pre-compute r_ij = rate(step_ij), d_ij = dist(step_ij).  Cached so
+     * λ bisection is O(subbands × ncand × 1) lookups instead of rebuilds. */
+    double rate[C3D_N_SUBBANDS][C3D_RD_NCAND];
+    double dist[C3D_N_SUBBANDS][C3D_RD_NCAND];
+    for (unsigned i = 0; i < C3D_N_SUBBANDS; ++i) {
+        for (unsigned j = 0; j < C3D_RD_NCAND; ++j) {
+            c3d_rd_estimate_subband(s, i, grid[i][j], /*alpha=*/0.375f,
+                                    &rate[i][j], &dist[i][j]);
+        }
+    }
+
+    /* Bisect λ in log space.  For each λ, pick per-subband j that minimises
+     * d_ij + λ·r_ij; sum over subbands and compare vs target. */
+    double lam_lo = 1e-8, lam_hi = 1e8;
+    /* Safe upper and lower brackets: pick coarsest and finest steps. */
+    double rate_coarse = 0.0, rate_fine = 0.0;
+    for (unsigned i = 0; i < C3D_N_SUBBANDS; ++i) {
+        rate_coarse += rate[i][C3D_RD_NCAND - 1];   /* coarsest = last grid slot */
+        rate_fine   += rate[i][0];                   /* finest = first slot */
+    }
+    if (rate_fine <= target_bytes) {
+        /* Target is easy — even finest steps fit.  Pick finest everywhere. */
+        for (unsigned i = 0; i < C3D_N_SUBBANDS; ++i)
+            s->allocator_steps[i] = grid[i][0];
+        s->has_allocator_steps = true;
+        if (getenv("C3D_RD_DEBUG"))
+            fprintf(stderr, "RD: shortcut FINE  target=%.0f rate_fine=%.0f rate_coarse=%.0f\n",
+                    target_bytes, rate_fine, rate_coarse);
+        return;
+    }
+    if (rate_coarse >= target_bytes) {
+        /* Target is hopelessly tight even at coarsest; pick coarsest. */
+        for (unsigned i = 0; i < C3D_N_SUBBANDS; ++i)
+            s->allocator_steps[i] = grid[i][C3D_RD_NCAND - 1];
+        s->has_allocator_steps = true;
+        if (getenv("C3D_RD_DEBUG"))
+            fprintf(stderr, "RD: shortcut COARSE target=%.0f rate_fine=%.0f rate_coarse=%.0f\n",
+                    target_bytes, rate_fine, rate_coarse);
+        return;
+    }
+
+    float best_j_all[C3D_N_SUBBANDS];
+    for (int it = 0; it < 14; ++it) {
+        double lam = sqrt(lam_lo * lam_hi);
+        double total_rate = 0.0;
+        for (unsigned i = 0; i < C3D_N_SUBBANDS; ++i) {
+            unsigned best_j = 0;
+            double   best_cost = dist[i][0] + lam * rate[i][0];
+            for (unsigned j = 1; j < C3D_RD_NCAND; ++j) {
+                double c = dist[i][j] + lam * rate[i][j];
+                if (c < best_cost) { best_cost = c; best_j = j; }
+            }
+            best_j_all[i] = (float)best_j;   /* stash as float to reuse the array */
+            total_rate += rate[i][best_j];
+        }
+        if (fabs(total_rate - target_bytes) < 0.01 * target_bytes) break;
+        if (total_rate > target_bytes) lam_lo = lam;   /* need more penalty on rate */
+        else                           lam_hi = lam;
+    }
+
+    /* Final picks at the last λ. */
+    double lam = sqrt(lam_lo * lam_hi);
+    double total_est_rate = 0.0;
+    for (unsigned i = 0; i < C3D_N_SUBBANDS; ++i) {
+        unsigned best_j = 0;
+        double   best_cost = dist[i][0] + lam * rate[i][0];
+        for (unsigned j = 1; j < C3D_RD_NCAND; ++j) {
+            double c = dist[i][j] + lam * rate[i][j];
+            if (c < best_cost) { best_cost = c; best_j = j; }
+        }
+        s->allocator_steps[i] = grid[i][best_j];
+        total_est_rate += rate[i][best_j];
+    }
+    s->has_allocator_steps = true;
+    if (getenv("C3D_RD_DEBUG")) {
+        fprintf(stderr, "RD: target=%.0f  rate_fine=%.0f  rate_coarse=%.0f  "
+                "final_lam=%.2e  est_rate=%.0f\n",
+                target_bytes, rate_fine, rate_coarse, lam, total_est_rate);
+    }
+    (void)best_j_all;
+}
+
 /* Cheap whole-chunk estimate: sum of per-subband estimates under the same
  * baseline / denom_shift / ctx-override logic as c3d_emit_entropy_at_q. */
 static double c3d_estimate_entropy_at_q(float q, const c3d_encoder *s,
@@ -1795,11 +2045,17 @@ static size_t c3d_emit_entropy_at_q(float q, const c3d_encoder *s,
     for (unsigned i = 0; i < C3D_N_SUBBANDS; ++i) {
         c3d_subband_info sb;
         c3d_subband_info_of(i, &sb);
-        float baseline = (ctx && ctx->has_quantizer_baseline) ? ctx->quantizer_baseline[i]
-                       : s->has_dyn_baselines                 ? s->dyn_baselines[i]
-                                                                : c3d_subband_baseline(i);
-        /* Absorb coeff_scale into step (see c3d_prepare_chunk). */
-        float step = q * baseline * s->coeff_scale;
+        float step;
+        if (s->has_allocator_steps) {
+            /* R-D allocator decided the step already. */
+            step = s->allocator_steps[i];
+        } else {
+            float baseline = (ctx && ctx->has_quantizer_baseline) ? ctx->quantizer_baseline[i]
+                           : s->has_dyn_baselines                 ? s->dyn_baselines[i]
+                                                                    : c3d_subband_baseline(i);
+            /* Absorb coeff_scale into step (see c3d_prepare_chunk). */
+            step = q * baseline * s->coeff_scale;
+        }
         uint32_t denom_shift = (ctx && ctx->has_freq_tables) ? ctx->denom_shifts[i]
                                                               : c3d_default_denom_shift(i);
 
@@ -1919,9 +2175,21 @@ size_t c3d_encoder_chunk_encode(c3d_encoder *e, const uint8_t *in,
                           - (double)C3D_CHUNK_FIXED_SIZE;
     if (target_bytes_d < 64.0) target_bytes_d = 64.0;
 
+    /* R-D allocator (§Q3) is gated off by default — first cut's rate
+     * estimate systematically undercounts by ~20 % on real scroll data
+     * and the distortion model is approximate, producing ratio drift +
+     * PSNR regression.  Scaffolding kept (c3d_rd_allocate, fine_prefix,
+     * rd_estimate_subband) for a careful second pass; enable via
+     * C3D_RD_ALLOCATOR=1 to experiment without rebuilding. */
+    e->has_allocator_steps = false;
+    if (getenv("C3D_RD_ALLOCATOR")) {
+        c3d_rd_allocate(e, ctx, target_bytes_d);
+    }
+
     /* Warm-start q from the previous chunk when target_ratio hasn't changed.
      * Bracket narrows to [q/4, q*4] — still wide enough to converge even if
-     * chunk content varies sharply, but cuts typical iteration count in half. */
+     * chunk content varies sharply, but cuts typical iteration count in half.
+     * Only used as a fallback here (R-D path above is primary). */
     float q, q_lo, q_hi;
     if (e->last_q > 0.0f && e->last_target_ratio == target_ratio) {
         q = e->last_q;
@@ -1940,7 +2208,7 @@ size_t c3d_encoder_chunk_encode(c3d_encoder *e, const uint8_t *in,
     /* Bisect on the cheap estimator (quantize + Shannon, no rANS) to pick q,
      * then run the true emit exactly once.  ~3-4× encode speedup vs the
      * per-iteration full-emit loop; final output is always the real encode. */
-    for (int iter = 0; iter < 10; ++iter) {
+    for (int iter = 0; iter < 10 && !e->has_allocator_steps; ++iter) {
         double est_bytes = c3d_estimate_entropy_at_q(q, e, ctx);
         double err = est_bytes - target_bytes_d;
         double rel = (err < 0 ? -err : err) / target_bytes_d;
