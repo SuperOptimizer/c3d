@@ -50,25 +50,25 @@ On a 64-chunk slice of `s3://scrollprize-volumes/esrf/20260311/2.4um_PHerc-Paris
 
 | target ratio | achieved | PSNR    | aggregate throughput |
 |--------------|----------|---------|----------------------|
-|   5:1        |    5.0   | 51.32 dB| 130 MB/s             |
-|  10:1        |   10.0   | 46.06 dB| 140 MB/s             |
-|  25:1        |   25.0   | 41.45 dB| 158 MB/s             |
-|  50:1        |   50.0   | 38.39 dB| 160 MB/s             |
-| 100:1        |  100.3   | 34.95 dB| 165 MB/s             |
-| 200:1        |  200.8   | 31.95 dB| 170 MB/s             |
+|   5:1        |    5.0   | 51.76 dB| 122 MB/s             |
+|  10:1        |    9.9   | 46.44 dB| 140 MB/s             |
+|  25:1        |   24.9   | 41.80 dB| 121 MB/s             |
+|  50:1        |   49.8   | 38.64 dB| 196 MB/s             |
+| 100:1        |   99.8   | 35.16 dB| 212 MB/s             |
+| 200:1        |  200.5   | 32.14 dB| 240 MB/s             |
 
 c3d vs H.264 (`openh264`, P-frames + CABAC + adaptive QP, byte-budget-matched):
 
 | QP | ratio   | H.264 PSNR | c3d PSNR | **Δ**      |
 |----|---------|-----------|----------|------------|
-| 18 |   8.9:1 | 43.10 dB  | 47.07 dB | **+3.96**  |
-| 24 |  18.0:1 | 38.93 dB  | 42.88 dB | **+3.95**  |
-| 30 |  41.0:1 | 35.08 dB  | 39.42 dB | **+4.34**  |
-| 36 | 100.3:1 | 31.03 dB  | 35.06 dB | **+4.02**  |
-| 42 | 258.8:1 | 27.30 dB  | 31.11 dB | **+3.81**  |
-| 48 | 654.9:1 | 24.04 dB  | 27.97 dB | **+3.94**  |
+| 18 |   8.9:1 | 43.10 dB  | 47.32 dB | **+4.22**  |
+| 24 |  18.0:1 | 38.93 dB  | 43.13 dB | **+4.20**  |
+| 30 |  41.0:1 | 35.08 dB  | 39.60 dB | **+4.52**  |
+| 36 | 100.3:1 | 31.03 dB  | 35.11 dB | **+4.08**  |
+| 42 | 258.8:1 | 27.30 dB  | 31.14 dB | **+3.84**  |
+| 48 | 654.9:1 | 24.04 dB  | 28.06 dB | **+4.03**  |
 
-Consistent **+3.8 to +4.3 dB** advantage at every operating point on real
+Consistent **+3.8 to +4.5 dB** advantage at every operating point on real
 scroll data.  H.264 uses single-GOP P-frames (exploiting z-axis correlation
 like c3d's 3D DWT), CABAC entropy coding, and per-MB adaptive QP — this is
 a strong baseline, not the all-I/CAVLC configuration some codec papers use.
@@ -78,17 +78,17 @@ Single-chunk perf (`c3d_perf`, same hardware, q=0.10):
 
 ```
      q    enc_bytes    enc_ms  enc_MB/s    dec_ms  dec_MB/s
-0.1000       142581     142.5     112.3     105.0     152.4
-DWT fwd+inv (64 MiB f32): 160.5 ms/iter, 398.6 MB/s f32
+0.1000       126395     113.5     141.0      99.5     160.8
+DWT fwd+inv (64 MiB f32): 161.4 ms/iter, 396.5 MB/s f32
 
 LOD sweep:
 lod   side   bytes_read    out_vox     dec_ms dec_MB/s_out
-  5      8          759        512       0.01       37.3
-  4     16         3058       4096       0.06       66.1
-  3     32        13875      32768       0.46       67.9
-  2     64        64524     262144       3.39       73.8
-  1    128       138637    2097152      21.83       91.6
-  0    256       142581   16777216     139.60      114.6
+  5      8          800        512       0.01       35.0
+  4     16         3095       4096       0.06       67.0
+  3     32        13759      32768       0.49       64.0
+  2     64        61725     262144       3.22       77.7
+  1    128       123376    2097152      17.82      112.2
+  0    256       126395   16777216      99.46      160.9
 ```
 
 ## Design constraints
