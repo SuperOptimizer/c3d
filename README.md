@@ -57,9 +57,22 @@ On a 64-chunk slice of `s3://scrollprize-volumes/esrf/20260311/2.4um_PHerc-Paris
 | 100:1        |  100.3   | 34.95 dB| 165 MB/s             |
 | 200:1        |  200.8   | 31.95 dB| 170 MB/s             |
 
-c3d beats H.264-intra (`openh264` at matching byte budgets, QP 18-48) by
-**+5 to +8 dB** across the full range on scroll data; see `c3d_bench` for
-the side-by-side harness.
+c3d vs H.264 (`openh264`, P-frames + CABAC + adaptive QP, byte-budget-matched):
+
+| QP | ratio   | H.264 PSNR | c3d PSNR | **Δ**      |
+|----|---------|-----------|----------|------------|
+| 18 |   8.9:1 | 43.10 dB  | 47.07 dB | **+3.96**  |
+| 24 |  18.0:1 | 38.93 dB  | 42.88 dB | **+3.95**  |
+| 30 |  41.0:1 | 35.08 dB  | 39.42 dB | **+4.34**  |
+| 36 | 100.3:1 | 31.03 dB  | 35.06 dB | **+4.02**  |
+| 42 | 258.8:1 | 27.30 dB  | 31.11 dB | **+3.81**  |
+| 48 | 654.9:1 | 24.04 dB  | 27.97 dB | **+3.94**  |
+
+Consistent **+3.8 to +4.3 dB** advantage at every operating point on real
+scroll data.  H.264 uses single-GOP P-frames (exploiting z-axis correlation
+like c3d's 3D DWT), CABAC entropy coding, and per-MB adaptive QP — this is
+a strong baseline, not the all-I/CAVLC configuration some codec papers use.
+See `c3d_bench` for the harness.
 
 Single-chunk perf (`c3d_perf`, same hardware, q=0.10):
 
