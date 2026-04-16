@@ -770,6 +770,49 @@ static void test_chunk_rate_control(void) {
     free(in); free(dec); free(enc);
 }
 
+static void test_chunk_deterministic_encode(void) {
+    /* Same-binary deterministic: encoding the same input twice must produce
+     * byte-identical output, whether via the stateless API, fresh encoder
+     * contexts, or a reused encoder context.  Protects against accidental
+     * state leaks in the encoder (warm-start, fine-hist cache, allocator)
+     * when future format changes (Q4) land. */
+    uint8_t *in  = aligned_alloc(C3D_ALIGN, C3D_VOXELS_PER_CHUNK);
+    uint8_t *a   = aligned_alloc(C3D_ALIGN, C3D_CHUNK_ENCODE_MAX_SIZE);
+    uint8_t *b   = aligned_alloc(C3D_ALIGN, C3D_CHUNK_ENCODE_MAX_SIZE);
+    uint8_t *dec_a = aligned_alloc(C3D_ALIGN, C3D_VOXELS_PER_CHUNK);
+    uint8_t *dec_b = aligned_alloc(C3D_ALIGN, C3D_VOXELS_PER_CHUNK);
+    c3d_assert(in && a && b && dec_a && dec_b);
+    make_test_chunk(in);
+
+    float ratios[] = {5.0f, 25.0f, 100.0f};
+    for (size_t i = 0; i < sizeof ratios / sizeof ratios[0]; ++i) {
+        float r = ratios[i];
+        /* Path 1: stateless API, two separate calls. */
+        size_t sz_a = c3d_chunk_encode(in, r, NULL, a, C3D_CHUNK_ENCODE_MAX_SIZE);
+        size_t sz_b = c3d_chunk_encode(in, r, NULL, b, C3D_CHUNK_ENCODE_MAX_SIZE);
+        CHECK_EQ(sz_a, sz_b);
+        CHECK(memcmp(a, b, sz_a) == 0);
+
+        /* Path 2: reused encoder context — must produce same bytes as fresh. */
+        c3d_encoder *e = c3d_encoder_new();
+        /* Warm the context once so last_q is set; then re-encode. */
+        size_t sz_warm = c3d_encoder_chunk_encode(e, in, r, NULL, b,
+                                                  C3D_CHUNK_ENCODE_MAX_SIZE);
+        size_t sz_c    = c3d_encoder_chunk_encode(e, in, r, NULL, b,
+                                                  C3D_CHUNK_ENCODE_MAX_SIZE);
+        CHECK_EQ(sz_warm, sz_c);
+        CHECK_EQ(sz_a, sz_c);
+        CHECK(memcmp(a, b, sz_a) == 0);
+        c3d_encoder_free(e);
+
+        /* Path 3: round-trip must match between the two paths. */
+        c3d_chunk_decode(a, sz_a, NULL, dec_a);
+        c3d_chunk_decode(b, sz_a, NULL, dec_b);
+        CHECK(memcmp(dec_a, dec_b, C3D_VOXELS_PER_CHUNK) == 0);
+    }
+    free(in); free(a); free(b); free(dec_a); free(dec_b);
+}
+
 static void test_chunk_lod_decode(void) {
     uint8_t *in  = aligned_alloc(C3D_ALIGN, C3D_VOXELS_PER_CHUNK);
     uint8_t *enc = aligned_alloc(C3D_ALIGN, C3D_CHUNK_ENCODE_MAX_SIZE);
@@ -1197,6 +1240,7 @@ int main(void) {
     test_chunk_validate_rejects_garbage();
     test_chunk_encode_decode_at_q();
     test_chunk_rate_control();
+    test_chunk_deterministic_encode();
     test_chunk_lod_decode();
 
     printf("§J shard + downsample\n");
