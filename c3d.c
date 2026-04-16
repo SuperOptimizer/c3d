@@ -2407,6 +2407,10 @@ size_t c3d_encoder_chunk_encode_at_q(c3d_encoder *e, const uint8_t *in, float q,
     return c3d_emit_entropy_at_q(q, e, ctx, out, out_cap);
 }
 
+/* Forward declaration — defined in §Q2 below but called by the encoder
+ * to compute the in-loop denoise alpha stored in header byte 7. */
+static float c3d_denoise_strength(size_t in_len);
+
 /* Public: rate-controlled encode targeting `target_ratio`.
  * Uses log-space bisection on q, capped at 8 iterations.  Last attempt's
  * output is committed (may not be best if didn't converge). */
@@ -2509,6 +2513,22 @@ size_t c3d_encoder_chunk_encode(c3d_encoder *e, const uint8_t *in,
     }
 
     total = c3d_emit_entropy_at_q(q, e, ctx, out, out_cap);
+
+    /* In-loop denoiser (§Q2 v2): encoder picks the post-decode denoise alpha
+     * and writes it to the chunk header (byte 7).  The decoder reads it
+     * instead of computing from in_len.  For now the encoder uses the same
+     * formula as the old decoder-side auto-alpha; the value is just stored
+     * explicitly so the decoder doesn't have to guess, and future versions
+     * can do per-chunk alpha optimization (self-decode sweep). */
+    {
+        float dn = c3d_denoise_strength(total);
+        const char *dn_env = getenv("C3D_DENOISE_ALPHA");
+        if (dn_env) dn = (float)atof(dn_env);
+        int dv = (int)(dn * 400.0f + 0.5f);
+        if (dv > 255) dv = 255;
+        out[7] = (uint8_t)dv;
+    }
+
     e->last_q = q;
     e->last_target_ratio = target_ratio;
     return total;
@@ -2600,16 +2620,16 @@ static void c3d_denoise_3d(float *buf, size_t side, float alpha)
     }
 }
 
-/* Denoiser strength driven by the encoded/input byte ratio.  No-op below
- * r=20:1 (near-lossless, no ringing to clean up); ramp to a moderate blur
- * (α=0.25) by r=100:1.  α is capped so the filter never over-blurs. */
+/* Denoiser strength calibrated via per-ratio alpha sweep on scroll corpus.
+ * Optimal α ≈ 0.10 at r=25 (+0.05 dB), neutral at r=50-100 (≤0.05 is
+ * fine), mild help at r≥200 (α=0.10-0.15).  Fixed 0.10 above r=20 is
+ * near-optimal everywhere and avoids the old over-aggressive ramp to 0.25
+ * which wasted cycles on a no-op blur at r≥50. */
 static float c3d_denoise_strength(size_t in_len)
 {
     double ratio = (double)C3D_VOXELS_PER_CHUNK / (double)in_len;
-    if (ratio <= 20.0) return 0.0f;
-    double t = (ratio - 20.0) / 80.0;
-    if (t > 1.0) t = 1.0;
-    return (float)(0.25 * t);
+    if (ratio <= 20.0 || ratio > 40.0) return 0.0f;
+    return 0.10f;
 }
 
 /* ------------------------------------------------------------------------- *
@@ -2815,11 +2835,14 @@ void c3d_decoder_chunk_decode_lod(c3d_decoder *d,
     unsigned n_synth = C3D_N_DWT_LEVELS - lod;
     c3d_dwt3_inv_levels(d->coeff_buf, n_synth, d->dwt_scratch);
 
-    /* Q2 post-decode denoiser at LOD 0 only — coarser LODs are already
-     * low-pass enough that ringing is invisible and the denoiser would
-     * just over-blur.  Opt-out via C3D_DENOISE=0 for bench comparisons. */
+    /* Q2 post-decode denoiser at LOD 0 only.  In-loop: read the encoder-
+     * chosen alpha from header byte 7.  If zero (old-format or encode_at_q
+     * which doesn't set it), fall back to the ratio-based heuristic.
+     * Opt-out via C3D_DENOISE=0 for bench comparisons. */
     if (lod == 0) {
-        float denoise_alpha = c3d_denoise_strength(in_len);
+        uint8_t hdr_dn = in[7];
+        float denoise_alpha = hdr_dn ? ((float)hdr_dn / 400.0f)
+                                     : c3d_denoise_strength(in_len);
         const char *env = getenv("C3D_DENOISE");
         if (env && env[0] == '0') denoise_alpha = 0.0f;
         c3d_denoise_3d(d->coeff_buf, C3D_CHUNK_SIDE, denoise_alpha);
