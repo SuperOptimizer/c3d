@@ -388,31 +388,51 @@ static size_t c3d_rans_enc_x8(const uint8_t *symbols,     /* each < 65 */
      * We reverse that: iterate i from n_symbols-1 down to 0.
      *
      * Fast path for symbol 0: hoist its (freq, start=0, x_max) so the common
-     * case avoids the t->syms[s] dependent load that feeds the renorm check. */
+     * case avoids the t->syms[s] dependent load that feeds the renorm check.
+     *
+     * Subband sizes are always multiples of 8 (8³ .. 128³), so we unroll
+     * 8 iterations per loop step — one touch of each lane's state.  Exposes
+     * inter-lane independence to the scheduler, mirroring the decoder's
+     * 8-lane unroll. */
+    c3d_assert((n_symbols & 7u) == 0);
     const uint32_t ds       = t->denom_shift;
     const uint32_t freq0    = t->syms[0].freq;
     c3d_assert(t->syms[0].start == 0);
     const uint32_t x_max_0  = freq0 ? ((C3D_RANS_BYTE_L >> ds) << 8) * freq0
                                     : UINT32_MAX;
-    for (size_t i = n_symbols; i > 0; --i) {
-        size_t idx = i - 1;
-        unsigned lane = (unsigned)(idx & (C3D_RANS_N_STATES - 1));
-        uint8_t  s    = symbols[idx];
-        if (__builtin_expect(s == 0, 1)) {
-            uint32_t x = states[lane];
-            while (x >= x_max_0) {
-                c3d_assert(buf_ptr > buf_beg);
-                *--buf_ptr = (uint8_t)(x & 0xff);
-                x >>= 8;
-            }
-            states[lane] = ((x / freq0) << ds) + (x % freq0);
-        } else {
-            const c3d_rans_sym *sym = &t->syms[s];
-            c3d_assert(sym->freq > 0);
-            c3d_rans_enc_put(&states[lane], &buf_ptr, buf_beg,
-                             sym->start, sym->freq, ds);
-        }
+
+    /* Per-lane enc: fast path for sym 0, else call into c3d_rans_enc_put. */
+    #define ENC_LANE(LANE, SYM) do {                                              \
+        uint8_t s_ = (SYM);                                                        \
+        if (__builtin_expect(s_ == 0, 1)) {                                        \
+            uint32_t x = states[LANE];                                             \
+            while (x >= x_max_0) {                                                 \
+                c3d_assert(buf_ptr > buf_beg);                                     \
+                *--buf_ptr = (uint8_t)(x & 0xff);                                  \
+                x >>= 8;                                                           \
+            }                                                                      \
+            states[LANE] = ((x / freq0) << ds) + (x % freq0);                      \
+        } else {                                                                   \
+            const c3d_rans_sym *sym_ = &t->syms[s_];                               \
+            c3d_assert(sym_->freq > 0);                                            \
+            c3d_rans_enc_put(&states[LANE], &buf_ptr, buf_beg,                     \
+                             sym_->start, sym_->freq, ds);                         \
+        }                                                                          \
+    } while (0)
+
+    /* Process 8 symbols per step, in backward lane order (7,6,5,4,3,2,1,0)
+     * which matches the backward symbol-index walk idx = i-1 … i-8. */
+    for (size_t i = n_symbols; i >= 8; i -= 8) {
+        ENC_LANE(7, symbols[i - 1]);
+        ENC_LANE(6, symbols[i - 2]);
+        ENC_LANE(5, symbols[i - 3]);
+        ENC_LANE(4, symbols[i - 4]);
+        ENC_LANE(3, symbols[i - 5]);
+        ENC_LANE(2, symbols[i - 6]);
+        ENC_LANE(1, symbols[i - 7]);
+        ENC_LANE(0, symbols[i - 8]);
     }
+    #undef ENC_LANE
 
     size_t renorm_bytes = (size_t)(buf_end - buf_ptr);
     size_t total = 32u + renorm_bytes;
