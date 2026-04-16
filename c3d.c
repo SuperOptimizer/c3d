@@ -1514,22 +1514,23 @@ static inline float c3d_default_alpha(unsigned s) {
     }
 }
 
-/* Per-subband softness (1 / w^softness perceptual weighting).  A calibration
- * sweep on real scroll CT data (s ∈ {0.15..0.55} × r ∈ {5..200}) showed
- * monotonically rising PSNR up to s≈0.50 at every ratio, with a plateau
- * past 0.50 (gains drop below 0.05 dB).  s=0.50 is also the strict R-D-
- * optimal exponent (1/sqrt(w) ≡ step ∝ 1/sqrt(synthesis_gain²)).
- * We used to clamp at 0.32 with q_min=2^-6 because rate control saturated;
- * with q_min=2^-12 the full range is usable and 0.50 wins by +0.5 to +1.2
- * dB over the old adaptive curve.  Env override kept for future sweeps. */
+/* Per-subband softness (1 / w^softness perceptual weighting).
+ *
+ * Original calibration found s=0.50 optimal (R-D theory exponent for
+ * Gaussian sources).  After the R-D allocator + dz=0.55 + dead-zone
+ * widening landed, a re-sweep (s ∈ {0.45..0.80} × r ∈ {5..200}) shows
+ * the optimum has shifted to s≈0.60 across every ratio: +0.02 to +0.04
+ * dB vs s=0.50, with ~0.5-2% ratio overshoot the bisection absorbs.
+ * Beyond 0.60 PSNR plateaus then regresses (rate-control saturates).
+ * Env override kept for future sweeps. */
 static float c3d_adaptive_softness(float target_ratio) {
     (void)target_ratio;
     const char *env = getenv("C3D_SOFTNESS");
     if (env) {
         float v = (float)atof(env);
-        if (v >= 0.05f && v <= 0.6f) return v;
+        if (v >= 0.05f && v <= 0.9f) return v;
     }
-    return 0.50f;
+    return 0.60f;
 }
 
 /* c3d_ctx struct definition — used by §G/§H/§I encode/decode paths.
