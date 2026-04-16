@@ -1179,6 +1179,12 @@ static void c3d_subband_scatter(float *buf,
 #define C3D_CDF97_GAIN_L_SQ 2.08f
 #define C3D_CDF97_GAIN_H_SQ 0.48f
 
+/* Bins in the fine-histogram cache used by the R-D allocator (§I1 / §Q3).
+ * 1024 bins × 36 subbands × 4 B = 144 KiB per encoder.  Enough resolution
+ * that trial-step dead-zone boundaries land on stable bin indices across
+ * bisection rounds. */
+#define C3D_FINE_BINS 1024u
+
 static float c3d_subband_baseline_table[C3D_N_SUBBANDS];
 static bool  c3d_subband_baseline_init = false;
 
@@ -1333,6 +1339,16 @@ struct c3d_encoder {
      * to ~3-4. */
     float    last_q;
     float    last_target_ratio;
+    /* Per-subband fine histogram + running prefix sum over |c|.  Built once
+     * post-DWT in c3d_prepare_chunk; lets the R-D allocator evaluate rate at
+     * any trial step with an O(65) range sum instead of an O(N) quant scan.
+     * fine_prefix[s][i] = count of coeffs in subband s with |c|/bin_width < i,
+     * where bin_width = max_abs_per_subband[s] / C3D_FINE_BINS.
+     * The +1 in [C3D_FINE_BINS+1] is the standard "one past last" slot so
+     * range_sum(lo, hi) = fine_prefix[hi] - fine_prefix[lo] never indexes
+     * out-of-bounds. */
+    uint32_t fine_prefix[C3D_N_SUBBANDS][C3D_FINE_BINS + 1];
+    bool     has_fine_hist;
 };
 
 struct c3d_decoder {
@@ -1359,6 +1375,7 @@ c3d_encoder *c3d_encoder_new(void) {
     e->has_max_abs = false;
     e->last_q = 0.0f;
     e->last_target_ratio = 0.0f;
+    e->has_fine_hist = false;
     return e;
 }
 void c3d_encoder_free(c3d_encoder *e) {
@@ -1455,7 +1472,37 @@ static bool c3d_prepare_chunk(const uint8_t *in, uint8_t *out,
 
     s->coeff_scale = coeff_scale;
     s->has_max_abs = true;
+    s->has_fine_hist = false;   /* lazy-built on demand by the R-D allocator */
     return true;
+}
+
+/* Lazily build per-subband fine histograms + prefix sums over |c|.  Called
+ * from the R-D allocator (§Q3) on encoders where rate control needs O(1)
+ * trial-step rate estimation.  Idempotent once has_fine_hist is set.
+ * Each bin i counts coefficients with |c| in [i·w, (i+1)·w) where
+ * w = max_abs_per_subband / C3D_FINE_BINS.  Prefix[i] = total count of
+ * bins 0..i-1 so range_sum is one subtract. */
+static void c3d_build_fine_hist(c3d_encoder *s) {
+    if (s->has_fine_hist) return;
+    c3d_assert(s->has_max_abs);
+    for (unsigned sidx = 0; sidx < C3D_N_SUBBANDS; ++sidx) {
+        uint32_t *pref = s->fine_prefix[sidx];
+        memset(pref, 0, (C3D_FINE_BINS + 1) * sizeof(uint32_t));
+        float mx = s->max_abs_per_subband[sidx];
+        if (mx <= 0.0f) continue;
+        float inv_w = (float)C3D_FINE_BINS / mx;
+        c3d_subband_info sb; c3d_subband_info_of(sidx, &sb);
+        for (uint32_t z = sb.z0; z < sb.z0 + sb.side; ++z)
+        for (uint32_t y = sb.y0; y < sb.y0 + sb.side; ++y)
+        for (uint32_t x = sb.x0; x < sb.x0 + sb.side; ++x) {
+            float ac = fabsf(s->coeff_buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + x]);
+            uint32_t b = (uint32_t)(ac * inv_w);
+            if (b >= C3D_FINE_BINS) b = C3D_FINE_BINS - 1u;
+            pref[b + 1]++;
+        }
+        for (unsigned i = 1; i <= C3D_FINE_BINS; ++i) pref[i] += pref[i - 1];
+    }
+    s->has_fine_hist = true;
 }
 
 /* -- Stage 2: per-subband encode (quantize → symbols + escapes → freq table
