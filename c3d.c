@@ -3005,16 +3005,28 @@ static void c3d_denoise_3d(float *buf, size_t side, float alpha)
     }
 }
 
-/* Denoiser strength calibrated via per-ratio alpha sweep on scroll corpus.
- * Optimal α ≈ 0.10 at r=25 (+0.05 dB), neutral at r=50-100 (≤0.05 is
- * fine), mild help at r≥200 (α=0.10-0.15).  Fixed 0.10 above r=20 is
- * near-optimal everywhere and avoids the old over-aggressive ramp to 0.25
- * which wasted cycles on a no-op blur at r≥50. */
+/* Denoiser strength as a piecewise function of achieved ratio.
+ * Re-calibrated after R-D allocator + dz=0.55 + softness=0.60 + T1c
+ * spatial sign + T2a α clamp landed.  The sweet spot grows much
+ * faster with ratio than the old curve assumed:
+ *   r=5:    α=0 (denoise hurts near-lossless)
+ *   r=10:   α=0.04 (+0.07 dB)
+ *   r=25:   α=0.05 (+0.02 dB)
+ *   r=50:   α=0.07 (+0.03 dB)
+ *   r=100:  α=0.22 (+0.08 dB)
+ *   r=200:  α=0.35 (+0.12 dB)
+ * Sharp bump above r≈70 because at high ratios the wavelet noise
+ * floor (sentinel-zeroed coefficients reconstructing to dz_half×sign
+ * artifacts in the spatial domain) becomes the dominant error term —
+ * a wide denoise blur smooths it out cheaply. */
 static float c3d_denoise_strength(size_t in_len)
 {
     double ratio = (double)C3D_VOXELS_PER_CHUNK / (double)in_len;
-    if (ratio <= 20.0 || ratio > 40.0) return 0.0f;
-    return 0.10f;
+    if (ratio <=   8.0) return 0.0f;
+    if (ratio <=  30.0) return 0.05f;
+    if (ratio <=  70.0) return 0.08f;
+    if (ratio <= 150.0) return 0.22f;
+    return 0.35f;
 }
 
 /* ------------------------------------------------------------------------- *
