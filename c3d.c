@@ -2302,7 +2302,12 @@ static void c3d_rd_estimate_subband(const c3d_encoder *s, unsigned sidx,
     float w = mx / (float)C3D_FINE_BINS;
     float inv_w = (float)C3D_FINE_BINS / mx;
 
-    /* Build trial histogram via range sums over the fine prefix. */
+    /* Build trial histogram via range sums over the fine prefix.
+     * NOTE: this estimator uses the *theoretical* dz=0.5*step model
+     * rather than the actual c3d_dz_half_for_kind value.  Empirically,
+     * matching the actual dz here regressed the allocator by ~0.05 dB
+     * — the theoretical model interacts more cleanly with the
+     * single-point rate calibration at mult=1. */
     uint32_t trial_hist[65];
     uint32_t idx_last;
     {
