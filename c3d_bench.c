@@ -43,6 +43,13 @@
 #include <aom/aomcx.h>
 #include <aom/aomdx.h>
 
+#include <zfp.h>
+
+#include "sz3c.h"
+
+#include <sys/wait.h>
+#include <fcntl.h>
+
 #define CHUNK_SIDE   256u
 #define CHUNK_BYTES  ((size_t)CHUNK_SIDE * CHUNK_SIDE * CHUNK_SIDE)
 
@@ -517,6 +524,165 @@ static size_t av1_encode_decode(const uint8_t *in, int cq, uint8_t *out_yuv) {
     return total;
 }
 
+/* ---------------------------------------------------------------------
+ * ZFP — fixed-rate 3D integer mode.  u8 input is widened to int32,
+ * compressed at `rate_q8` / 256 bits per value (so rate_q8=128 → 0.5 bpp ≈
+ * 16:1 on u8-in-i32 semantic bytes), decompressed, narrowed back to u8.
+ * The rate slots into the "QP" column: smaller = higher compression.
+ * --------------------------------------------------------------------- */
+static size_t zfp_encode_decode(const uint8_t *in, int rate_q8, uint8_t *out) {
+    const int W = CHUNK_SIDE, H = CHUNK_SIDE, D = CHUNK_SIDE;
+    const size_t N = (size_t)W * H * D;
+
+    int32_t *buf32 = aligned_alloc(32, N * sizeof(int32_t));
+    if (!buf32) { fprintf(stderr, "zfp oom\n"); exit(1); }
+    for (size_t i = 0; i < N; ++i) buf32[i] = (int32_t)in[i];
+
+    zfp_field *field = zfp_field_3d(buf32, zfp_type_int32, W, H, D);
+    zfp_stream *zfp = zfp_stream_open(NULL);
+    /* Fixed-rate: bits per value = rate_q8 / 256.  ZFP clamps to its minimum
+     * (~1 bpp for int32 3D) so highest useful ratios are ~32:1 on i32
+     * data = ~8:1 on the u8 source byte count. */
+    double bpp = (double)rate_q8 / 256.0;
+    zfp_stream_set_rate(zfp, bpp, zfp_type_int32, 3, zfp_false);
+    size_t bufsize = zfp_stream_maximum_size(zfp, field);
+    uint8_t *bits = malloc(bufsize);
+    if (!bits) { fprintf(stderr, "zfp oom\n"); exit(1); }
+    bitstream *bs = stream_open(bits, bufsize);
+    zfp_stream_set_bit_stream(zfp, bs);
+    zfp_stream_rewind(zfp);
+
+    size_t nbytes = zfp_compress(zfp, field);
+    if (nbytes == 0) { fprintf(stderr, "zfp_compress failed\n"); exit(1); }
+
+    /* Decode in place on the same buffer. */
+    memset(buf32, 0, N * sizeof(int32_t));
+    zfp_stream_rewind(zfp);
+    if (!zfp_decompress(zfp, field)) {
+        fprintf(stderr, "zfp_decompress failed\n"); exit(1);
+    }
+
+    for (size_t i = 0; i < N; ++i) {
+        int32_t v = buf32[i];
+        if (v < 0)   v = 0;
+        if (v > 255) v = 255;
+        out[i] = (uint8_t)v;
+    }
+
+    stream_close(bs);
+    zfp_stream_close(zfp);
+    zfp_field_free(field);
+    free(bits);
+    free(buf32);
+    return nbytes;
+}
+
+/* ---------------------------------------------------------------------
+ * SZ3 — C API (Lorenzo + regression + Huffman + zstd).  SZ3 only supports
+ * float/double at runtime, so u8 is widened to float, compressed with
+ * absolute error bound in LSBs, decompressed, narrowed back.
+ * --------------------------------------------------------------------- */
+static size_t sz3_encode_decode(const uint8_t *in, int tol, uint8_t *out) {
+    const size_t N = CHUNK_BYTES;
+    float *buf = aligned_alloc(32, N * sizeof(float));
+    if (!buf) { fprintf(stderr, "sz3 oom\n"); exit(1); }
+    for (size_t i = 0; i < N; ++i) buf[i] = (float)in[i];
+
+    size_t out_size = 0;
+    unsigned char *comp = SZ_compress_args(
+        SZ_FLOAT, buf, &out_size,
+        ABS, (double)tol, 0.0, 0.0,
+        0, 0, CHUNK_SIDE, CHUNK_SIDE, CHUNK_SIDE);
+    if (!comp || out_size == 0) { fprintf(stderr, "sz3 encode failed\n"); exit(1); }
+    float *dec = (float *)SZ_decompress(
+        SZ_FLOAT, comp, out_size,
+        0, 0, CHUNK_SIDE, CHUNK_SIDE, CHUNK_SIDE);
+    if (!dec) { fprintf(stderr, "sz3 decode failed\n"); exit(1); }
+    for (size_t i = 0; i < N; ++i) {
+        float v = dec[i];
+        if (v < 0.0f)   v = 0.0f;
+        if (v > 255.0f) v = 255.0f;
+        out[i] = (uint8_t)(v + 0.5f);
+    }
+    free_buf(comp);
+    free_buf(dec);
+    free(buf);
+    return out_size;
+}
+
+/* ---------------------------------------------------------------------
+ * TTHRESH — invoked as an external CLI.  Writes the chunk to a temp
+ * file, spawns `tthresh -i ... -p <psnr> -c ...` for encode then
+ * `tthresh -c ... -o ...` for decode; reads the reconstructed bytes
+ * back.  `target_psnr` is the "QP" — higher = better quality.
+ *
+ * Hits disk 3× per call so it's measurably slower than library-linked
+ * codecs; accepted overhead for a comparison bench.
+ * --------------------------------------------------------------------- */
+#ifndef TTHRESH_BIN
+#define TTHRESH_BIN "/home/forrest/c3d/third_party/tthresh/build/tthresh"
+#endif
+static int run_silently(char *const argv[]) {
+    pid_t pid = fork();
+    if (pid < 0) return -1;
+    if (pid == 0) {
+        int devnull = open("/dev/null", O_WRONLY);
+        if (devnull >= 0) {
+            dup2(devnull, 1); dup2(devnull, 2);
+            close(devnull);
+        }
+        execv(argv[0], argv);
+        _exit(127);
+    }
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0) {}
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+static size_t tthresh_encode_decode(const uint8_t *in, int target_psnr,
+                                    uint8_t *out) {
+    char raw[128], comp[128], dec[128], psnr_arg[32], sx[8], sy[8], sz[8];
+    snprintf(raw,  sizeof raw,  "/tmp/tthresh_%d_%d.raw",  (int)getpid(), target_psnr);
+    snprintf(comp, sizeof comp, "/tmp/tthresh_%d_%d.comp", (int)getpid(), target_psnr);
+    snprintf(dec,  sizeof dec,  "/tmp/tthresh_%d_%d.dec",  (int)getpid(), target_psnr);
+    snprintf(psnr_arg, sizeof psnr_arg, "%d", target_psnr);
+    snprintf(sx, sizeof sx, "%u", CHUNK_SIDE);
+    snprintf(sy, sizeof sy, "%u", CHUNK_SIDE);
+    snprintf(sz, sizeof sz, "%u", CHUNK_SIDE);
+
+    FILE *fp = fopen(raw, "wb");
+    if (!fp) { perror(raw); exit(1); }
+    if (fwrite(in, 1, CHUNK_BYTES, fp) != CHUNK_BYTES) { perror("fwrite"); exit(1); }
+    fclose(fp);
+
+    char *enc_argv[] = {
+        (char *)TTHRESH_BIN, "-i", raw, "-t", "uchar",
+        "-s", sx, sy, sz,
+        "-p", psnr_arg, "-c", comp, NULL
+    };
+    if (run_silently(enc_argv) != 0) {
+        fprintf(stderr, "tthresh encode failed\n"); exit(1);
+    }
+    char *dec_argv[] = {
+        (char *)TTHRESH_BIN, "-c", comp, "-o", dec, NULL
+    };
+    if (run_silently(dec_argv) != 0) {
+        fprintf(stderr, "tthresh decode failed\n"); exit(1);
+    }
+
+    struct stat st;
+    if (stat(comp, &st) != 0) { perror(comp); exit(1); }
+    size_t comp_size = (size_t)st.st_size;
+
+    fp = fopen(dec, "rb");
+    if (!fp) { perror(dec); exit(1); }
+    size_t rd = fread(out, 1, CHUNK_BYTES, fp);
+    fclose(fp);
+    if (rd != CHUNK_BYTES) { fprintf(stderr, "tthresh short decode %zu\n", rd); exit(1); }
+
+    unlink(raw); unlink(comp); unlink(dec);
+    return comp_size;
+}
+
 /* =====================================================================
  * Driver — parallel sweep across chunks.  Each worker owns its own c3d
  * encoder/decoder + scratch buffers; codec handles are constructed per call
@@ -524,12 +690,20 @@ static size_t av1_encode_decode(const uint8_t *in, int cq, uint8_t *out_yuv) {
  * shared counter under a mutex; per-thread accumulators are reduced at end.
  * =====================================================================*/
 
-/* H.264 / H.265 take [0,51] QP; AV1 AOM_Q takes cq_level ∈ [0,63]. */
+/* H.264 / H.265 take [0,51] QP; AV1 AOM_Q takes cq_level ∈ [0,63];
+ * ZFP accuracy tolerance in integer LSBs spans a wide range. */
 static const int g_h264_qps[] = { 18, 24, 30, 36, 42, 48 };
 static const int g_h265_qps[] = { 18, 24, 30, 36, 42, 48 };
 static const int g_av1_cqs [] = { 16, 28, 40, 48, 55, 60 };
+/* Fixed-rate in q8 (bits × 256).  256=1.0 bpp, 128=0.5, 64=0.25, 32=0.125,
+ * etc.  Picked to span ratios comparable to the video/c3d QP columns. */
+static const int g_zfp_rates[] = { 1024, 512, 256, 128,  64,  32 };
+/* SZ3 absolute error bound in u8 LSBs.  Larger → higher ratio. */
+static const int g_sz3_eps  [] = {    1,   3,   6,  12,  24,  48 };
+/* TTHRESH target PSNR in dB. */
+static const int g_tthresh_p[] = {   50,  45,  40,  35,  30,  25 };
 #define N_QPS    (sizeof g_h264_qps / sizeof g_h264_qps[0])
-#define N_CODECS 3u
+#define N_CODECS 6u
 
 typedef size_t (*codec_fn)(const uint8_t *, int, uint8_t *);
 typedef struct {
@@ -543,6 +717,9 @@ static const codec_desc g_codecs[N_CODECS] = {
     { "H264", h264_encode_decode, g_h264_qps, "Q"  },
     { "H265", h265_encode_decode, g_h265_qps, "Q"  },
     { "AV1",  av1_encode_decode,  g_av1_cqs,  "cq" },
+    { "ZFP",  zfp_encode_decode,  g_zfp_rates, "rq8" },
+    { "SZ3",  sz3_encode_decode,  g_sz3_eps,   "eps" },
+    { "TTHR", tthresh_encode_decode, g_tthresh_p, "P" },
 };
 
 typedef struct {

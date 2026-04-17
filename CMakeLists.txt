@@ -88,8 +88,9 @@ target_compile_options(c3d_perf PRIVATE -Wno-unused-function)
 add_executable(c3d_bench_par c3d_bench_par.c)
 target_link_libraries(c3d_bench_par PRIVATE c3d m pthread)
 
-# Benchmark — builds against openh264 (H.264) + x265 + libde265 (H.265) + libaom (AV1).
-# All four must be installed; the bench is skipped otherwise.
+# Benchmark — builds against openh264 (H.264) + x265 + libde265 (H.265) +
+# libaom (AV1) + libzfp (ZFP).  All must be installed; bench is skipped otherwise.
+# ZFP in Debian doesn't ship a .pc, so we look it up via find_library.
 find_package(PkgConfig QUIET)
 if(PKG_CONFIG_FOUND)
     pkg_check_modules(OPENH264 QUIET openh264)
@@ -97,18 +98,43 @@ if(PKG_CONFIG_FOUND)
     pkg_check_modules(DE265    QUIET libde265)
     pkg_check_modules(AOM      QUIET aom)
 endif()
-if(OPENH264_FOUND AND X265_FOUND AND DE265_FOUND AND AOM_FOUND)
+find_path(ZFP_INCLUDE_DIR  zfp.h)
+find_library(ZFP_LIBRARY   zfp)
+if(ZFP_INCLUDE_DIR AND ZFP_LIBRARY)
+    set(ZFP_FOUND TRUE)
+endif()
+# SZ3: vendored under third_party/SZ3 (static libSZ3c.a + zstd).  Detect via
+# the built artifact path; user runs `cmake --build third_party/SZ3/build`
+# once before configuring c3d_bench.
+set(SZ3_DIR "${CMAKE_SOURCE_DIR}/third_party/SZ3")
+set(SZ3_LIB "${SZ3_DIR}/build/tools/sz3c/libSZ3c.a")
+set(SZ3_INC "${SZ3_DIR}/tools/sz3c/include")
+if(EXISTS "${SZ3_LIB}")
+    set(SZ3_FOUND TRUE)
+    pkg_check_modules(ZSTD QUIET libzstd)
+endif()
+# TTHRESH: invoked as CLI, just need the binary present.
+set(TTHRESH_BIN "${CMAKE_SOURCE_DIR}/third_party/tthresh/build/tthresh")
+if(EXISTS "${TTHRESH_BIN}")
+    set(TTHRESH_FOUND TRUE)
+endif()
+if(OPENH264_FOUND AND X265_FOUND AND DE265_FOUND AND AOM_FOUND
+   AND ZFP_FOUND AND SZ3_FOUND AND ZSTD_FOUND AND TTHRESH_FOUND)
     add_executable(c3d_bench c3d_bench.c)
     target_link_libraries(c3d_bench PRIVATE c3d m pthread
-        ${OPENH264_LIBRARIES} ${X265_LIBRARIES} ${DE265_LIBRARIES} ${AOM_LIBRARIES})
+        ${OPENH264_LIBRARIES} ${X265_LIBRARIES} ${DE265_LIBRARIES} ${AOM_LIBRARIES}
+        ${ZFP_LIBRARY} ${SZ3_LIB} ${ZSTD_LIBRARIES} stdc++ gomp)
     target_include_directories(c3d_bench PRIVATE
         ${OPENH264_INCLUDE_DIRS} ${X265_INCLUDE_DIRS}
-        ${DE265_INCLUDE_DIRS}    ${AOM_INCLUDE_DIRS})
+        ${DE265_INCLUDE_DIRS}    ${AOM_INCLUDE_DIRS}
+        ${ZFP_INCLUDE_DIR}       ${SZ3_INC})
     target_compile_options(c3d_bench PRIVATE
         ${OPENH264_CFLAGS_OTHER} ${X265_CFLAGS_OTHER}
         ${DE265_CFLAGS_OTHER}    ${AOM_CFLAGS_OTHER})
+    target_compile_definitions(c3d_bench PRIVATE TTHRESH_BIN="${TTHRESH_BIN}")
     message(STATUS "c3d_bench: openh264 ${OPENH264_VERSION}, x265 ${X265_VERSION}, "
-                   "libde265 ${DE265_VERSION}, libaom ${AOM_VERSION}")
+                   "libde265 ${DE265_VERSION}, libaom ${AOM_VERSION}, "
+                   "zfp ${ZFP_LIBRARY}, sz3 ${SZ3_LIB}, tthresh ${TTHRESH_BIN}")
 else()
     set(_c3d_bench_missing "")
     if(NOT OPENH264_FOUND)
@@ -122,6 +148,18 @@ else()
     endif()
     if(NOT AOM_FOUND)
         list(APPEND _c3d_bench_missing aom)
+    endif()
+    if(NOT ZFP_FOUND)
+        list(APPEND _c3d_bench_missing zfp)
+    endif()
+    if(NOT SZ3_FOUND)
+        list(APPEND _c3d_bench_missing sz3)
+    endif()
+    if(NOT ZSTD_FOUND)
+        list(APPEND _c3d_bench_missing libzstd)
+    endif()
+    if(NOT TTHRESH_FOUND)
+        list(APPEND _c3d_bench_missing tthresh)
     endif()
     message(STATUS "c3d_bench: skipping — missing ${_c3d_bench_missing}")
 endif()
