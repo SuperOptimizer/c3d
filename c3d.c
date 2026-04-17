@@ -1659,6 +1659,15 @@ struct c3d_encoder {
     bool     inter_chunk_enabled;
     float    prev_ll5[512];
     bool     has_prev_ll5;
+
+    /* §T14 — learned R-D slope for rate-control shortcut.  Tracks
+     * d(log bytes)/d(log q) from consecutive estimator samples (EMA,
+     * alpha=0.3).  Used to pick the next q via Newton-in-log-space
+     * instead of geometric bisection; collapses typical bisection
+     * from 3-8 iters to 1-3 since the rate curve is close to a
+     * straight line in log-log.  Seeded to -1.5 on first encode. */
+    float    log_rd_slope;
+    bool     has_log_rd_slope;
 };
 
 struct c3d_decoder {
@@ -1699,6 +1708,8 @@ c3d_encoder *c3d_encoder_new(void) {
     e->ll_prediction_source = 0;
     e->inter_chunk_enabled = false;
     e->has_prev_ll5 = false;
+    e->log_rd_slope = 0.0f;
+    e->has_log_rd_slope = false;
     return e;
 }
 void c3d_encoder_free(c3d_encoder *e) {
@@ -2979,14 +2990,25 @@ size_t c3d_encoder_chunk_encode(c3d_encoder *e, const uint8_t *in,
         q_hi = C3D_Q_MAX;
     }
 
-    /* Bisect on the cheap estimator (quantize + Shannon, no rANS) to pick q,
-     * then run the true emit exactly once.  ~3-4× encode speedup vs the
-     * per-iteration full-emit loop; final output is always the real encode.
+    /* Rate-control on the cheap estimator (quantize + Shannon, no rANS) to
+     * pick q, then run the true emit exactly once.  ~3-4× encode speedup vs
+     * the per-iteration full-emit loop; final output is always the real
+     * encode.
      *
      * §S7: when warm-started, accept the warm q if it lands within ±5% of
-     * target (R-D allocator can correct the rest).  Saves 2-4 bisection
-     * iterations on sequential chunks in a shard. */
+     * target (R-D allocator can correct the rest).  Saves 2-4 iterations on
+     * sequential chunks in a shard.
+     *
+     * §T14: the rate curve log(bytes) vs log(q) is nearly linear for
+     * DWT+rANS on CT data, with slope ~-1.5.  We track that slope as an EMA
+     * over successive estimator samples and jump directly to the predicted q
+     * (Newton-in-log-space) instead of geometric bisection.  The bracket
+     * q_lo/q_hi still advances every iter as a safety net: when the Newton
+     * step lands at the bracket edge we fall back to the geometric midpoint.
+     * Typical iter counts: cold 2-3 (vs 5-8), warm 1-2 (vs 2-4). */
     bool warm = (e->last_q > 0.0f && e->last_target_ratio == target_ratio);
+    double prev_log_q = 0.0, prev_log_b = 0.0;
+    bool have_prev = false;
     for (int iter = 0; iter < 10 && !e->has_allocator_steps; ++iter) {
         double est_bytes = c3d_estimate_entropy_at_q(q, e, ctx);
         double err = est_bytes - target_bytes_d;
@@ -2994,17 +3016,47 @@ size_t c3d_encoder_chunk_encode(c3d_encoder *e, const uint8_t *in,
         if (rel < 0.01) break;
         if (iter == 0 && warm && rel < 0.05) break;   /* §S7 early-exit */
 
-        if (est_bytes > target_bytes_d) {
-            q_lo = q;
-            float new_q = sqrtf(q_lo * q_hi);
-            if (new_q <= q_lo * 1.001f) break;
-            q = new_q;
-        } else {
-            q_hi = q;
-            float new_q = sqrtf(q_lo * q_hi);
-            if (new_q >= q_hi * 0.999f) break;
-            q = new_q;
+        /* Advance bracket from the new sample. */
+        if (est_bytes > target_bytes_d) q_lo = q;
+        else                            q_hi = q;
+
+        /* Online slope update (EMA) from consecutive samples. */
+        double log_q = log((double)q);
+        double log_b = log(est_bytes);
+        if (have_prev) {
+            double dq = log_q - prev_log_q;
+            if (dq > 1e-4 || dq < -1e-4) {
+                double sample = (log_b - prev_log_b) / dq;
+                if (sample < -4.0)  sample = -4.0;
+                if (sample > -0.25) sample = -0.25;
+                e->log_rd_slope = e->has_log_rd_slope
+                    ? (0.7f * e->log_rd_slope + 0.3f * (float)sample)
+                    : (float)sample;
+                e->has_log_rd_slope = true;
+            }
         }
+        prev_log_q = log_q; prev_log_b = log_b; have_prev = true;
+
+        /* Newton step in log-space using the learned slope.  Seed -1.5 when
+         * no slope has been observed yet — typical value for DWT+rANS. */
+        float slope = e->has_log_rd_slope ? e->log_rd_slope : -1.5f;
+        double d_log_q = log(target_bytes_d / est_bytes) / (double)slope;
+        /* Cap step to 4× / quarter per iter so a bad slope can't slingshot
+         * us outside the valid range. */
+        if (d_log_q > 1.386)  d_log_q = 1.386;   /* log 4 */
+        if (d_log_q < -1.386) d_log_q = -1.386;
+        float new_q = (float)((double)q * exp(d_log_q));
+
+        /* Keep the jump strictly inside the current bracket; if it lands on
+         * the edge, fall back to the geometric midpoint (old behaviour). */
+        if (new_q <= q_lo * 1.001f || new_q >= q_hi * 0.999f) {
+            new_q = sqrtf(q_lo * q_hi);
+            if (new_q <= q_lo * 1.001f) break;
+            if (new_q >= q_hi * 0.999f) break;
+        }
+        if (new_q < C3D_Q_MIN) new_q = C3D_Q_MIN;
+        if (new_q > C3D_Q_MAX) new_q = C3D_Q_MAX;
+        q = new_q;
     }
     /* R-D allocator (§Q3 v3): two-pass calibrated Lagrangian.
      * Pass 1: emit at global q → measure actual per-subband bytes.
