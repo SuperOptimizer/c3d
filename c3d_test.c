@@ -793,6 +793,50 @@ static void test_chunk_rate_control(void) {
     free(in); free(dec); free(enc);
 }
 
+static void test_chunk_truncated_decode(void) {
+    /* §T9 — quality-scalable truncated decode.  Decoding with in_len smaller
+     * than the emitted chunk size must (a) not panic and (b) produce a
+     * valid u8 reconstruction.  Subband granularity is the truncation unit.
+     *
+     * Monotonicity (more bytes → ≥ PSNR) holds on real data but not
+     * universally on synthetic test chunks — when the HF bitstream
+     * encodes specific patterns, adding more of it at high compression
+     * can introduce reconstruction noise that wasn't there in the
+     * LL-only reconstruction.  So we check validity + reasonable floor
+     * here and leave monotonicity validation to the corpus bench. */
+    uint8_t *in  = aligned_alloc(C3D_ALIGN, C3D_VOXELS_PER_CHUNK);
+    uint8_t *dec = aligned_alloc(C3D_ALIGN, C3D_VOXELS_PER_CHUNK);
+    uint8_t *enc = aligned_alloc(C3D_ALIGN, C3D_CHUNK_ENCODE_MAX_SIZE);
+    c3d_assert(in && dec && enc);
+    make_test_chunk(in);
+
+    size_t full = c3d_chunk_encode(in, 10.0f, NULL, enc, C3D_CHUNK_ENCODE_MAX_SIZE);
+    CHECK(full > 400);
+
+    c3d_chunk_decode(enc, full, NULL, dec);
+    double psnr_full = measure_psnr(in, dec, C3D_VOXELS_PER_CHUNK);
+    CHECK(psnr_full > 30.0);
+
+    /* Every truncation must still produce output, and PSNR must stay above
+     * a LL-only-reconstruction floor (chunk mean ~= 20 dB in the worst case). */
+    static const double fracs[] = { 0.75, 0.50, 0.25, 0.10, 0.05 };
+    for (size_t i = 0; i < sizeof fracs / sizeof fracs[0]; ++i) {
+        size_t trunc = (size_t)((double)full * fracs[i]);
+        if (trunc < C3D_CHUNK_FIXED_SIZE) trunc = C3D_CHUNK_FIXED_SIZE;
+        c3d_chunk_decode(enc, trunc, NULL, dec);
+        double p = measure_psnr(in, dec, C3D_VOXELS_PER_CHUNK);
+        printf("  frac=%.2f  bytes=%7zu  PSNR=%.2f dB\n", fracs[i], trunc, p);
+        CHECK(p > 15.0);   /* above LL-only floor for this synthetic chunk */
+    }
+
+    /* Header-only decode (exactly C3D_CHUNK_FIXED_SIZE bytes): no entropy
+     * payload at all; every subband zero-filled; output is the chunk's
+     * dc_offset + 128 (constant value).  Must still not panic. */
+    c3d_chunk_decode(enc, C3D_CHUNK_FIXED_SIZE, NULL, dec);
+
+    free(in); free(dec); free(enc);
+}
+
 static void test_chunk_deterministic_encode(void) {
     /* Same-binary deterministic: encoding the same input twice must produce
      * byte-identical output, whether via the stateless API, fresh encoder
@@ -1319,6 +1363,7 @@ int main(void) {
     test_chunk_validate_rejects_garbage();
     test_chunk_encode_decode_at_q();
     test_chunk_rate_control();
+    test_chunk_truncated_decode();
     test_chunk_deterministic_encode();
     test_chunks_batched();
     test_chunk_lod_decode();

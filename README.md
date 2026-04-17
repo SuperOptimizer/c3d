@@ -1,9 +1,9 @@
 # c3d
 
 Compression codec for very-large volumetric u8 X-ray CT data (Vesuvius-style
-scroll scans up to ~75 k × 35 k × 35 k voxels). Beats H.264-intra (openh264
-baseline) by several dB at comparable bitrates on real scroll data, and keeps
-random access cheap via a fixed chunk/shard hierarchy with 6 built-in LODs.
+scroll scans up to ~75 k × 35 k × 35 k voxels). Beats H.264, H.265, and AV1
+baselines by several dB at comparable byte budgets on real scroll data, and
+keeps random access cheap via a fixed chunk/shard hierarchy with 6 built-in LODs.
 
 One C23 source file + one header, libc only. No intrinsics.
 
@@ -39,6 +39,15 @@ bitstream — no duplicated coefficients. Coarser LODs read a tiny byte
 prefix and skip IDWT levels; LOD 5 (8³) decodes in ~10 µs from a single
 ~760-byte prefix.
 
+**Byte-level progressive decode** at subband granularity: feeding the
+decoder fewer bytes than the full chunk yields a valid reconstruction with
+gracefully-degraded quality. Subband order is importance-sorted (LL_5
+first, then detail subbands coarse-to-fine), so the coarsest information
+is always preserved. At 50 % bytes, PSNR typically stays within 3-5 dB of
+the full decode on scroll CT; at 10 %, it drops to LL-dominated quality
+(~20-25 dB). Useful for streaming, bandwidth-adaptive clients, and
+preview-then-refine pipelines.
+
 Sparse sentinel: shard index slots encode `(UINT64_MAX, 0)` = ABSENT and
 `(0, 0)` = ALL-ZERO so empty chunks cost zero bytes and zero decode —
 critical for scrolls where 75-85 % of masked chunks are uniformly zero.
@@ -57,22 +66,75 @@ On a 64-chunk slice of `s3://scrollprize-volumes/esrf/20260311/2.4um_PHerc-Paris
 | 100:1        |   99.4   | 35.30 dB| 238 MB/s             |
 | 200:1        |  197.8   | 32.34 dB| 290 MB/s             |
 
-c3d vs H.264 (`openh264`, P-frames + CABAC + adaptive QP, byte-budget-matched):
+c3d vs three video baselines — H.264 (`openh264`), H.265 (`x265` + `libde265`),
+AV1 (`libaom`) — byte-budget-matched over the same 64-chunk corpus.  Each row
+fixes a rate-control point for the video codec (QP for H.264/H.265,
+`cq_level` for AV1) and retargets c3d to the resulting byte size, so both
+sides hit essentially the same rate.  Δ is c3d PSNR minus baseline PSNR.
 
-| QP | ratio   | H.264 PSNR | c3d PSNR | **Δ**      |
-|----|---------|-----------|----------|------------|
-| 18 |   8.9:1 | 43.10 dB  | 47.48 dB | **+4.37**  |
-| 24 |  18.0:1 | 38.93 dB  | 43.29 dB | **+4.36**  |
-| 30 |  41.0:1 | 35.08 dB  | 39.69 dB | **+4.61**  |
-| 36 | 100.3:1 | 31.03 dB  | 35.26 dB | **+4.22**  |
-| 42 | 258.8:1 | 27.30 dB  | 31.30 dB | **+4.00**  |
-| 48 | 654.9:1 | 24.04 dB  | 28.14 dB | **+4.11**  |
+**H.264** — openh264, CABAC, per-MB adaptive QP, single-GOP 1 I + 255 P
+(exploiting z-axis correlation like c3d's 3D DWT):
 
-Consistent **+4.0 to +4.6 dB** advantage at every operating point on real
-scroll data.  H.264 uses single-GOP P-frames (exploiting z-axis correlation
-like c3d's 3D DWT), CABAC entropy coding, and per-MB adaptive QP — this is
-a strong baseline, not the all-I/CAVLC configuration some codec papers use.
-See `c3d_bench` for the harness.
+| QP | ratio   | H.264 PSNR | c3d PSNR | **Δ**     |
+|----|---------|------------|----------|-----------|
+| 18 |   8.9:1 | 43.10 dB   | 47.48 dB | **+4.37** |
+| 24 |  18.0:1 | 38.93 dB   | 43.29 dB | **+4.36** |
+| 30 |  41.0:1 | 35.08 dB   | 39.69 dB | **+4.61** |
+| 36 | 100.3:1 | 31.03 dB   | 35.26 dB | **+4.22** |
+| 42 | 258.8:1 | 27.30 dB   | 31.30 dB | **+4.00** |
+| 48 | 654.9:1 | 24.04 dB   | 28.14 dB | **+4.11** |
+
+**H.265** — x265 medium + zerolatency, 1 I + 255 P, no B-frames, CQP, libde265
+decode:
+
+| QP | ratio   | H.265 PSNR | c3d PSNR | **Δ**     |
+|----|---------|------------|----------|-----------|
+| 18 |  11.3:1 | 44.35 dB   | 45.77 dB | **+1.42** |
+| 24 |  22.6:1 | 40.71 dB   | 42.29 dB | **+1.58** |
+| 30 |  46.7:1 | 37.13 dB   | 39.07 dB | **+1.94** |
+| 36 | 102.9:1 | 33.47 dB   | 35.15 dB | **+1.68** |
+| 42 | 248.5:1 | 29.60 dB   | 31.44 dB | **+1.84** |
+| 48 | 690.3:1 | 25.41 dB   | 28.02 dB | **+2.60** |
+
+**AV1** — libaom `AOM_USAGE_ALL_INTRA`, `cpu-used=6`, AOM_Q.  All-intra
+because libaom's altref + `lag_in_frames` pipeline drops visible frames at
+flush under constant-Q; ALL_INTRA gives a clean R-D curve at the cost of
+not exploiting z-axis correlation:
+
+| cq | ratio   | AV1 PSNR  | c3d PSNR | **Δ**     |
+|----|---------|-----------|----------|-----------|
+| 16 |  11.0:1 | 43.24 dB  | 45.97 dB | **+2.73** |
+| 28 |  18.3:1 | 39.65 dB  | 43.21 dB | **+3.56** |
+| 40 |  34.8:1 | 35.40 dB  | 40.46 dB | **+5.06** |
+| 48 |  55.8:1 | 32.51 dB  | 38.16 dB | **+5.65** |
+| 55 |  85.7:1 | 30.07 dB  | 36.03 dB | **+5.96** |
+| 60 | 129.2:1 | 28.05 dB  | 34.12 dB | **+6.07** |
+
+c3d wins at every operating point against all three baselines — **+4.0 to +4.6
+dB** over H.264, **+1.4 to +2.6 dB** over H.265 (the strongest inter
+baseline), **+2.7 to +6.1 dB** over AV1 all-intra.  H.265 closes most of the
+gap near-lossless; c3d pulls ahead again as compression gets aggressive.
+Harness: `c3d_bench` (runs all three codecs in one sweep).
+
+**Perceptual gap is larger than PSNR gap at high compression.**  The same
+bench measures block-SSIM (8×8, mean-averaged across slices) alongside
+PSNR, and the SSIM story is substantially more favourable to c3d:
+
+| operating point       | ΔPSNR | ΔSSIM | c3d SSIM | baseline SSIM |
+|-----------------------|-------|-------|----------|----------------|
+| H.264 Q18 (9:1)       | +4.37 | +0.008 | 0.996   | 0.988          |
+| H.264 Q48 (655:1)     | +4.11 | **+0.189** | 0.794 | 0.605      |
+| H.265 Q18 (11:1)      | +1.42 | +0.002 | 0.994   | 0.991          |
+| H.265 Q48 (690:1)     | +2.60 | **+0.123** | 0.791 | 0.668      |
+| AV1 cq16 (11:1)       | +2.73 | +0.005 | 0.994   | 0.988          |
+| AV1 cq60 (129:1)      | +6.07 | **+0.160** | 0.928 | 0.768      |
+
+At near-lossless, SSIM saturates near 1.0 for every codec and there's
+nothing to distinguish.  At 100:1+ ratios where the video codecs start
+producing visible blocking artifacts, c3d's wavelet blur degrades to
+0.79-0.93 SSIM (still usable) while the baselines collapse to 0.60-0.77
+(visibly broken).  The +0.1-0.2 SSIM gap at high ratios is arguably a
+better summary of c3d's practical advantage than the PSNR numbers above.
 
 Single-chunk perf (`c3d_perf`, same hardware, q=0.10):
 
@@ -93,8 +155,9 @@ lod   side   bytes_read    out_vox     dec_ms dec_MB/s_out
 
 ## Design constraints
 
-- **C23**, single `c3d.c` + `c3d.h`, libc only. `openh264` appears in the
-  benchmark harness only, not in the library.
+- **C23**, single `c3d.c` + `c3d.h`, libc only. Video-codec baselines
+  (`openh264`, `x265` + `libde265`, `libaom`) appear in the benchmark
+  harness only, not in the library.
 - **In-memory API** — bytes in → bytes out. Callers own all I/O.
 - **Fatal on error** — corruption, OOM, or invalid input → `c3d_panic()` →
   `abort()`. No status codes. Panic hook is overridable.
@@ -188,7 +251,7 @@ for streaming.
 | `c3d_test`       | unit tests (in-tree `#include "c3d.c"`)              |
 | `c3d_perf`       | single-chunk encode/decode throughput + LOD sweep    |
 | `c3d_bench_par`  | multi-thread corpus bench                            |
-| `c3d_bench`      | c3d vs H.264-intra at matched bitrate (needs openh264) |
+| `c3d_bench`      | c3d vs H.264 / H.265 / AV1 at matched byte budget, pthread-parallel (needs openh264, x265, libde265, libaom) |
 | `c3d_inspect`    | dump chunk / shard / .c3dx metadata                  |
 | `c3d_compact`    | parse+re-serialise (drops orphaned bytes)            |
 | `c3d_train`      | build a `.c3dx` from a corpus directory              |

@@ -82,20 +82,42 @@ target_compile_options(c3d_perf PRIVATE -Wno-unused-function)
 add_executable(c3d_bench_par c3d_bench_par.c)
 target_link_libraries(c3d_bench_par PRIVATE c3d m pthread)
 
-# Benchmark — optionally builds against openh264 for the H.264 baseline.
-# Skipped if openh264 isn't installed.
+# Benchmark — builds against openh264 (H.264) + x265 + libde265 (H.265) + libaom (AV1).
+# All four must be installed; the bench is skipped otherwise.
 find_package(PkgConfig QUIET)
 if(PKG_CONFIG_FOUND)
     pkg_check_modules(OPENH264 QUIET openh264)
+    pkg_check_modules(X265     QUIET x265)
+    pkg_check_modules(DE265    QUIET libde265)
+    pkg_check_modules(AOM      QUIET aom)
 endif()
-if(OPENH264_FOUND)
+if(OPENH264_FOUND AND X265_FOUND AND DE265_FOUND AND AOM_FOUND)
     add_executable(c3d_bench c3d_bench.c)
-    target_link_libraries(c3d_bench PRIVATE c3d m ${OPENH264_LIBRARIES})
-    target_include_directories(c3d_bench PRIVATE ${OPENH264_INCLUDE_DIRS})
-    target_compile_options(c3d_bench PRIVATE ${OPENH264_CFLAGS_OTHER})
-    message(STATUS "c3d_bench: found openh264 ${OPENH264_VERSION}")
+    target_link_libraries(c3d_bench PRIVATE c3d m pthread
+        ${OPENH264_LIBRARIES} ${X265_LIBRARIES} ${DE265_LIBRARIES} ${AOM_LIBRARIES})
+    target_include_directories(c3d_bench PRIVATE
+        ${OPENH264_INCLUDE_DIRS} ${X265_INCLUDE_DIRS}
+        ${DE265_INCLUDE_DIRS}    ${AOM_INCLUDE_DIRS})
+    target_compile_options(c3d_bench PRIVATE
+        ${OPENH264_CFLAGS_OTHER} ${X265_CFLAGS_OTHER}
+        ${DE265_CFLAGS_OTHER}    ${AOM_CFLAGS_OTHER})
+    message(STATUS "c3d_bench: openh264 ${OPENH264_VERSION}, x265 ${X265_VERSION}, "
+                   "libde265 ${DE265_VERSION}, libaom ${AOM_VERSION}")
 else()
-    message(STATUS "c3d_bench: openh264 not found — skipping")
+    set(_c3d_bench_missing "")
+    if(NOT OPENH264_FOUND)
+        list(APPEND _c3d_bench_missing openh264)
+    endif()
+    if(NOT X265_FOUND)
+        list(APPEND _c3d_bench_missing x265)
+    endif()
+    if(NOT DE265_FOUND)
+        list(APPEND _c3d_bench_missing libde265)
+    endif()
+    if(NOT AOM_FOUND)
+        list(APPEND _c3d_bench_missing aom)
+    endif()
+    message(STATUS "c3d_bench: skipping — missing ${_c3d_bench_missing}")
 endif()
 
 enable_testing()

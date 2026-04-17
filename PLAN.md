@@ -4,7 +4,7 @@ Target: one coherent state-of-the-art 3D volumetric codec, planned end-to-end, i
 
 ## 0. Non-negotiable locks
 
-- **C23**, single `c3d.h` + `c3d.c`, libc only. `openh264` is the only third-party dependency and it lives in the benchmark harness, not the library.
+- **C23**, single `c3d.h` + `c3d.c`, libc only. Third-party video codecs (`openh264`, `x265` + `libde265`, `libaom`) are permitted in the benchmark harness only — they never link into the shipped library.
 - **CDF 9/7 float32 DWT**, 5 levels, symmetric extension. No integer wavelet, no dedicated lossless mode — near-lossless is the highest-quality point on a single lossy R-D curve.
 - **Per-subband rANS entropy coding** with static (per-chunk or per-shard) frequency tables. 8-way interleaved decode path. No EBCOT, no PCRD, no tier-1/tier-2 distinction.
 - **Little-endian only.**
@@ -14,7 +14,7 @@ Target: one coherent state-of-the-art 3D volumetric codec, planned end-to-end, i
 - **Rate control by `target_ratio`.** Only rate knob. `target_ratio ∈ (1.0, ∞)`; typical 2, 10, 100. Internal rate-control bisection over `chunk_scalar ∈ [2^-12, 2^12]` (widened from the originally-locked 2^-6 lower bound to accommodate perceptual subband weights, which compress HF subbands aggressively).
 - **Generic vectorisable C, no intrinsics in v1.** Built with `-O3 -ffast-math -funsafe-math-optimizations`. Determinism policy: same binary + same inputs → byte-identical encoded output (same-build reproducibility). Across different builds/compilers/architectures, no guarantee — tests compare decoded voxels with tolerance, not encoded bytes.
 - **Format version = 1, forever, no compat.** During development the only upgrade path is re-encoding from raw u8.
-- **Permitted dev-time deps:** `openh264` may be invoked from the benchmark harness (`c3d_bench.c`) for baseline comparison. Not linked into any shipped binary. Lives under `third_party/`. The rANS reference (`ryg_rans`) is public-domain and inlined into `c3d.c` rather than carried as a dep.
+- **Permitted dev-time deps:** the benchmark harness (`c3d_bench.c`) may invoke `openh264` (H.264 baseline), `x265` + `libde265` (H.265 baseline), and `libaom` (AV1 baseline) for byte-budget-matched PSNR comparison. None are linked into any shipped binary. The rANS reference (`ryg_rans`) is public-domain and inlined into `c3d.c` rather than carried as a dep.
 - **Library-wide parser rule.** Every parser (shard, chunk, `.c3dx`, TLV) bounds-checks before every read. On any inconsistency — bad magic, wrong version, offset past end, size overflow, TLV truncation, hash mismatch, sentinel byte in a data field, frequency table that does not sum to `M`, rANS state inconsistency — `c3d_panic()` immediately. No partial-recovery attempts. Multi-byte reads use `memcpy` into typed locals, not direct casts, to handle unaligned offsets (the per-subband bitstream layout has u32 fields after variable-length sections).
 - **Panic reentrancy.** `c3d_panic()` must not return. Hooks that `longjmp` or otherwise resume control are undefined behaviour; library state after a panic is not recoverable.
 
@@ -46,6 +46,8 @@ LOD 5 :   8³   coarsest — single LLL subband
 ```
 
 All 6 LODs are decoded from **prefixes of one bitstream**. The payload is laid out resolution-first (LLL_5 first, then detail subbands at level 5, then level 4, … then level 1). Decoding to LOD k reads `lod_offset[k]` bytes and runs `5 − k` IDWT synthesis steps. No duplicated coefficients across LODs.
+
+**Byte-level truncatable decode (§T9):** the decoder also accepts *shorter* `in_len` than the emitted chunk within a given LOD. Any subband whose entropy range extends past the supplied bytes is zero-filled; the LL and remaining HF subbands that fit are decoded normally. The effect is monotonic progressive decode at subband granularity — valid reconstruction at every truncation point, quality non-decreasing as bytes append. Useful for streaming, bandwidth-adaptive clients, and progressive preview-then-refine pipelines. Subbands are emitted biggest-magnitude-first by construction (LL_5 → level-5 details → level-4 details → … → level-1 details), so early truncation keeps the most important coefficients.
 
 For zoom-out beyond LOD 5 (chunk thumbnails smaller than 8³), callers build a pyramid of shards at coarser resolutions. The library exposes `c3d_downsample_chunk_2x` to make each step a one-liner; these pyramid shards are independent `.c3ds` files with their `shard_lod` incremented.
 

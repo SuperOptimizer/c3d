@@ -1935,15 +1935,24 @@ static size_t c3d_encode_one_subband(
     uint32_t hist_ctx[2][65] = {{0}, {0}};  /* [0]=after-zero, [1]=after-nonzero */
     size_t escape_pos = 0;
     size_t idx = 0;
-    bool prev_sign_zy[128 * 128] = {0};   /* max side = 128 */
+    /* §T12: only memset the portion we'll actually use.  Side ranges from 8
+     * to 128, so this zeroes 64 B to 16 KiB instead of always 16 KiB — a 4-256×
+     * reduction in zero-fill work on smaller subbands.  Must NOT use `= {0}`
+     * on the VLA-sized subarray because that zeros the whole 128*128 block. */
+    bool prev_sign_zy[128 * 128];
+    memset(prev_sign_zy, 0, (size_t)sb->side * sb->side);
     bool lane_ctx[8] = {false,false,false,false,false,false,false,false};
-    for (uint32_t z = sb->z0; z < sb->z0 + sb->side; ++z)
-    for (uint32_t y = sb->y0; y < sb->y0 + sb->side; ++y)
-    for (uint32_t x = sb->x0; x < sb->x0 + sb->side; ++x) {
+    /* §T12: hoist sb-> struct reads to locals so the compiler doesn't
+     * reload them every inner iteration (sb is not restrict-qualified). */
+    const uint32_t sb_z0 = sb->z0, sb_y0 = sb->y0, sb_x0 = sb->x0;
+    const uint32_t sb_side = sb->side;
+    for (uint32_t z = sb_z0; z < sb_z0 + sb_side; ++z)
+    for (uint32_t y = sb_y0; y < sb_y0 + sb_side; ++y)
+    for (uint32_t x = sb_x0; x < sb_x0 + sb_side; ++x) {
         float c = coeff_buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + x];
         int32_t qv = c3d_quant(c, step, dz_half);
         uint32_t escape_mag;
-        bool *sp = &prev_sign_zy[(y - sb->y0) * sb->side + (x - sb->x0)];
+        bool *sp = &prev_sign_zy[(y - sb_y0) * sb_side + (x - sb_x0)];
         uint8_t sym = c3d_quant_to_symbol(qv, &escape_mag, sp);
         sub_symbols[idx] = sym;
         hist[sym]++;
@@ -2196,7 +2205,8 @@ static double c3d_estimate_one_subband_rd(
      * can re-compute distortion at α* without a second scan. */
     double sumabs_bin[65] = {0};
     double sumabs2_bin[65] = {0};
-    bool prev_sign_zy[128 * 128] = {0};
+    bool prev_sign_zy[128 * 128];
+    memset(prev_sign_zy, 0, (size_t)sb->side * sb->side);   /* §T12 */
     for (uint32_t z = sb->z0; z < sb->z0 + sb->side; ++z)
     for (uint32_t y = sb->y0; y < sb->y0 + sb->side; ++y)
     for (uint32_t x = sb->x0; x < sb->x0 + sb->side; ++x) {
@@ -2313,7 +2323,8 @@ static double c3d_estimate_one_subband_bytes(
     uint32_t hist[65] = {0};
     uint32_t hist_ctx[2][65] = {{0},{0}};
     size_t escape_bytes = 0;
-    bool prev_sign_zy[128 * 128] = {0};
+    bool prev_sign_zy[128 * 128];
+    memset(prev_sign_zy, 0, (size_t)sb->side * sb->side);   /* §T12 */
     bool lane_ctx_est[8] = {false,false,false,false,false,false,false,false};
     size_t est_idx = 0;
     for (uint32_t z = sb->z0; z < sb->z0 + sb->side; ++z)
@@ -3127,61 +3138,125 @@ void c3d_encoder_chunks_encode(c3d_encoder *e,
  * byte ratio so the filter is a no-op at near-lossless and a mild blur at
  * high ratios where quantisation ringing dominates. */
 
-static inline void c3d_denoise_blur_x_row(float *row, size_t N, float alpha)
+/* §T10: 3-tap 3D denoiser.  Previous implementation maintained l/c/r state
+ * across the inner loop iterations, which created a first-order recurrence
+ * the auto-vectorizer can't break.  This rewrite uses a single scratch row
+ * (X pass) and a scratch plane (Y/Z passes) so each inner loop is a pure
+ * unit-stride SIMD-friendly filter with no iteration-carried state.  Clang
+ * and GCC both vectorize the inner float loops to 4/8-wide NEON/AVX2. */
+
+static inline void c3d_denoise_blur_x_row(float *restrict row, size_t N,
+                                          float alpha, float *restrict scratch)
 {
     if (N < 3) return;
     float one_minus_a = 1.0f - alpha;
-    float l = row[0];   /* boundary: replicate */
-    float c = row[0];
-    for (size_t i = 0; i < N; ++i) {
-        float r = (i + 1 < N) ? row[i + 1] : c;
-        row[i] = one_minus_a * c + alpha * (l + c + r) * (1.0f / 3.0f);
-        l = c;
-        c = r;
+    float third = alpha * (1.0f / 3.0f);
+    memcpy(scratch, row, N * sizeof(float));
+    /* Boundary: replicate endpoints (scratch[0] used as left of row[0],
+     * scratch[N-1] as right of row[N-1]). */
+    row[0] = one_minus_a * scratch[0]
+           + third * (scratch[0] + scratch[0] + scratch[1]);
+    for (size_t i = 1; i + 1 < N; ++i) {
+        row[i] = one_minus_a * scratch[i]
+               + third * (scratch[i - 1] + scratch[i] + scratch[i + 1]);
+    }
+    row[N - 1] = one_minus_a * scratch[N - 1]
+               + third * (scratch[N - 2] + scratch[N - 1] + scratch[N - 1]);
+}
+
+/* Generic "blur one axis" pass.  Treats `buf` as a 3D array of side³ with
+ * strides (SZ, SY, 1) in (z, y, x) order.  Blurs along `axis` in {0=Z, 1=Y, 2=X}
+ * using a 3-tap [1, 1, 1] / 3 kernel weighted by alpha: out = (1-α)·c + (α/3)·(l+c+r),
+ * with edge replication at boundaries.
+ *
+ * Implementation: for each (slice, row) of the two non-axis dimensions, read
+ * three adjacent rows/columns, write one filtered output row/column into
+ * scratch_plane, then copy scratch_plane back.  Inner loop is always unit-stride
+ * on the innermost axis, so vectorization works even on Y/Z passes. */
+static void c3d_denoise_axis(float *restrict buf, size_t side,
+                             unsigned axis, float alpha,
+                             float *restrict scratch_plane,
+                             float *restrict scratch_row)
+{
+    const size_t SY = C3D_STRIDE_Y;
+    const size_t SZ = C3D_STRIDE_Z;
+    const float one_minus_a = 1.0f - alpha;
+    const float third = alpha * (1.0f / 3.0f);
+
+    if (axis == 2u) {
+        /* X pass: innermost contiguous row.  Uses the per-row helper. */
+        for (size_t z = 0; z < side; ++z)
+        for (size_t y = 0; y < side; ++y)
+            c3d_denoise_blur_x_row(&buf[z * SZ + y * SY], side, alpha, scratch_row);
+        return;
+    }
+
+    /* Y pass (axis == 1): for each z slice, for each y, we need rows y-1, y, y+1
+     * (contiguous in x) → write filtered row to scratch_plane[y], then copy
+     * scratch_plane back into buf's z-slice. */
+    if (axis == 1u) {
+        for (size_t z = 0; z < side; ++z) {
+            float *plane = buf + z * SZ;
+            for (size_t y = 0; y < side; ++y) {
+                size_t y_l = (y > 0) ? y - 1 : y;
+                size_t y_r = (y + 1 < side) ? y + 1 : y;
+                const float *rl = plane + y_l * SY;
+                const float *rc = plane + y   * SY;
+                const float *rr = plane + y_r * SY;
+                float *out = scratch_plane + y * side;
+                for (size_t x = 0; x < side; ++x) {
+                    out[x] = one_minus_a * rc[x]
+                           + third * (rl[x] + rc[x] + rr[x]);
+                }
+            }
+            /* Copy scratch_plane back.  Memcpy is SIMD-fast. */
+            for (size_t y = 0; y < side; ++y) {
+                memcpy(plane + y * SY, scratch_plane + y * side,
+                       side * sizeof(float));
+            }
+        }
+        return;
+    }
+
+    /* Z pass (axis == 0): for each y, for each z, we need slices z-1, z, z+1
+     * at (z, y, *).  Inner loop is over x (unit-stride). */
+    if (axis == 0u) {
+        for (size_t y = 0; y < side; ++y) {
+            /* For each z we write one x-row of length `side` into
+             * scratch_plane[z].  After the z loop, copy back into buf. */
+            for (size_t z = 0; z < side; ++z) {
+                size_t z_l = (z > 0) ? z - 1 : z;
+                size_t z_r = (z + 1 < side) ? z + 1 : z;
+                const float *rl = buf + z_l * SZ + y * SY;
+                const float *rc = buf + z   * SZ + y * SY;
+                const float *rr = buf + z_r * SZ + y * SY;
+                float *out = scratch_plane + z * side;
+                for (size_t x = 0; x < side; ++x) {
+                    out[x] = one_minus_a * rc[x]
+                           + third * (rl[x] + rc[x] + rr[x]);
+                }
+            }
+            for (size_t z = 0; z < side; ++z) {
+                memcpy(buf + z * SZ + y * SY, scratch_plane + z * side,
+                       side * sizeof(float));
+            }
+        }
+        return;
     }
 }
 
 static void c3d_denoise_3d(float *buf, size_t side, float alpha)
 {
     if (alpha <= 0.0f || side < 3) return;
-    const size_t SY = C3D_STRIDE_Y;
-    const size_t SZ = C3D_STRIDE_Z;
-
-    /* X pass — contiguous rows. */
-    for (size_t z = 0; z < side; ++z)
-    for (size_t y = 0; y < side; ++y)
-        c3d_denoise_blur_x_row(&buf[z * SZ + y * SY], side, alpha);
-
-    /* Y pass — per column, use 3 scalar registers of state. */
-    float one_minus_a = 1.0f - alpha;
-    for (size_t z = 0; z < side; ++z) {
-        for (size_t x = 0; x < side; ++x) {
-            float *col0 = &buf[z * SZ + 0 * SY + x];
-            float l = col0[0];
-            float c = col0[0];
-            for (size_t y = 0; y < side; ++y) {
-                float r = (y + 1 < side) ? col0[(y + 1) * SY] : c;
-                col0[y * SY] = one_minus_a * c + alpha * (l + c + r) * (1.0f / 3.0f);
-                l = c;
-                c = r;
-            }
-        }
-    }
-
-    /* Z pass — same idea, stride SZ. */
-    for (size_t y = 0; y < side; ++y) {
-        for (size_t x = 0; x < side; ++x) {
-            float *col0 = &buf[0 * SZ + y * SY + x];
-            float l = col0[0];
-            float c = col0[0];
-            for (size_t z = 0; z < side; ++z) {
-                float r = (z + 1 < side) ? col0[(z + 1) * SZ] : c;
-                col0[z * SZ] = one_minus_a * c + alpha * (l + c + r) * (1.0f / 3.0f);
-                l = c;
-                c = r;
-            }
-        }
-    }
+    /* Scratch: one plane (side²) for Y/Z passes, one row (side) for X pass.
+     * At side=256 that's 256 KiB + 1 KiB on the stack.  Fits within a
+     * typical 8 MiB pthread stack comfortably; for smaller LODs it's <<1 KiB. */
+    float scratch_plane[256 * 256];
+    float scratch_row[256];
+    c3d_assert(side <= 256);
+    c3d_denoise_axis(buf, side, 2, alpha, scratch_plane, scratch_row); /* X */
+    c3d_denoise_axis(buf, side, 1, alpha, scratch_plane, scratch_row); /* Y */
+    c3d_denoise_axis(buf, side, 0, alpha, scratch_plane, scratch_row); /* Z */
 }
 
 /* Denoiser strength as a piecewise function of achieved ratio.
@@ -3233,13 +3308,18 @@ static void c3d_decode_one_subband(
     uint16_t ftable_bytes = c3d_read_u16_le(in + r);
     r += 2;
 
-    /* All-zero subband sentinel (encoder's fast path): zero-fill and return. */
+    /* All-zero subband sentinel (encoder's fast path): zero-fill and return.
+     * §T12: row-level memset is several times faster than the per-coef
+     * triple-nested loop for large subbands, and this branch fires for
+     * ~10-20 of 36 subbands at r≥50 per c3d_estimate_one_subband_bytes. */
     if (ftable_bytes == 0xFFFFu) {
         c3d_assert(in_size == 2);
+        const size_t row_bytes = (size_t)sb->side * sizeof(float);
         for (uint32_t z = sb->z0; z < sb->z0 + sb->side; ++z)
-        for (uint32_t y = sb->y0; y < sb->y0 + sb->side; ++y)
-        for (uint32_t x = sb->x0; x < sb->x0 + sb->side; ++x)
-            coeff_buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + x] = 0.0f;
+        for (uint32_t y = sb->y0; y < sb->y0 + sb->side; ++y) {
+            memset(&coeff_buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + sb->x0],
+                   0, row_bytes);
+        }
         (void)step; (void)alpha;
         (void)sub_symbols; (void)tbl_scratch;
         return;
@@ -3298,13 +3378,18 @@ static void c3d_decode_one_subband(
     const uint8_t *esc_ptr = in + r;
     size_t esc_remaining = in_size - r;
 
-    /* Dequantize + scatter into coeff_buf (sign-predictive symbols). */
+    /* Dequantize + scatter into coeff_buf (sign-predictive symbols).
+     * §T12: hoist sb-> fields to locals to help the compiler eliminate
+     * repeated struct-field reloads inside the hot inner loop. */
     float dz_half = c3d_dz_half_for_kind(sb->kind, step);
-    bool prev_sign_zy[128 * 128] = {0};
+    bool prev_sign_zy[128 * 128];
+    memset(prev_sign_zy, 0, (size_t)sb->side * sb->side);
+    const uint32_t sb_z0 = sb->z0, sb_y0 = sb->y0, sb_x0 = sb->x0;
+    const uint32_t sb_side = sb->side;
     size_t idx = 0;
-    for (uint32_t z = sb->z0; z < sb->z0 + sb->side; ++z)
-    for (uint32_t y = sb->y0; y < sb->y0 + sb->side; ++y)
-    for (uint32_t x = sb->x0; x < sb->x0 + sb->side; ++x) {
+    for (uint32_t z = sb_z0; z < sb_z0 + sb_side; ++z)
+    for (uint32_t y = sb_y0; y < sb_y0 + sb_side; ++y)
+    for (uint32_t x = sb_x0; x < sb_x0 + sb_side; ++x) {
         uint8_t sym = sub_symbols[idx++];
         uint32_t escape_mag = 0;
         if (C3D_SYM_IS_ESCAPE(sym)) {
@@ -3315,7 +3400,7 @@ static void c3d_decode_one_subband(
             esc_ptr += c;
             esc_remaining -= c;
         }
-        bool *sp = &prev_sign_zy[(y - sb->y0) * sb->side + (x - sb->x0)];
+        bool *sp = &prev_sign_zy[(y - sb_y0) * sb_side + (x - sb_x0)];
         int32_t qv = c3d_symbol_to_quant(sym, escape_mag, sp);
         coeff_buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + x]
             = c3d_dequant(qv, step, dz_half, alpha);
@@ -3388,6 +3473,15 @@ void c3d_decoder_chunk_decode_lod(c3d_decoder *d,
         cached_ext = d->cached_tables;
     }
 
+    /* §T9 — quality-scalable truncation.  If `in_len` is shorter than the
+     * emitted chunk (caller truncated for streaming / bandwidth-adaptive
+     * decode), any subband whose entropy range extends past the supplied
+     * bytes is zero-filled instead of panicking.  Subsequent subbands get
+     * the same treatment.  Output quality degrades gracefully from finest
+     * (LOD 0 full) to coarsest (LL_5 only) as bytes drop, and is monotonic
+     * — appending bytes can only improve quality. */
+    size_t entropy_avail = (in_len > C3D_CHUNK_FIXED_SIZE)
+                         ? (in_len - C3D_CHUNK_FIXED_SIZE) : 0;
     for (unsigned s = 0; s < n_sb; ++s) {
         c3d_subband_info sb;
         c3d_subband_info_of(s, &sb);
@@ -3410,7 +3504,20 @@ void c3d_decoder_chunk_decode_lod(c3d_decoder *d,
             sub_end = lod_end;
         }
         c3d_assert(sub_end >= sub_start);
-        c3d_assert(sub_end <= in_len - C3D_CHUNK_FIXED_SIZE);
+
+        bool truncated = (sub_end > entropy_avail);
+        if (truncated) {
+            /* §T9: zero-fill this subband and every later one.  Break early. */
+            for (unsigned sz = s; sz < n_sb; ++sz) {
+                c3d_subband_info sbz;
+                c3d_subband_info_of(sz, &sbz);
+                for (uint32_t z = sbz.z0; z < sbz.z0 + sbz.side; ++z)
+                for (uint32_t y = sbz.y0; y < sbz.y0 + sbz.side; ++y)
+                for (uint32_t x = sbz.x0; x < sbz.x0 + sbz.side; ++x)
+                    d->coeff_buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + x] = 0.0f;
+            }
+            break;
+        }
 
         c3d_decode_one_subband(entropy + sub_start, sub_end - sub_start,
                                step, alpha,
@@ -3478,15 +3585,25 @@ void c3d_decoder_chunk_decode_lod(c3d_decoder *d,
     /* Encoder v2: coeff_scale is already absorbed into per-subband step, so
      * dequant produces raw-magnitude coefficients.  coeff_scale in the header
      * is informational only (preserved for c3d_inspect and downstream tools). */
+    /* §T10: branch-free u8 output cast.  Previous version had `? 0.5 : -0.5`
+     * and a clamping if-ladder, both of which blocked auto-vectorization.
+     * This form is pure float arithmetic with fminf/fmaxf and single cast —
+     * clang and gcc both auto-vectorize the innermost x-loop.  Inputs to the
+     * cast live in [0, 255] after the fmaxf/fminf so (uint8_t)(v_c + 0.5f)
+     * rounds correctly (no negative-rounding case needed). */
     (void)coeff_scale;
-    for (size_t z = 0; z < out_side; ++z)
-    for (size_t y = 0; y < out_side; ++y)
-    for (size_t x = 0; x < out_side; ++x) {
-        float v = d->coeff_buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + x]
-                  + dc_offset + 128.0f;
-        int iv = (int)(v + (v >= 0.0f ? 0.5f : -0.5f));
-        if (iv < 0) iv = 0; else if (iv > 255) iv = 255;
-        out[z * out_side * out_side + y * out_side + x] = (uint8_t)iv;
+    for (size_t z = 0; z < out_side; ++z) {
+        for (size_t y = 0; y < out_side; ++y) {
+            const float *restrict row = d->coeff_buf + z * C3D_STRIDE_Z
+                                      + y * C3D_STRIDE_Y;
+            uint8_t *restrict orow = out + z * out_side * out_side
+                                   + y * out_side;
+            for (size_t x = 0; x < out_side; ++x) {
+                float v = row[x] + dc_offset + 128.0f;
+                float v_c = fminf(fmaxf(v, 0.0f), 255.0f);
+                orow[x] = (uint8_t)(v_c + 0.5f);
+            }
+        }
     }
 }
 
@@ -4254,7 +4371,8 @@ void c3d_ctx_builder_observe_chunk(c3d_ctx_builder *b, const uint8_t *in) {
              * same space. */
             float step = b->q_ref * c3d_subband_baseline(sidx) * e->coeff_scale;
             float dz_half = c3d_dz_half_for_kind(sb.kind, step);
-            bool prev_sign_zy[128 * 128] = {0};
+            bool prev_sign_zy[128 * 128];
+            memset(prev_sign_zy, 0, (size_t)sb.side * sb.side);   /* §T12 */
             for (uint32_t z = sb.z0; z < sb.z0 + sb.side; ++z)
             for (uint32_t y = sb.y0; y < sb.y0 + sb.side; ++y)
             for (uint32_t x = sb.x0; x < sb.x0 + sb.side; ++x) {

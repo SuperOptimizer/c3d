@@ -14,7 +14,7 @@ See `PLAN.md` for the full design spec; CLAUDE.md only summarises what shapes da
 
 ## Hard constraints (non-negotiable, see `PLAN.md` §0)
 
-- **C23**, single `c3d.h` + `c3d.c`, libc only. `openh264` permitted in the benchmark harness only; the rANS reference (`ryg_rans`) is inlined into `c3d.c`.
+- **C23**, single `c3d.h` + `c3d.c`, libc only. Third-party video codecs (`openh264`, `x265` + `libde265`, `libaom`) are permitted in the benchmark harness only; the rANS reference (`ryg_rans`) is inlined into `c3d.c`.
 - **In-memory API.** Library never touches disk, network, or fds. Everything is (bytes in) → (bytes out). Callers own all I/O.
 - **Fatal on error.** No status codes, no recoverable errors. Invalid input / corruption / OOM → `c3d_panic()` → `abort()`. Happy path is the only path. `c3d_panic` is overridable via `c3d_set_panic_hook`.
 - **Little-endian only.** Build-time static-assert rejects BE targets.
@@ -101,7 +101,7 @@ c3d/
 ├── c3d.h
 ├── c3d.c
 ├── c3d_test.c       (defines C3D_BUILD_REF)
-├── c3d_bench.c      (links openh264 baseline)
+├── c3d_bench.c      (links openh264 + x265 + libde265 + libaom baselines)
 ├── c3d_train.c      (offline .c3dx builder CLI)
 ├── c3d_inspect.c    (CLI: dump chunk/shard/.c3dx metadata)
 ├── c3d_compact.c    (CLI: parse+serialize to drop any orphaned bytes)
