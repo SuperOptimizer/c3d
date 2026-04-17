@@ -1559,6 +1559,14 @@ struct c3d_ctx {
     bool     has_quantizer_baseline;
     float    quantizer_baseline[C3D_N_SUBBANDS];
 
+    /* §T13: per-subband dead-zone ratio.  When set, overrides the kind-based
+     * c3d_dz_ratio_for_kind() (which currently returns a global 0.55 for
+     * every kind).  Per-subband values (36 scalars) allow the dead-zone
+     * width to be learned from a training corpus per subband, capturing
+     * distribution shape differences the kind-based table doesn't. */
+    bool     has_dz_ratio;
+    float    dz_ratio[C3D_N_SUBBANDS];
+
     bool     has_freq_tables;
     uint32_t denom_shifts[C3D_N_SUBBANDS];
     uint32_t freqs[C3D_N_SUBBANDS][65];
@@ -1899,10 +1907,11 @@ static void c3d_build_fine_hist(c3d_encoder *s) {
  *             → rANS → pack).  Writes bytes to `out`.  Returns bytes written.
  * If `external_freqs` is non-NULL, use those frequencies (EXTERNAL mode):
  * all chunk symbols must have freq ≥ 1 in the provided table, otherwise rANS
- * encoding panics.  freq_table_size is written as 0 in this mode. */
+ * encoding panics.  freq_table_size is written as 0 in this mode.
+ * §T13: dz_ratio is looked up by caller (ctx override or kind default). */
 static size_t c3d_encode_one_subband(
     const float *coeff_buf, const c3d_subband_info *sb,
-    float step, uint32_t denom_shift,
+    float step, float dz_ratio, uint32_t denom_shift,
     const uint32_t *external_freqs,
     uint8_t *sub_symbols, uint8_t *sub_escapes,
     uint8_t *rans_scratch, size_t rans_scratch_size,
@@ -1911,7 +1920,7 @@ static size_t c3d_encode_one_subband(
 {
     size_t n = (size_t)sb->side * sb->side * sb->side;
 
-    float dz_half = c3d_dz_half_for_kind(sb->kind, step);
+    float dz_half = dz_ratio * step;
 
     /* All-zero fast path (before the quant scan): if max|c| < dz_half,
      * every coefficient will quantize to 0 and we can emit the 2-byte
@@ -2308,11 +2317,11 @@ static double c3d_estimate_one_subband_rd(
 
 static double c3d_estimate_one_subband_bytes(
     const float *coeff_buf, const c3d_subband_info *sb,
-    float step, uint32_t denom_shift,
+    float step, float dz_ratio, uint32_t denom_shift,
     const uint32_t *external_freqs,
     float max_abs)
 {
-    float dz_half = c3d_dz_half_for_kind(sb->kind, step);
+    float dz_half = dz_ratio * step;
     /* Fast reject: if max |c| in this subband quantizes to 0, the whole band
      * is empty → matches c3d_encode_one_subband's 2-byte sentinel, and we
      * skip the O(N) quant loop entirely.  On sparse chunks (typical at
@@ -2761,9 +2770,11 @@ static double c3d_estimate_entropy_at_q(float q, const c3d_encoder *s,
         float step = q * baseline * s->coeff_scale;
         uint32_t denom_shift = (ctx && ctx->has_freq_tables) ? ctx->denom_shifts[i]
                                                              : c3d_default_denom_shift(i);
+        float dz_ratio = (ctx && ctx->has_dz_ratio) ? ctx->dz_ratio[i]
+                       : c3d_dz_ratio_for_kind(c3d_kind_h_count(sb.kind));
         float max_abs = s->has_max_abs ? s->max_abs_per_subband[i] : s->coeff_scale;
         total += c3d_estimate_one_subband_bytes(
-            s->coeff_buf, &sb, step, denom_shift,
+            s->coeff_buf, &sb, step, dz_ratio, denom_shift,
             (ctx && ctx->has_freq_tables) ? ctx->freqs[i] : NULL,
             max_abs);
     }
@@ -2804,6 +2815,9 @@ static size_t c3d_emit_entropy_at_q(float q, const c3d_encoder *s,
         }
         uint32_t denom_shift = (ctx && ctx->has_freq_tables) ? ctx->denom_shifts[i]
                                                               : c3d_default_denom_shift(i);
+        /* §T13: per-subband dz_ratio from ctx if trained; else kind-default. */
+        float dz_ratio = (ctx && ctx->has_dz_ratio) ? ctx->dz_ratio[i]
+                       : c3d_dz_ratio_for_kind(c3d_kind_h_count(sb.kind));
 
         c3d_write_f32_le(qmul_ptr + 4 * i, step);
         c3d_write_u32_le(suboff_ptr + 4 * i, (uint32_t)entropy_pos);
@@ -2812,7 +2826,7 @@ static size_t c3d_emit_entropy_at_q(float q, const c3d_encoder *s,
 
         float fitted_alpha = c3d_default_alpha(i);
         size_t bytes = c3d_encode_one_subband(
-            s->coeff_buf, &sb, step, denom_shift,
+            s->coeff_buf, &sb, step, dz_ratio, denom_shift,
             (ctx && ctx->has_freq_tables) ? ctx->freqs[i] : NULL,
             s->sub_symbols, s->sub_escapes,
             s->rans_scratch, rans_scratch_size,
@@ -3294,7 +3308,7 @@ static float c3d_denoise_strength(size_t in_len)
  * frequencies with the provided `external_denom_shift`. */
 static void c3d_decode_one_subband(
     const uint8_t *in, size_t in_size,
-    float step, float alpha,
+    float step, float dz_ratio, float alpha,
     const uint32_t *external_freqs, uint32_t external_denom_shift,
     float *coeff_buf, const c3d_subband_info *sb,
     uint8_t *sub_symbols, c3d_rans_tables *tbl_scratch,
@@ -3380,8 +3394,9 @@ static void c3d_decode_one_subband(
 
     /* Dequantize + scatter into coeff_buf (sign-predictive symbols).
      * §T12: hoist sb-> fields to locals to help the compiler eliminate
-     * repeated struct-field reloads inside the hot inner loop. */
-    float dz_half = c3d_dz_half_for_kind(sb->kind, step);
+     * repeated struct-field reloads inside the hot inner loop.
+     * §T13: dz_half comes from caller's dz_ratio (ctx override or default). */
+    float dz_half = dz_ratio * step;
     bool prev_sign_zy[128 * 128];
     memset(prev_sign_zy, 0, (size_t)sb->side * sb->side);
     const uint32_t sb_z0 = sb->z0, sb_y0 = sb->y0, sb_x0 = sb->x0;
@@ -3495,6 +3510,9 @@ void c3d_decoder_chunk_decode_lod(c3d_decoder *d,
         }
         const uint32_t *ext_freqs = (ctx && ctx->has_freq_tables) ? ctx->freqs[s] : NULL;
         uint32_t ext_ds           = (ctx && ctx->has_freq_tables) ? ctx->denom_shifts[s] : 0u;
+        /* §T13: per-subband dz_ratio from ctx if trained; else kind-default. */
+        float dz_ratio = (ctx && ctx->has_dz_ratio) ? ctx->dz_ratio[s]
+                       : c3d_dz_ratio_for_kind(c3d_kind_h_count(sb.kind));
 
         uint32_t sub_start = c3d_read_u32_le(suboff_ptr + 4 * s);
         uint32_t sub_end;
@@ -3520,7 +3538,7 @@ void c3d_decoder_chunk_decode_lod(c3d_decoder *d,
         }
 
         c3d_decode_one_subband(entropy + sub_start, sub_end - sub_start,
-                               step, alpha,
+                               step, dz_ratio, alpha,
                                ext_freqs, ext_ds,
                                d->coeff_buf, &sb, d->sub_symbols, &tbl,
                                cached_ext ? &cached_ext[s] : NULL);
@@ -4142,6 +4160,7 @@ size_t c3d_ctx_max_size(void) { return 65535; }
 #define C3D_TAG_QUANTIZER_BASELINE  2u
 #define C3D_TAG_SUBBAND_FREQ_TABLES 3u
 #define C3D_TAG_LL_REFERENCE        4u   /* 512 × f32 = 2048 B = 512 quads */
+#define C3D_TAG_DZ_RATIO            5u   /* §T13: 36 × f32 = 144 B         */
 /* struct c3d_ctx defined in §G above. */
 
 /* --- Serialization helpers ----------------------------------------------- */
@@ -4182,6 +4201,12 @@ static size_t c3d_ctx_write_body(const c3d_ctx *ctx, uint8_t *out, size_t out_ca
         w = c3d_write_tlv_header(out, out_cap, w, C3D_TAG_LL_REFERENCE, 512);
         for (unsigned i = 0; i < 512; ++i) {
             c3d_write_f32_le(out + w, ctx->ll_reference[i]); w += 4;
+        }
+    }
+    if (ctx->has_dz_ratio) {
+        w = c3d_write_tlv_header(out, out_cap, w, C3D_TAG_DZ_RATIO, 36);
+        for (unsigned i = 0; i < C3D_N_SUBBANDS; ++i) {
+            c3d_write_f32_le(out + w, ctx->dz_ratio[i]); w += 4;
         }
     }
     if (ctx->has_freq_tables) {
@@ -4284,6 +4309,13 @@ c3d_ctx *c3d_ctx_parse(const uint8_t *in, size_t in_len) {
                 ctx->ll_reference[i] = c3d_read_f32_le(v + 4 * i);
             }
             break;
+        case C3D_TAG_DZ_RATIO:
+            c3d_assert(vbytes == C3D_N_SUBBANDS * 4u);
+            ctx->has_dz_ratio = true;
+            for (unsigned i = 0; i < C3D_N_SUBBANDS; ++i) {
+                ctx->dz_ratio[i] = c3d_read_f32_le(v + 4 * i);
+            }
+            break;
         case C3D_TAG_SUBBAND_FREQ_TABLES: {
             ctx->has_freq_tables = true;
             size_t rr = 0;
@@ -4325,6 +4357,13 @@ struct c3d_ctx_builder {
      * prediction. */
     double   ll_sum[512];
     uint64_t ll_n;
+
+    /* §T13 — per-subband dz_ratio to emit at finish.  Populated via
+     * c3d_ctx_builder_set_dz_ratio(); builder_finish() sets has_dz_ratio
+     * on the resulting ctx only when this array has been explicitly
+     * supplied by the caller (training tools / sweeps). */
+    bool     has_dz_ratio_override;
+    float    dz_ratio_override[C3D_N_SUBBANDS];
 };
 
 /* A moderate compression point used by the builder when accumulating histograms.
@@ -4341,6 +4380,12 @@ c3d_ctx_builder *c3d_ctx_builder_new(void) {
 }
 
 void c3d_ctx_builder_free(c3d_ctx_builder *b) { free(b); }
+
+void c3d_ctx_builder_set_dz_ratio(c3d_ctx_builder *b, const float dz_ratio[36]) {
+    c3d_assert(b && dz_ratio);
+    memcpy(b->dz_ratio_override, dz_ratio, sizeof b->dz_ratio_override);
+    b->has_dz_ratio_override = true;
+}
 
 void c3d_ctx_builder_observe_chunk(c3d_ctx_builder *b, const uint8_t *in) {
     c3d_assert(b);
@@ -4425,6 +4470,13 @@ c3d_ctx *c3d_ctx_builder_finish(c3d_ctx_builder *b, bool include_freq_tables) {
             c3d_normalise_freqs(b->histograms[s], denom_shift, ctx->freqs[s]);
             ctx->denom_shifts[s] = denom_shift;
         }
+    }
+
+    /* §T13 — propagate explicitly-supplied per-subband dz_ratio to the ctx. */
+    if (b->has_dz_ratio_override) {
+        ctx->has_dz_ratio = true;
+        memcpy(ctx->dz_ratio, b->dz_ratio_override,
+               sizeof ctx->dz_ratio);
     }
 
     /* Compute block_size + self_hash by serializing to a scratch buffer with

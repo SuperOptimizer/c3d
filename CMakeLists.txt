@@ -73,6 +73,12 @@ target_link_libraries(c3d_compact PRIVATE c3d m)
 add_executable(c3d_train c3d_train.c)
 target_link_libraries(c3d_train PRIVATE c3d m)
 
+add_executable(c3d_train_dz c3d_train_dz.c)
+target_link_libraries(c3d_train_dz PRIVATE c3d m)
+
+add_executable(c3d_progressive c3d_progressive.c)
+target_link_libraries(c3d_progressive PRIVATE c3d m)
+
 add_executable(c3d_perf c3d_perf.c)
 # c3d_perf #includes c3d.c directly; don't link libc3d (avoid duplicate symbols).
 target_link_libraries(c3d_perf PRIVATE m)

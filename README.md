@@ -255,6 +255,8 @@ for streaming.
 | `c3d_inspect`    | dump chunk / shard / .c3dx metadata                  |
 | `c3d_compact`    | parse+re-serialise (drops orphaned bytes)            |
 | `c3d_train`      | build a `.c3dx` from a corpus directory              |
+| `c3d_train_dz`   | grid-search uniform dead-zone ratio on a corpus, emit tuned `.c3dx` |
+| `c3d_progressive`| §T9 demo: feed byte prefixes of an encoded chunk to the decoder, show PSNR/SSIM vs fraction |
 | `c3d_zarr_to_c3d.py` | zarr v2 → c3d shard converter (via ctypes)       |
 
 ## License

@@ -220,6 +220,13 @@ typedef struct c3d_ctx_builder c3d_ctx_builder;
 c3d_ctx_builder *c3d_ctx_builder_new(void);
 void             c3d_ctx_builder_observe_chunk(c3d_ctx_builder *,
                                                const uint8_t *in);
+/* §T13 — supply a per-subband dead-zone ratio for emission in the produced
+ * ctx.  Must be called before c3d_ctx_builder_finish.  Typically used by
+ * training tools that run a grid search.  Array length is C3D_N_SUBBANDS=36.
+ * Without this call, builder emits no DZ_RATIO TLV and encoders fall back
+ * to kind-based c3d_dz_ratio_for_kind(). */
+void             c3d_ctx_builder_set_dz_ratio(c3d_ctx_builder *,
+                                              const float dz_ratio[36]);
 c3d_ctx         *c3d_ctx_builder_finish(c3d_ctx_builder *, bool include_freq_tables);
 void             c3d_ctx_builder_free(c3d_ctx_builder *);
 
