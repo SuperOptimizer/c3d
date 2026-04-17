@@ -4416,6 +4416,11 @@ struct c3d_ctx_builder {
      * supplied by the caller (training tools / sweeps). */
     bool     has_dz_ratio_override;
     float    dz_ratio_override[C3D_N_SUBBANDS];
+
+    /* §T15 — per-subband Laplacian α override.  Same semantics as
+     * dz_ratio_override. */
+    bool     has_laplacian_alpha_override;
+    float    laplacian_alpha_override[C3D_N_SUBBANDS];
 };
 
 /* A moderate compression point used by the builder when accumulating histograms.
@@ -4437,6 +4442,13 @@ void c3d_ctx_builder_set_dz_ratio(c3d_ctx_builder *b, const float dz_ratio[36]) 
     c3d_assert(b && dz_ratio);
     memcpy(b->dz_ratio_override, dz_ratio, sizeof b->dz_ratio_override);
     b->has_dz_ratio_override = true;
+}
+
+void c3d_ctx_builder_set_laplacian_alpha(c3d_ctx_builder *b,
+                                         const float alpha[36]) {
+    c3d_assert(b && alpha);
+    memcpy(b->laplacian_alpha_override, alpha, sizeof b->laplacian_alpha_override);
+    b->has_laplacian_alpha_override = true;
 }
 
 void c3d_ctx_builder_observe_chunk(c3d_ctx_builder *b, const uint8_t *in) {
@@ -4529,6 +4541,13 @@ c3d_ctx *c3d_ctx_builder_finish(c3d_ctx_builder *b, bool include_freq_tables) {
         ctx->has_dz_ratio = true;
         memcpy(ctx->dz_ratio, b->dz_ratio_override,
                sizeof ctx->dz_ratio);
+    }
+
+    /* §T15 — propagate per-subband Laplacian α override. */
+    if (b->has_laplacian_alpha_override) {
+        ctx->has_laplacian_alpha = true;
+        memcpy(ctx->laplacian_alpha, b->laplacian_alpha_override,
+               sizeof ctx->laplacian_alpha);
     }
 
     /* Compute block_size + self_hash by serializing to a scratch buffer with

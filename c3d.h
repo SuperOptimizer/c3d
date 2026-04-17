@@ -227,6 +227,12 @@ void             c3d_ctx_builder_observe_chunk(c3d_ctx_builder *,
  * to kind-based c3d_dz_ratio_for_kind(). */
 void             c3d_ctx_builder_set_dz_ratio(c3d_ctx_builder *,
                                               const float dz_ratio[36]);
+/* §T15 — supply a per-subband Laplacian α for dequantization.  Same
+ * conventions as set_dz_ratio: call before finish(), 36-long array.
+ * Without this call, decoder falls back to the per-chunk alpha byte or
+ * the kind-based default c3d_default_alpha(). */
+void             c3d_ctx_builder_set_laplacian_alpha(c3d_ctx_builder *,
+                                                     const float alpha[36]);
 c3d_ctx         *c3d_ctx_builder_finish(c3d_ctx_builder *, bool include_freq_tables);
 void             c3d_ctx_builder_free(c3d_ctx_builder *);
 
