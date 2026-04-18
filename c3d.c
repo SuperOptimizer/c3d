@@ -3737,23 +3737,56 @@ static void c3d_decode_one_subband(
     const uint32_t sb_z0 = sb->z0, sb_y0 = sb->y0, sb_x0 = sb->x0;
     const uint32_t sb_side = sb->side;
     size_t idx = 0;
+    /* Row-wise two-phase dequant.  Phase 1 (scalar): read sub_symbols, do
+     * the stateful sign-prediction + escape LEB128 decode, emit qv into a
+     * stack-local row buffer.  Phase 2 (NEON): turn qv → float via the
+     * dequant formula, 4 lanes at a time, write contiguous x-run.
+     * The scalar phase keeps sp/escape flow trivially correct; NEON only
+     * touches the pure float math. */
+    int32_t qv_row[128];   /* max sb_side = 128 */
+    const float inv_step_unused = 0.0f; (void)inv_step_unused;
     for (uint32_t z = sb_z0; z < sb_z0 + sb_side; ++z)
-    for (uint32_t y = sb_y0; y < sb_y0 + sb_side; ++y)
-    for (uint32_t x = sb_x0; x < sb_x0 + sb_side; ++x) {
-        uint8_t sym = sub_symbols[idx++];
-        uint32_t escape_mag = 0;
-        if (C3D_SYM_IS_ESCAPE(sym)) {
-            uint64_t zv = 0;
-            size_t c = c3d_leb128_decode(esc_ptr, esc_remaining, &zv);
-            c3d_assert(zv <= 0xffffffffull);
-            escape_mag = (uint32_t)zv;
-            esc_ptr += c;
-            esc_remaining -= c;
+    for (uint32_t y = sb_y0; y < sb_y0 + sb_side; ++y) {
+        /* Phase 1 — scalar, keeps sp + escape state correct. */
+        for (uint32_t x = 0; x < sb_side; ++x) {
+            uint8_t sym = sub_symbols[idx++];
+            uint32_t escape_mag = 0;
+            if (C3D_SYM_IS_ESCAPE(sym)) {
+                uint64_t zv = 0;
+                size_t c = c3d_leb128_decode(esc_ptr, esc_remaining, &zv);
+                c3d_assert(zv <= 0xffffffffull);
+                escape_mag = (uint32_t)zv;
+                esc_ptr += c;
+                esc_remaining -= c;
+            }
+            bool *sp = &prev_sign_zy[(y - sb_y0) * sb_side + x];
+            qv_row[x] = c3d_symbol_to_quant(sym, escape_mag, sp);
         }
-        bool *sp = &prev_sign_zy[(y - sb_y0) * sb_side + (x - sb_x0)];
-        int32_t qv = c3d_symbol_to_quant(sym, escape_mag, sp);
-        coeff_buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + x]
-            = c3d_dequant(qv, step, dz_half, alpha);
+        /* Phase 2 — NEON dequant over the row. */
+        float *out_row = &coeff_buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + sb_x0];
+#if C3D_HAVE_NEON
+        float32x4_t vdz    = vdupq_n_f32(dz_half);
+        float32x4_t vstep  = vdupq_n_f32(step);
+        float32x4_t vbias  = vdupq_n_f32(alpha - 1.0f);
+        float32x4_t vzero  = vdupq_n_f32(0.0f);
+        uint32_t x = 0;
+        for (; x + 4 <= sb_side; x += 4) {
+            int32x4_t q   = vld1q_s32(qv_row + x);
+            uint32x4_t isz = vceqq_s32(q, vdupq_n_s32(0));
+            int32x4_t aq   = vabsq_s32(q);
+            float32x4_t af = vcvtq_f32_s32(aq);
+            float32x4_t mag = vfmaq_f32(vdz, vstep, vaddq_f32(af, vbias));
+            uint32x4_t neg = vcltq_s32(q, vdupq_n_s32(0));
+            float32x4_t res = vbslq_f32(neg, vnegq_f32(mag), mag);
+            res = vbslq_f32(isz, vzero, res);
+            vst1q_f32(out_row + x, res);
+        }
+        for (; x < sb_side; ++x)
+            out_row[x] = c3d_dequant(qv_row[x], step, dz_half, alpha);
+#else
+        for (uint32_t x = 0; x < sb_side; ++x)
+            out_row[x] = c3d_dequant(qv_row[x], step, dz_half, alpha);
+#endif
     }
     c3d_assert(esc_remaining == 0);
 }
