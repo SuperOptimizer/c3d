@@ -140,7 +140,7 @@ static void sweep_kind(uint8_t **chunks, size_t n_chunks,
         }
         metric_row m = measure(chunks, n_chunks, dz, alpha, target_ratio);
         fprintf(stderr, "    %s=%.3f  PSNR=%.3f  MAE=%.3f  maxE=%.0f  bytes=%.0f\n",
-                is_alpha ? "α" : "dz", v, m.psnr, m.mae, m.max_err,
+                is_alpha ? "α" : "dz", (double)v, m.psnr, m.mae, m.max_err,
                 m.avg_bytes);
         if (m.psnr > best_psnr) { best_psnr = m.psnr; best_val = v; }
         /* Restore the other groups before the next candidate iterates. */
@@ -154,7 +154,7 @@ static void sweep_kind(uint8_t **chunks, size_t n_chunks,
     }
     *out_best = best_val;
     fprintf(stderr, "  → best %s[h=%u] = %.3f (PSNR=%.3f dB)\n",
-            is_alpha ? "α" : "dz", target_h, best_val, best_psnr);
+            is_alpha ? "α" : "dz", target_h, (double)best_val, best_psnr);
 }
 
 int main(int argc, char **argv) {
@@ -195,7 +195,7 @@ int main(int argc, char **argv) {
     closedir(dir);
     if (n_chunks == 0) { fprintf(stderr, "no chunks in %s\n", corpus_dir); return 1; }
     fprintf(stderr, "loaded %zu chunks, target_ratio=%.1f\n",
-            n_chunks, target_ratio);
+            n_chunks, (double)target_ratio);
 
     /* Starting point: uniform dz = 0.55 (library default), kind-based α. */
     float dz[N_SUBBANDS], alpha[N_SUBBANDS];

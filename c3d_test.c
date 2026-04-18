@@ -21,7 +21,7 @@ static jmp_buf g_panic_jmp;
 static bool    g_expect_panic = false;
 static char    g_panic_msg[256];
 
-static void test_panic_hook(const char *file, int line, const char *msg) {
+_Noreturn static void test_panic_hook(const char *file, int line, const char *msg) {
     (void)file; (void)line;
     if (g_expect_panic) {
         snprintf(g_panic_msg, sizeof g_panic_msg, "%s", msg);
@@ -51,17 +51,44 @@ static void test_panic_hook(const char *file, int line, const char *msg) {
 } while (0)
 
 /* Expect the next block to panic; requires the panic hook to longjmp. */
+/* Panic-expected blocks longjmp out mid-call, bypassing any free() in the
+ * normal unwind path.  Under LSan that reads as a leak, so disable leak
+ * accounting for the duration.  Harmless when LSan is absent (the two
+ * __lsan_* symbols are provided as weak no-ops by the sanitizer runtime). */
+#if defined(__has_feature)
+# if __has_feature(address_sanitizer)
+#  define C3D_TEST_HAS_LSAN 1
+# endif
+#endif
+#ifndef C3D_TEST_HAS_LSAN
+# if defined(__SANITIZE_ADDRESS__)
+#  define C3D_TEST_HAS_LSAN 1
+# endif
+#endif
+#ifdef C3D_TEST_HAS_LSAN
+void __lsan_disable(void);
+void __lsan_enable(void);
+#  define C3D_LSAN_DISABLE() __lsan_disable()
+#  define C3D_LSAN_ENABLE()  __lsan_enable()
+#else
+#  define C3D_LSAN_DISABLE() ((void)0)
+#  define C3D_LSAN_ENABLE()  ((void)0)
+#endif
+
 #define EXPECT_PANIC(block) do {                                               \
     ++g_tests_run;                                                             \
     g_expect_panic = true;                                                     \
+    C3D_LSAN_DISABLE();                                                        \
     if (setjmp(g_panic_jmp) == 0) {                                            \
         block;                                                                 \
         g_expect_panic = false;                                                \
+        C3D_LSAN_ENABLE();                                                     \
         ++g_tests_fail;                                                        \
         fprintf(stderr, "FAIL %s:%d: expected panic, none occurred\n",         \
                 __FILE__, __LINE__);                                           \
     } else {                                                                   \
         g_expect_panic = false;                                                \
+        C3D_LSAN_ENABLE();                                                     \
     }                                                                          \
 } while (0)
 
@@ -194,7 +221,12 @@ static void make_geometric_freqs(uint32_t *freqs, size_t n_symbols,
     uint64_t sum_w = 0;
     uint64_t w[65];
     for (size_t i = 0; i < n_symbols; ++i) {
-        w[i] = (uint64_t)1 << (n_symbols - 1 - i);
+        /* Cap the shift at 63 — 1<<64 is UB for uint64_t.  A geometric
+         * ratio that saturates in the top handful of symbols is exactly
+         * what this test's later normalisation already expects. */
+        size_t sh = n_symbols - 1 - i;
+        if (sh > 63) sh = 63;
+        w[i] = (uint64_t)1 << sh;
         sum_w += w[i];
     }
     /* Scale to M, reserving floor; distribute residual. */
@@ -562,7 +594,10 @@ static void test_quant_roundtrip(void) {
         float step    = steps[si];
         float dz_half = dz_ratio * step;
         float worst = 0.0f;
-        for (float c = -1000.0f; c <= 1000.0f; c += 0.123f) {
+        /* 16261 samples from -1000 to +1000 in 0.123f-ish steps — use an
+         * integer counter so accumulation error doesn't drift the sweep. */
+        for (int step_i = 0; step_i <= 16260; ++step_i) {
+            float c = -1000.0f + 0.123f * (float)step_i;
             int32_t q   = c3d_quant(c, step, dz_half);
             float   chi = c3d_dequant(q, step, dz_half, alpha);
             float   err = chi - c;
@@ -686,10 +721,13 @@ static void test_subband_extract_scatter(void) {
         size_t n = c3d_subband_extract(buf, &sb, flat);
         CHECK_EQ(n, (size_t)sb.side * sb.side * sb.side);
         /* Zero the subband region then scatter flat back to confirm round-trip. */
-        for (uint32_t z = sb.z0; z < sb.z0 + sb.side; ++z)
-        for (uint32_t y = sb.y0; y < sb.y0 + sb.side; ++y)
-        for (uint32_t x = sb.x0; x < sb.x0 + sb.side; ++x)
-            buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + x] = -1.0f;
+        for (uint32_t z = sb.z0; z < sb.z0 + sb.side; ++z) {
+            for (uint32_t y = sb.y0; y < sb.y0 + sb.side; ++y) {
+                for (uint32_t x = sb.x0; x < sb.x0 + sb.side; ++x) {
+                    buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + x] = -1.0f;
+                }
+            }
+        }
         c3d_subband_scatter(buf, &sb, flat);
     }
     CHECK(memcmp(buf, copy, C3D_VOXELS_PER_CHUNK * sizeof(float)) == 0);
@@ -776,7 +814,7 @@ static void test_chunk_rate_control(void) {
     for (size_t i = 0; i < sizeof ratios / sizeof ratios[0]; ++i) {
         float r = ratios[i];
         size_t sz = c3d_chunk_encode(in, r, NULL, enc, C3D_CHUNK_ENCODE_MAX_SIZE);
-        size_t target = (size_t)((double)C3D_VOXELS_PER_CHUNK / r);
+        size_t target = (size_t)((double)C3D_VOXELS_PER_CHUNK / (double)r);
         double rel_err = (double)((long)sz - (long)target) / (double)target;
         if (rel_err < 0) rel_err = -rel_err;
         /* Rate control should land within 2× target (very loose); tighter
@@ -1132,10 +1170,12 @@ static void test_downsample_2x(void) {
 
     /* Spot check: out[0,0,0] = mean of the 8 voxels at (0..1, 0..1, 0..1). */
     uint32_t sum = 0;
-    for (uint32_t dz = 0; dz < 2; ++dz)
-    for (uint32_t dy = 0; dy < 2; ++dy)
-    for (uint32_t dx = 0; dx < 2; ++dx) {
-        sum += in[dz*16*16 + dy*16 + dx];
+    for (uint32_t dz = 0; dz < 2; ++dz) {
+        for (uint32_t dy = 0; dy < 2; ++dy) {
+            for (uint32_t dx = 0; dx < 2; ++dx) {
+                sum += in[dz*16*16 + dy*16 + dx];
+            }
+        }
     }
     /* Rounded average with ties-to-even. */
     uint32_t expected = (sum + 4) >> 3;
@@ -1191,7 +1231,7 @@ static void test_ctx_with_freq_tables(void) {
         c3d_ctx_builder_observe_chunk(b, chunk);
     }
     c3d_ctx *ctx = c3d_ctx_builder_finish(b, true);
-    CHECK(ctx != NULL);
+    c3d_assert(ctx != NULL);
     CHECK(ctx->has_freq_tables);
 
     size_t sz = c3d_ctx_serialized_size(ctx);

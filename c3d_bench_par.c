@@ -124,15 +124,17 @@ int main(int argc, char **argv) {
                n_obs, c3d_ctx_serialized_size(ctx));
     }
 
-    pthread_t *thr = calloc(n_threads, sizeof *thr);
-    worker_arg *args = calloc(n_threads, sizeof *args);
+    pthread_t *thr = calloc((size_t)n_threads, sizeof *thr);
+    worker_arg *args = calloc((size_t)n_threads, sizeof *args);
     /* Round-robin assignment. */
-    size_t per = (n_paths + n_threads - 1) / n_threads;
+    size_t per = (n_paths + (size_t)n_threads - 1) / (size_t)n_threads;
     for (int t = 0; t < n_threads; ++t) {
         args[t].tid = t;
-        args[t].paths = &paths[t * per];
-        args[t].n_paths = (t * per >= n_paths) ? 0
-                        : (((t + 1) * per <= n_paths) ? per : n_paths - t * per);
+        args[t].paths = &paths[(size_t)t * per];
+        args[t].n_paths = ((size_t)t * per >= n_paths) ? 0
+                        : ((size_t)(t + 1) * per <= n_paths
+                               ? per
+                               : n_paths - (size_t)t * per);
         args[t].target_ratio = target;
         args[t].ctx = ctx;
     }
@@ -147,23 +149,23 @@ int main(int argc, char **argv) {
            "tid", "chunks", "bytes_in", "bytes_enc", "MB/s_in", "PSNR_avg");
     for (int t = 0; t < n_threads; ++t) {
         if (args[t].n_paths == 0) continue;
-        double mbps = (args[t].total_bytes_in / (1024.0*1024.0)) / args[t].elapsed_s;
+        double mbps = ((double)args[t].total_bytes_in / (1024.0*1024.0)) / args[t].elapsed_s;
         printf("%-3d %-7zu %12zu %10zu %10.1f %.2f\n",
                t, args[t].n_paths, args[t].total_bytes_in, args[t].total_bytes_enc,
                mbps, args[t].avg_psnr);
         agg_bytes_in  += args[t].total_bytes_in;
         agg_bytes_enc += args[t].total_bytes_enc;
-        psnr_sum += args[t].avg_psnr * args[t].n_paths;
+        psnr_sum += args[t].avg_psnr * (double)args[t].n_paths;
         n_done += args[t].n_paths;
     }
-    double agg_mbps = (agg_bytes_in / (1024.0*1024.0)) / total;
+    double agg_mbps = ((double)agg_bytes_in / (1024.0*1024.0)) / total;
     printf("---\n");
     printf("aggregate: %zu chunks in %.2fs, %.1f MB/s in (%.2fx scale-up vs ideal=%dx)\n",
            n_done, total, agg_mbps,
-           agg_mbps / ((agg_bytes_in / (1024.0*1024.0)) / args[0].elapsed_s) /* approx scale */,
+           agg_mbps / (((double)agg_bytes_in / (1024.0*1024.0)) / args[0].elapsed_s) /* approx scale */,
            n_threads);
     printf("compression: %.1f:1, avg PSNR %.2f dB\n",
-           (double)agg_bytes_in / agg_bytes_enc, psnr_sum / n_done);
+           (double)agg_bytes_in / (double)agg_bytes_enc, psnr_sum / (double)n_done);
 
     for (size_t i = 0; i < n_paths; ++i) free(paths[i]);
     free(paths); free(thr); free(args);

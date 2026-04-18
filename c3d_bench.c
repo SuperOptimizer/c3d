@@ -114,7 +114,7 @@ static double ssim_u8(const uint8_t *a, const uint8_t *b, int side) {
     const double inv_n = 1.0 / (double)(B * B);
     double acc = 0.0;
     long blocks = 0;
-    const size_t S2 = (size_t)side * side;
+    const size_t S2 = (size_t)side * (size_t)side;
     for (int z = 0; z < side; ++z) {
         const uint8_t *ap = a + (size_t)z * S2;
         const uint8_t *bp = b + (size_t)z * S2;
@@ -122,8 +122,8 @@ static double ssim_u8(const uint8_t *a, const uint8_t *b, int side) {
         for (int bx = 0; bx + B <= side; bx += B) {
             double sa = 0, sb = 0, saa = 0, sbb = 0, sab = 0;
             for (int dy = 0; dy < B; ++dy) {
-                const uint8_t *arow = ap + (size_t)(by + dy) * side + bx;
-                const uint8_t *brow = bp + (size_t)(by + dy) * side + bx;
+                const uint8_t *arow = ap + (size_t)(by + dy) * (size_t)side + (size_t)bx;
+                const uint8_t *brow = bp + (size_t)(by + dy) * (size_t)side + (size_t)bx;
                 for (int dx = 0; dx < B; ++dx) {
                     double va = (double)arow[dx];
                     double vb = (double)brow[dx];
@@ -151,7 +151,7 @@ static double ssim_u8(const uint8_t *a, const uint8_t *b, int side) {
 static size_t h264_encode_decode(const uint8_t *in, int qp, uint8_t *out_yuv,
                                  double *t_enc_out, double *t_dec_out) {
     const int W = (int)CHUNK_SIDE, H = (int)CHUNK_SIDE;
-    const size_t Y = (size_t)W * H, UV = Y / 4;
+    const size_t Y = (size_t)W * (size_t)H, UV = Y / 4;
 
     ISVCEncoder *enc = NULL;
     if (WelsCreateSVCEncoder(&enc) != 0 || !enc) { fprintf(stderr, "h264 enc create\n"); exit(1); }
@@ -209,7 +209,7 @@ static size_t h264_encode_decode(const uint8_t *in, int qp, uint8_t *out_yuv,
                 while (total + (size_t)lsz > cap) cap *= 2;
                 bitstream = realloc(bitstream, cap);
             }
-            memcpy(bitstream + total, lb->pBsBuf, (size_t)lsz); total += lsz;
+            memcpy(bitstream + total, lb->pBsBuf, (size_t)lsz); total += (size_t)lsz;
         }
     }
     (*enc)->Uninitialize(enc); WelsDestroySVCEncoder(enc);
@@ -280,7 +280,7 @@ static size_t h264_encode_decode(const uint8_t *in, int qp, uint8_t *out_yuv,
 static size_t h265_encode_decode(const uint8_t *in, int qp, uint8_t *out_yuv,
                                  double *t_enc_out, double *t_dec_out) {
     const int W = (int)CHUNK_SIDE, H = (int)CHUNK_SIDE;
-    const size_t Y = (size_t)W * H, UV = Y / 4;
+    const size_t Y = (size_t)W * (size_t)H, UV = Y / 4;
 
     x265_param *param = x265_param_alloc();
     x265_param_default_preset(param, "medium", "zerolatency");
@@ -364,7 +364,7 @@ static size_t h265_encode_decode(const uint8_t *in, int qp, uint8_t *out_yuv,
     /* Decode with libde265. */
     de265_decoder_context *dec = de265_new_decoder();
     de265_set_verbosity(0);
-    de265_push_data(dec, bitstream, total, 0, NULL);
+    de265_push_data(dec, bitstream, (int)total, 0, NULL);
     de265_flush_data(dec);
 
     size_t decoded = 0;
@@ -382,7 +382,8 @@ static size_t h265_encode_decode(const uint8_t *in, int qp, uint8_t *out_yuv,
             int cpy_h = ih < H ? ih : H;
             if (decoded < (size_t)H) {
                 for (int r = 0; r < cpy_h; ++r)
-                    memcpy(out_yuv + decoded * Y + r * W, py + r * stride, cpy_w);
+                    memcpy(out_yuv + decoded * Y + (size_t)r * (size_t)W,
+                           py + (size_t)r * (size_t)stride, (size_t)cpy_w);
                 decoded++;
             }
             de265_release_next_picture(dec);
@@ -413,7 +414,7 @@ static size_t h265_encode_decode(const uint8_t *in, int qp, uint8_t *out_yuv,
 static size_t av1_encode_decode(const uint8_t *in, int cq, uint8_t *out_yuv,
                                 double *t_enc_out, double *t_dec_out) {
     const int W = (int)CHUNK_SIDE, H = (int)CHUNK_SIDE;
-    const size_t Y = (size_t)W * H;
+    const size_t Y = (size_t)W * (size_t)H;
 
     aom_codec_iface_t *cx_iface = aom_codec_av1_cx();
     aom_codec_enc_cfg_t cfg;
@@ -450,8 +451,8 @@ static size_t av1_encode_decode(const uint8_t *in, int cq, uint8_t *out_yuv,
     aom_image_t *img = aom_img_alloc(NULL, AOM_IMG_FMT_I420, W, H, 1);
     if (!img) { fprintf(stderr, "aom_img_alloc fail\n"); exit(1); }
     /* Fill U and V once with 128. */
-    memset(img->planes[1], 128, (size_t)img->stride[1] * (H / 2));
-    memset(img->planes[2], 128, (size_t)img->stride[2] * (H / 2));
+    memset(img->planes[1], 128, (size_t)img->stride[1] * (size_t)(H / 2));
+    memset(img->planes[2], 128, (size_t)img->stride[2] * (size_t)(H / 2));
 
     size_t cap = 4u * 1024 * 1024, total = 0;
     uint8_t *bitstream = malloc(cap);
@@ -529,8 +530,9 @@ static size_t av1_encode_decode(const uint8_t *in, int cq, uint8_t *out_yuv,
             int cpy_w = (int)dimg->d_w < W ? (int)dimg->d_w : W;
             int cpy_h = (int)dimg->d_h < H ? (int)dimg->d_h : H;
             for (int r = 0; r < cpy_h; ++r)
-                memcpy(out_yuv + decoded * Y + r * W,
-                       dimg->planes[0] + r * dimg->stride[0], cpy_w);
+                memcpy(out_yuv + decoded * Y + (size_t)r * (size_t)W,
+                       dimg->planes[0] + (size_t)r * (size_t)dimg->stride[0],
+                       (size_t)cpy_w);
             decoded++;
         }
     }
@@ -554,7 +556,7 @@ static size_t av1_encode_decode(const uint8_t *in, int cq, uint8_t *out_yuv,
 static size_t zfp_encode_decode(const uint8_t *in, int rate_q8, uint8_t *out,
                                 double *t_enc_out, double *t_dec_out) {
     const int W = CHUNK_SIDE, H = CHUNK_SIDE, D = CHUNK_SIDE;
-    const size_t N = (size_t)W * H * D;
+    const size_t N = (size_t)W * (size_t)H * (size_t)D;
 
     int32_t *buf32 = aligned_alloc(32, N * sizeof(int32_t));
     if (!buf32) { fprintf(stderr, "zfp oom\n"); exit(1); }
@@ -698,9 +700,10 @@ static size_t tthresh_encode_decode(const uint8_t *in, int target_psnr,
     fclose(fp);
 
     char *enc_argv[] = {
-        (char *)TTHRESH_BIN, "-i", raw, "-t", "uchar",
-        "-s", sx, sy, sz,
-        "-p", psnr_arg, "-c", comp, NULL
+        (char *)(uintptr_t)TTHRESH_BIN, (char *)(uintptr_t)"-i", raw,
+        (char *)(uintptr_t)"-t", (char *)(uintptr_t)"uchar",
+        (char *)(uintptr_t)"-s", sx, sy, sz,
+        (char *)(uintptr_t)"-p", psnr_arg, (char *)(uintptr_t)"-c", comp, NULL
     };
     double t_enc0 = now_s();
     if (run_silently(enc_argv) != 0) {
@@ -709,7 +712,8 @@ static size_t tthresh_encode_decode(const uint8_t *in, int target_psnr,
     double t_enc = now_s() - t_enc0;
 
     char *dec_argv[] = {
-        (char *)TTHRESH_BIN, "-c", comp, "-o", dec, NULL
+        (char *)(uintptr_t)TTHRESH_BIN, (char *)(uintptr_t)"-c", comp,
+        (char *)(uintptr_t)"-o", dec, NULL
     };
     double t_dec0 = now_s();
     if (run_silently(dec_argv) != 0) {
@@ -911,18 +915,19 @@ static void print_summary(size_t k, size_t n_chunks, const bench_sums *s) {
            "-----------  -----  -----  -----  ---  ---    "
            "----  ---- | -------  -------\n");
     for (size_t q = 0; q < N_QPS; ++q) {
-        double v_sz = s->v_sz[k][q] / n_chunks;
-        double v_p  = s->v_p [k][q] / n_chunks;
-        double v_s  = s->v_s [k][q] / n_chunks;
-        double v_m  = s->v_mae[k][q] / n_chunks;
-        double v_p99 = s->v_p99[k][q] / n_chunks;
-        double v_max = s->v_max[k][q] / n_chunks;
-        double c_sz = s->c_sz[k][q] / n_chunks;
-        double c_p  = s->c_p [k][q] / n_chunks;
-        double c_s  = s->c_s [k][q] / n_chunks;
-        double c_m  = s->c_mae[k][q] / n_chunks;
-        double c_p99 = s->c_p99[k][q] / n_chunks;
-        double c_max = s->c_max[k][q] / n_chunks;
+        double n = (double)n_chunks;
+        double v_sz = s->v_sz[k][q] / n;
+        double v_p  = s->v_p [k][q] / n;
+        double v_s  = s->v_s [k][q] / n;
+        double v_m  = s->v_mae[k][q] / n;
+        double v_p99 = s->v_p99[k][q] / n;
+        double v_max = s->v_max[k][q] / n;
+        double c_sz = s->c_sz[k][q] / n;
+        double c_p  = s->c_p [k][q] / n;
+        double c_s  = s->c_s [k][q] / n;
+        double c_m  = s->c_mae[k][q] / n;
+        double c_p99 = s->c_p99[k][q] / n;
+        double c_max = s->c_max[k][q] / n;
         double c_enc_mbps = ((double)n_chunks * (double)CHUNK_BYTES) /
                          (s->c_et[k][q] * 1024.0 * 1024.0);
         double c_dec_mbps = ((double)n_chunks * (double)CHUNK_BYTES) /

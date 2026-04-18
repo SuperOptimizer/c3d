@@ -97,7 +97,7 @@ int main(int argc, char **argv) {
                                              NULL, out_lod);
             }
             double t = (now_s() - t0) / REPS;
-            double mbps_out = (out_vox / (1024.0 * 1024.0)) / t;
+            double mbps_out = ((double)out_vox / (1024.0 * 1024.0)) / t;
             printf("%3d %6u %12zu %10zu %10.2f %10.1f\n",
                    lod, side, bytes_read, out_vox, t * 1000.0, mbps_out);
         }

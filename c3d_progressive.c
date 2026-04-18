@@ -45,7 +45,7 @@ static double ssim_u8(const uint8_t *a, const uint8_t *b, int side) {
     const int B = 8;
     const double inv_n = 1.0 / (double)(B * B);
     double acc = 0.0; long blocks = 0;
-    const size_t S2 = (size_t)side * side;
+    const size_t S2 = (size_t)side * (size_t)side;
     for (int z = 0; z < side; ++z) {
         const uint8_t *ap = a + (size_t)z * S2;
         const uint8_t *bp = b + (size_t)z * S2;
@@ -53,8 +53,8 @@ static double ssim_u8(const uint8_t *a, const uint8_t *b, int side) {
         for (int bx = 0; bx + B <= side; bx += B) {
             double sa=0,sb=0,saa=0,sbb=0,sab=0;
             for (int dy = 0; dy < B; ++dy) {
-                const uint8_t *ar = ap + (size_t)(by+dy)*side + bx;
-                const uint8_t *br = bp + (size_t)(by+dy)*side + bx;
+                const uint8_t *ar = ap + (size_t)(by+dy)*(size_t)side + (size_t)bx;
+                const uint8_t *br = bp + (size_t)(by+dy)*(size_t)side + (size_t)bx;
                 for (int dx = 0; dx < B; ++dx) {
                     double va = ar[dx], vb = br[dx];
                     sa += va; sb += vb;
@@ -78,9 +78,9 @@ static uint8_t *read_file(const char *path, size_t *out_size) {
     if (!fp) { perror(path); return NULL; }
     struct stat st;
     if (stat(path, &st) != 0) { perror(path); fclose(fp); return NULL; }
-    uint8_t *buf = aligned_alloc(32, (size_t)st.st_size);
+    uint8_t *buf = aligned_alloc(32, ((size_t)st.st_size + 31u) & ~(size_t)31u);
     if (!buf) { fprintf(stderr, "oom\n"); fclose(fp); return NULL; }
-    if (fread(buf, 1, st.st_size, fp) != (size_t)st.st_size) {
+    if (fread(buf, 1, (size_t)st.st_size, fp) != (size_t)st.st_size) {
         perror("fread"); free(buf); fclose(fp); return NULL;
     }
     fclose(fp);
