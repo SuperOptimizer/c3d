@@ -148,7 +148,8 @@ static double ssim_u8(const uint8_t *a, const uint8_t *b, int side) {
 /* =====================================================================
  * H.264 — openh264 encode + decode, single GOP (1 I + 255 P), CQP, CABAC.
  * =====================================================================*/
-static size_t h264_encode_decode(const uint8_t *in, int qp, uint8_t *out_yuv) {
+static size_t h264_encode_decode(const uint8_t *in, int qp, uint8_t *out_yuv,
+                                 double *t_enc_out, double *t_dec_out) {
     const int W = (int)CHUNK_SIDE, H = (int)CHUNK_SIDE;
     const size_t Y = (size_t)W * H, UV = Y / 4;
 
@@ -192,6 +193,7 @@ static size_t h264_encode_decode(const uint8_t *in, int qp, uint8_t *out_yuv) {
     pic.iStride[0] = W; pic.iStride[1] = W/2; pic.iStride[2] = W/2;
     pic.pData[0] = y; pic.pData[1] = u; pic.pData[2] = v;
 
+    double t_enc0 = now_s();
     for (int z = 0; z < H; ++z) {
         memcpy(y, in + (size_t)z * Y, Y);
         pic.uiTimeStamp = z;
@@ -211,7 +213,9 @@ static size_t h264_encode_decode(const uint8_t *in, int qp, uint8_t *out_yuv) {
         }
     }
     (*enc)->Uninitialize(enc); WelsDestroySVCEncoder(enc);
+    double t_enc = now_s() - t_enc0;
 
+    double t_dec0 = now_s();
     ISVCDecoder *dec = NULL;
     WelsCreateDecoder(&dec);
     SDecodingParam dp = {0};
@@ -260,17 +264,21 @@ static size_t h264_encode_decode(const uint8_t *in, int qp, uint8_t *out_yuv) {
         (*dec)->FlushFrame(dec, decbuf, &bi);
     }
     (*dec)->Uninitialize(dec); WelsDestroyDecoder(dec);
+    double t_dec = now_s() - t_dec0;
 
     if (decoded != (size_t)H) fprintf(stderr, "warning: h264 decoded %zu/%d at qp=%d\n", decoded, H, qp);
 
     free(y); free(u); free(v); free(bitstream);
+    if (t_enc_out) *t_enc_out = t_enc;
+    if (t_dec_out) *t_dec_out = t_dec;
     return total;
 }
 
 /* =====================================================================
  * H.265 — x265 encode + libde265 decode, 1 I + 255 P, CQP, no B-frames.
  * =====================================================================*/
-static size_t h265_encode_decode(const uint8_t *in, int qp, uint8_t *out_yuv) {
+static size_t h265_encode_decode(const uint8_t *in, int qp, uint8_t *out_yuv,
+                                 double *t_enc_out, double *t_dec_out) {
     const int W = (int)CHUNK_SIDE, H = (int)CHUNK_SIDE;
     const size_t Y = (size_t)W * H, UV = Y / 4;
 
@@ -316,6 +324,7 @@ static size_t h265_encode_decode(const uint8_t *in, int qp, uint8_t *out_yuv) {
     x265_nal *p_nal = NULL;
     uint32_t nal_count = 0;
 
+    double t_enc0 = now_s();
     for (int z = 0; z < H; ++z) {
         memcpy(y, in + (size_t)z * Y, Y);
         pic_in->pts = z;
@@ -349,7 +358,9 @@ static size_t h265_encode_decode(const uint8_t *in, int qp, uint8_t *out_yuv) {
     x265_picture_free(pic_in);
     x265_param_free(param);
     free(y); free(u); free(v);
+    double t_enc = now_s() - t_enc0;
 
+    double t_dec0 = now_s();
     /* Decode with libde265. */
     de265_decoder_context *dec = de265_new_decoder();
     de265_set_verbosity(0);
@@ -378,10 +389,13 @@ static size_t h265_encode_decode(const uint8_t *in, int qp, uint8_t *out_yuv) {
         }
     }
     de265_free_decoder(dec);
+    double t_dec = now_s() - t_dec0;
 
     if (decoded != (size_t)H) fprintf(stderr, "warning: h265 decoded %zu/%d at qp=%d\n", decoded, H, qp);
 
     free(bitstream);
+    if (t_enc_out) *t_enc_out = t_enc;
+    if (t_dec_out) *t_dec_out = t_dec;
     return total;
 }
 
@@ -396,7 +410,8 @@ static size_t h265_encode_decode(const uint8_t *in, int qp, uint8_t *out_yuv) {
  * All-intra sidesteps both problems at the cost of not exploiting z-axis
  * correlation the way H.264/H.265 do — documented in the README table.
  * =====================================================================*/
-static size_t av1_encode_decode(const uint8_t *in, int cq, uint8_t *out_yuv) {
+static size_t av1_encode_decode(const uint8_t *in, int cq, uint8_t *out_yuv,
+                                double *t_enc_out, double *t_dec_out) {
     const int W = (int)CHUNK_SIDE, H = (int)CHUNK_SIDE;
     const size_t Y = (size_t)W * H;
 
@@ -446,6 +461,7 @@ static size_t av1_encode_decode(const uint8_t *in, int cq, uint8_t *out_yuv) {
     size_t *tu_sizes = malloc(sizeof(size_t) * (size_t)(H * 2 + 32));
     int n_tus = 0;
 
+    double t_enc0 = now_s();
     for (int z = 0; z < H; ++z) {
         for (int r = 0; r < H; ++r)
             memcpy(img->planes[0] + r * img->stride[0], in + (size_t)z * Y + r * W, W);
@@ -489,7 +505,9 @@ static size_t av1_encode_decode(const uint8_t *in, int cq, uint8_t *out_yuv) {
 
     aom_img_free(img);
     aom_codec_destroy(&enc);
+    double t_enc = now_s() - t_enc0;
 
+    double t_dec0 = now_s();
     /* Decode TU by TU; each TU may decode to multiple visible frames
      * when libaom uses superframes (altref + show_existing_frame). */
     aom_codec_ctx_t dec;
@@ -517,10 +535,13 @@ static size_t av1_encode_decode(const uint8_t *in, int cq, uint8_t *out_yuv) {
         }
     }
     aom_codec_destroy(&dec);
+    double t_dec = now_s() - t_dec0;
 
     if (decoded != (size_t)H) fprintf(stderr, "warning: av1 decoded %zu/%d at cq=%d\n", decoded, H, cq);
 
     free(bitstream); free(tu_sizes);
+    if (t_enc_out) *t_enc_out = t_enc;
+    if (t_dec_out) *t_dec_out = t_dec;
     return total;
 }
 
@@ -530,7 +551,8 @@ static size_t av1_encode_decode(const uint8_t *in, int cq, uint8_t *out_yuv) {
  * 16:1 on u8-in-i32 semantic bytes), decompressed, narrowed back to u8.
  * The rate slots into the "QP" column: smaller = higher compression.
  * --------------------------------------------------------------------- */
-static size_t zfp_encode_decode(const uint8_t *in, int rate_q8, uint8_t *out) {
+static size_t zfp_encode_decode(const uint8_t *in, int rate_q8, uint8_t *out,
+                                double *t_enc_out, double *t_dec_out) {
     const int W = CHUNK_SIDE, H = CHUNK_SIDE, D = CHUNK_SIDE;
     const size_t N = (size_t)W * H * D;
 
@@ -538,6 +560,7 @@ static size_t zfp_encode_decode(const uint8_t *in, int rate_q8, uint8_t *out) {
     if (!buf32) { fprintf(stderr, "zfp oom\n"); exit(1); }
     for (size_t i = 0; i < N; ++i) buf32[i] = (int32_t)in[i];
 
+    double t_enc0 = now_s();
     zfp_field *field = zfp_field_3d(buf32, zfp_type_int32, W, H, D);
     zfp_stream *zfp = zfp_stream_open(NULL);
     /* Fixed-rate: bits per value = rate_q8 / 256.  ZFP clamps to its minimum
@@ -554,7 +577,9 @@ static size_t zfp_encode_decode(const uint8_t *in, int rate_q8, uint8_t *out) {
 
     size_t nbytes = zfp_compress(zfp, field);
     if (nbytes == 0) { fprintf(stderr, "zfp_compress failed\n"); exit(1); }
+    double t_enc = now_s() - t_enc0;
 
+    double t_dec0 = now_s();
     /* Decode in place on the same buffer. */
     memset(buf32, 0, N * sizeof(int32_t));
     zfp_stream_rewind(zfp);
@@ -568,12 +593,15 @@ static size_t zfp_encode_decode(const uint8_t *in, int rate_q8, uint8_t *out) {
         if (v > 255) v = 255;
         out[i] = (uint8_t)v;
     }
+    double t_dec = now_s() - t_dec0;
 
     stream_close(bs);
     zfp_stream_close(zfp);
     zfp_field_free(field);
     free(bits);
     free(buf32);
+    if (t_enc_out) *t_enc_out = t_enc;
+    if (t_dec_out) *t_dec_out = t_dec;
     return nbytes;
 }
 
@@ -582,18 +610,23 @@ static size_t zfp_encode_decode(const uint8_t *in, int rate_q8, uint8_t *out) {
  * float/double at runtime, so u8 is widened to float, compressed with
  * absolute error bound in LSBs, decompressed, narrowed back.
  * --------------------------------------------------------------------- */
-static size_t sz3_encode_decode(const uint8_t *in, int tol, uint8_t *out) {
+static size_t sz3_encode_decode(const uint8_t *in, int tol, uint8_t *out,
+                                double *t_enc_out, double *t_dec_out) {
     const size_t N = CHUNK_BYTES;
     float *buf = aligned_alloc(32, N * sizeof(float));
     if (!buf) { fprintf(stderr, "sz3 oom\n"); exit(1); }
     for (size_t i = 0; i < N; ++i) buf[i] = (float)in[i];
 
+    double t_enc0 = now_s();
     size_t out_size = 0;
     unsigned char *comp = SZ_compress_args(
         SZ_FLOAT, buf, &out_size,
         ABS, (double)tol, 0.0, 0.0,
         0, 0, CHUNK_SIDE, CHUNK_SIDE, CHUNK_SIDE);
     if (!comp || out_size == 0) { fprintf(stderr, "sz3 encode failed\n"); exit(1); }
+    double t_enc = now_s() - t_enc0;
+
+    double t_dec0 = now_s();
     float *dec = (float *)SZ_decompress(
         SZ_FLOAT, comp, out_size,
         0, 0, CHUNK_SIDE, CHUNK_SIDE, CHUNK_SIDE);
@@ -604,9 +637,12 @@ static size_t sz3_encode_decode(const uint8_t *in, int tol, uint8_t *out) {
         if (v > 255.0f) v = 255.0f;
         out[i] = (uint8_t)(v + 0.5f);
     }
+    double t_dec = now_s() - t_dec0;
     free_buf(comp);
     free_buf(dec);
     free(buf);
+    if (t_enc_out) *t_enc_out = t_enc;
+    if (t_dec_out) *t_dec_out = t_dec;
     return out_size;
 }
 
@@ -639,11 +675,18 @@ static int run_silently(char *const argv[]) {
     return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
 }
 static size_t tthresh_encode_decode(const uint8_t *in, int target_psnr,
-                                    uint8_t *out) {
-    char raw[128], comp[128], dec[128], psnr_arg[32], sx[8], sy[8], sz[8];
-    snprintf(raw,  sizeof raw,  "/tmp/tthresh_%d_%d.raw",  (int)getpid(), target_psnr);
-    snprintf(comp, sizeof comp, "/tmp/tthresh_%d_%d.comp", (int)getpid(), target_psnr);
-    snprintf(dec,  sizeof dec,  "/tmp/tthresh_%d_%d.dec",  (int)getpid(), target_psnr);
+                                    uint8_t *out,
+                                    double *t_enc_out, double *t_dec_out) {
+    char raw[160], comp[160], dec[160], psnr_arg[32], sx[8], sy[8], sz[8];
+    /* pthread_self() is a thread-unique id within this process, so bench
+     * workers running in parallel write to distinct tempfiles. */
+    unsigned long tid = (unsigned long)pthread_self();
+    snprintf(raw,  sizeof raw,  "/tmp/tthresh_%d_%lx_%d.raw",
+             (int)getpid(), tid, target_psnr);
+    snprintf(comp, sizeof comp, "/tmp/tthresh_%d_%lx_%d.comp",
+             (int)getpid(), tid, target_psnr);
+    snprintf(dec,  sizeof dec,  "/tmp/tthresh_%d_%lx_%d.dec",
+             (int)getpid(), tid, target_psnr);
     snprintf(psnr_arg, sizeof psnr_arg, "%d", target_psnr);
     snprintf(sx, sizeof sx, "%u", CHUNK_SIDE);
     snprintf(sy, sizeof sy, "%u", CHUNK_SIDE);
@@ -659,15 +702,20 @@ static size_t tthresh_encode_decode(const uint8_t *in, int target_psnr,
         "-s", sx, sy, sz,
         "-p", psnr_arg, "-c", comp, NULL
     };
+    double t_enc0 = now_s();
     if (run_silently(enc_argv) != 0) {
         fprintf(stderr, "tthresh encode failed\n"); exit(1);
     }
+    double t_enc = now_s() - t_enc0;
+
     char *dec_argv[] = {
         (char *)TTHRESH_BIN, "-c", comp, "-o", dec, NULL
     };
+    double t_dec0 = now_s();
     if (run_silently(dec_argv) != 0) {
         fprintf(stderr, "tthresh decode failed\n"); exit(1);
     }
+    double t_dec = now_s() - t_dec0;
 
     struct stat st;
     if (stat(comp, &st) != 0) { perror(comp); exit(1); }
@@ -680,6 +728,8 @@ static size_t tthresh_encode_decode(const uint8_t *in, int target_psnr,
     if (rd != CHUNK_BYTES) { fprintf(stderr, "tthresh short decode %zu\n", rd); exit(1); }
 
     unlink(raw); unlink(comp); unlink(dec);
+    if (t_enc_out) *t_enc_out = t_enc;
+    if (t_dec_out) *t_dec_out = t_dec;
     return comp_size;
 }
 
@@ -705,7 +755,11 @@ static const int g_tthresh_p[] = {   50,  45,  40,  35,  30,  25 };
 #define N_QPS    (sizeof g_h264_qps / sizeof g_h264_qps[0])
 #define N_CODECS 6u
 
-typedef size_t (*codec_fn)(const uint8_t *, int, uint8_t *);
+/* Codec entry point: encode `in` at QP `qp`, decode into `out`, return
+ * the compressed byte size.  Writes encode/decode wall time in seconds
+ * into *t_enc_out / *t_dec_out when those are non-NULL. */
+typedef size_t (*codec_fn)(const uint8_t *in, int qp, uint8_t *out,
+                           double *t_enc_out, double *t_dec_out);
 typedef struct {
     const char *name;
     codec_fn    fn;
@@ -737,6 +791,8 @@ typedef struct {
     double c_max[N_CODECS][N_QPS];
     double c_et[N_CODECS][N_QPS];
     double c_dt[N_CODECS][N_QPS];
+    double v_et[N_CODECS][N_QPS];
+    double v_dt[N_CODECS][N_QPS];
 } bench_sums;
 
 typedef struct {
@@ -788,7 +844,8 @@ static void *worker_fn(void *arg) {
             const codec_desc *cd = &g_codecs[k];
             for (size_t q = 0; q < N_QPS; ++q) {
                 int qp = cd->qps[q];
-                size_t v_sz = cd->fn(in, qp, codec_dec);
+                double t_v_enc = 0.0, t_v_dec = 0.0;
+                size_t v_sz = cd->fn(in, qp, codec_dec, &t_v_enc, &t_v_dec);
                 double v_p  = psnr_u8(in, codec_dec, CHUNK_BYTES);
                 double v_s  = ssim_u8(in, codec_dec, (int)CHUNK_SIDE);
                 err_stats v_e; err_metrics_u8(in, codec_dec, CHUNK_BYTES, &v_e);
@@ -822,6 +879,8 @@ static void *worker_fn(void *arg) {
                 w->sums.c_max[k][q] += c_e.max_err;
                 w->sums.c_et [k][q] += t_enc;
                 w->sums.c_dt [k][q] += t_dec;
+                w->sums.v_et [k][q] += t_v_enc;
+                w->sums.v_dt [k][q] += t_v_dec;
 
                 pthread_mutex_lock(w->out_mutex);
                 printf("[t%d] %-5s %-34s | %s%2d %8zu %6.2f %5.3f  %7zu %6.2f %5.3f  %+.2f\n",
@@ -843,12 +902,14 @@ static void print_summary(size_t k, size_t n_chunks, const bench_sums *s) {
     const codec_desc *cd = &g_codecs[k];
     printf("\n%s summary averaged over %zu chunks:\n", cd->name, n_chunks);
     printf("  %-3s  vid_sz       PSNR   SSIM   MAE    P99  max    "
+           "vidE  vidD    "
            "c3d_sz       PSNR   SSIM   MAE    P99  max    "
-           "enc_MB/s  dec_MB/s | ΔPSNR    ΔSSIM\n",
+           "c3dE  c3dD | ΔPSNR    ΔSSIM\n",
            cd->qp_label);
     printf("  ---  -----------  -----  -----  -----  ---  ---    "
+           "----  ----    "
            "-----------  -----  -----  -----  ---  ---    "
-           "--------  -------- | -------  -------\n");
+           "----  ---- | -------  -------\n");
     for (size_t q = 0; q < N_QPS; ++q) {
         double v_sz = s->v_sz[k][q] / n_chunks;
         double v_p  = s->v_p [k][q] / n_chunks;
@@ -862,18 +923,24 @@ static void print_summary(size_t k, size_t n_chunks, const bench_sums *s) {
         double c_m  = s->c_mae[k][q] / n_chunks;
         double c_p99 = s->c_p99[k][q] / n_chunks;
         double c_max = s->c_max[k][q] / n_chunks;
-        double enc_mbps = ((double)n_chunks * (double)CHUNK_BYTES) /
+        double c_enc_mbps = ((double)n_chunks * (double)CHUNK_BYTES) /
                          (s->c_et[k][q] * 1024.0 * 1024.0);
-        double dec_mbps = ((double)n_chunks * (double)CHUNK_BYTES) /
+        double c_dec_mbps = ((double)n_chunks * (double)CHUNK_BYTES) /
                          (s->c_dt[k][q] * 1024.0 * 1024.0);
+        double v_enc_mbps = ((double)n_chunks * (double)CHUNK_BYTES) /
+                         (s->v_et[k][q] * 1024.0 * 1024.0);
+        double v_dec_mbps = ((double)n_chunks * (double)CHUNK_BYTES) /
+                         (s->v_dt[k][q] * 1024.0 * 1024.0);
         double ratio_v = (double)CHUNK_BYTES / v_sz;
         printf("  %3d  %11.0f  %5.2f  %5.3f  %5.2f  %3.0f  %3.0f    "
+               "%4.0f  %4.0f    "
                "%11.0f  %5.2f  %5.3f  %5.2f  %3.0f  %3.0f    "
-               "%8.1f  %8.1f | %+6.2f   %+7.4f  (~%.1f:1)\n",
+               "%4.0f  %4.0f | %+6.2f   %+7.4f  (~%.1f:1)\n",
                cd->qps[q],
                v_sz, v_p, v_s, v_m, v_p99, v_max,
+               v_enc_mbps, v_dec_mbps,
                c_sz, c_p, c_s, c_m, c_p99, c_max,
-               enc_mbps, dec_mbps,
+               c_enc_mbps, c_dec_mbps,
                c_p - v_p, c_s - v_s, ratio_v);
     }
 }
@@ -985,6 +1052,8 @@ int main(int argc, char **argv) {
             tot.c_max[k][q] += workers[t].sums.c_max[k][q];
             tot.c_et [k][q] += workers[t].sums.c_et [k][q];
             tot.c_dt [k][q] += workers[t].sums.c_dt [k][q];
+            tot.v_et [k][q] += workers[t].sums.v_et [k][q];
+            tot.v_dt [k][q] += workers[t].sums.v_dt [k][q];
         }
     }
 
