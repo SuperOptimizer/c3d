@@ -932,6 +932,22 @@ static void c3d_dwt_1d_inv(float *x, size_t N, float *aux) {
  * both halves cleanly.  Keep this a compile-time constant so loops can unroll. */
 #define C3D_TILE_X 8
 
+/* Copy 8 contiguous floats (32 bytes = TILE_X × f32).  Used for every Y/Z
+ * tile gather/scatter inside the 3D DWT; replacing the glibc memcpy call
+ * with a direct 2×NEON-load+store saves the __memcpy_chk trampoline and
+ * makes the hot inner memory ops inlineable.  Compiler trivially fuses
+ * the pair when the data is aligned. */
+static inline void c3d_copy8(float *restrict dst, const float *restrict src) {
+#if C3D_HAVE_NEON
+    float32x4_t a = vld1q_f32(src);
+    float32x4_t b = vld1q_f32(src + 4);
+    vst1q_f32(dst,     a);
+    vst1q_f32(dst + 4, b);
+#else
+    memcpy(dst, src, 8 * sizeof(float));
+#endif
+}
+
 static void c3d_cdf97_lift_fwd_x4(float *restrict x, size_t N) {
     c3d_assert(N >= 4 && (N & 1) == 0);
     /* Predict 1. */
@@ -1062,12 +1078,12 @@ static void c3d_dwt3_fwd_level(float *buf, size_t side, float *scratch) {
         for (size_t z = 0; z < side; ++z) {
             for (size_t xb = 0; xb < side; xb += C3D_Y_TILE) {
                 for (size_t y = 0; y < side; ++y)
-                    memcpy(&tile[y * C3D_TILE_X], &buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + xb],
-                           C3D_TILE_X * sizeof(float));
+                    c3d_copy8(&tile[y * C3D_TILE_X],
+                              &buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + xb]);
                 c3d_dwt_1d_fwd_x4(tile, side, aux);
                 for (size_t y = 0; y < side; ++y)
-                    memcpy(&buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + xb], &tile[y * C3D_TILE_X],
-                           C3D_TILE_X * sizeof(float));
+                    c3d_copy8(&buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + xb],
+                              &tile[y * C3D_TILE_X]);
             }
         }
     }
@@ -1080,12 +1096,12 @@ static void c3d_dwt3_fwd_level(float *buf, size_t side, float *scratch) {
         for (size_t y = 0; y < side; ++y) {
             for (size_t xb = 0; xb < side; xb += C3D_Z_TILE) {
                 for (size_t z = 0; z < side; ++z)
-                    memcpy(&tile[z * C3D_TILE_X], &buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + xb],
-                           C3D_TILE_X * sizeof(float));
+                    c3d_copy8(&tile[z * C3D_TILE_X],
+                              &buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + xb]);
                 c3d_dwt_1d_fwd_x4(tile, side, aux);
                 for (size_t z = 0; z < side; ++z)
-                    memcpy(&buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + xb], &tile[z * C3D_TILE_X],
-                           C3D_TILE_X * sizeof(float));
+                    c3d_copy8(&buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + xb],
+                              &tile[z * C3D_TILE_X]);
             }
         }
     }
@@ -1104,12 +1120,12 @@ static void c3d_dwt3_inv_level(float *buf, size_t side, float *scratch) {
         for (size_t y = 0; y < side; ++y) {
             for (size_t xb = 0; xb < side; xb += C3D_Z_TILE) {
                 for (size_t z = 0; z < side; ++z)
-                    memcpy(&tile[z * C3D_TILE_X], &buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + xb],
-                           C3D_TILE_X * sizeof(float));
+                    c3d_copy8(&tile[z * C3D_TILE_X],
+                              &buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + xb]);
                 c3d_dwt_1d_inv_x4(tile, side, aux);
                 for (size_t z = 0; z < side; ++z)
-                    memcpy(&buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + xb], &tile[z * C3D_TILE_X],
-                           C3D_TILE_X * sizeof(float));
+                    c3d_copy8(&buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + xb],
+                              &tile[z * C3D_TILE_X]);
             }
         }
     }
@@ -1121,12 +1137,12 @@ static void c3d_dwt3_inv_level(float *buf, size_t side, float *scratch) {
         for (size_t z = 0; z < side; ++z) {
             for (size_t xb = 0; xb < side; xb += C3D_Y_TILE) {
                 for (size_t y = 0; y < side; ++y)
-                    memcpy(&tile[y * C3D_TILE_X], &buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + xb],
-                           C3D_TILE_X * sizeof(float));
+                    c3d_copy8(&tile[y * C3D_TILE_X],
+                              &buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + xb]);
                 c3d_dwt_1d_inv_x4(tile, side, aux);
                 for (size_t y = 0; y < side; ++y)
-                    memcpy(&buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + xb], &tile[y * C3D_TILE_X],
-                           C3D_TILE_X * sizeof(float));
+                    c3d_copy8(&buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + xb],
+                              &tile[y * C3D_TILE_X]);
             }
         }
     }
