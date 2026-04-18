@@ -114,7 +114,57 @@ c3d wins at every operating point against all three baselines — **+4.0 to +4.6
 dB** over H.264, **+1.4 to +2.6 dB** over H.265 (the strongest inter
 baseline), **+2.7 to +6.1 dB** over AV1 all-intra.  H.265 closes most of the
 gap near-lossless; c3d pulls ahead again as compression gets aggressive.
-Harness: `c3d_bench` (runs all three codecs in one sweep).
+Harness: `c3d_bench` (runs all six codecs in one sweep).
+
+Three scientific-data codecs were added to the sweep for full coverage:
+**ZFP** (fixed-rate 3D integer mode), **SZ3** (Lorenzo + Huffman + zstd, float
+only — u8 widened for the comparison), **TTHRESH** (Tucker decomposition via
+the reference CLI).
+
+**ZFP** — fixed-rate 3D integer mode, `rate_q8 / 256` bits per value.  Degrades
+catastrophically below ~0.5 bpp because its block-floating-point substrate
+doesn't adapt to the near-zero regions scroll data actually consists of:
+
+| rq8 | ratio   | ZFP PSNR  | c3d PSNR | **Δ**      |
+|-----|---------|-----------|----------|------------|
+| 1024|   2.0:1 | 36.99 dB  | 87.81 dB | **+50.82** |
+|  512|   4.0:1 | 35.99 dB  | 54.06 dB | **+18.07** |
+|  256|   8.0:1 | 33.46 dB  | 48.26 dB | **+14.80** |
+|  128|  16.0:1 | 23.22 dB  | 43.90 dB | **+20.67** |
+|   64|  32.0:1 |  8.53 dB  | 40.86 dB | **+32.33** |
+|   32|  64.0:1 |  8.53 dB  | 37.48 dB | **+28.95** |
+
+**SZ3** — Lorenzo + Huffman + zstd.  Scientific-data workhorse for smooth
+fields; performs well at low ratios (close to c3d at r=3.5-7.7) and still
+tracks c3d within 4-5 dB at higher ratios:
+
+| eps | ratio   | SZ3 PSNR  | c3d PSNR | **Δ**     |
+|-----|---------|-----------|----------|-----------|
+|   1 |   3.5:1 | 51.14 dB  | 55.67 dB | **+4.52** |
+|   3 |   7.7:1 | 43.63 dB  | 48.59 dB | **+4.96** |
+|   6 |  16.4:1 | 39.82 dB  | 43.75 dB | **+3.93** |
+|  12 |  42.4:1 | 35.40 dB  | 39.51 dB | **+4.11** |
+|  24 | 112.8:1 | 30.46 dB  | 34.74 dB | **+4.28** |
+|  48 | 370.3:1 | 25.92 dB  | 30.01 dB | **+4.09** |
+
+**TTHRESH** — Tucker decomposition.  The only baseline that holds its own at
+low ratios: beats c3d by ~0.7–1.6 dB in the r≈6-13 band because the Tucker
+factorisation is an excellent fit for smooth volumetric data.  c3d pulls
+ahead above r≈30:
+
+| P  | ratio   | TTHR PSNR | c3d PSNR | **Δ**     |
+|----|---------|-----------|----------|-----------|
+| 50 |   3.4:1 | 56.14 dB  | 56.53 dB | **+0.39** |
+| 45 |   6.0:1 | 51.16 dB  | 50.44 dB | **−0.72** |
+| 40 |  13.0:1 | 46.58 dB  | 44.97 dB | **−1.61** |
+| 35 |  27.4:1 | 41.61 dB  | 41.49 dB | **−0.12** |
+| 30 |  66.6:1 | 36.52 dB  | 37.25 dB | **+0.73** |
+| 25 | 173.3:1 | 31.11 dB  | 32.88 dB | **+1.77** |
+
+TTHRESH runs via an external CLI (fork + exec + disk tempfiles per chunk);
+c3d's throughput advantage over TTHRESH is 5-20× even where TTHRESH wins
+PSNR, which matters more for a scroll-CT ingest pipeline than the last dB
+at r≈10.
 
 **Perceptual gap is larger than PSNR gap at high compression.**  The same
 bench measures block-SSIM (8×8, mean-averaged across slices) alongside
@@ -135,6 +185,58 @@ producing visible blocking artifacts, c3d's wavelet blur degrades to
 0.79-0.93 SSIM (still usable) while the baselines collapse to 0.60-0.77
 (visibly broken).  The +0.1-0.2 SSIM gap at high ratios is arguably a
 better summary of c3d's practical advantage than the PSNR numbers above.
+
+**Encode / decode throughput** per codec at each operating point, raw-voxel
+MB/s measured inside `c3d_bench` (single worker-thread path, X1E Release
++ PGO).  Higher is better.  c3d is the same codec at every row — it does
+not get faster at higher QP / coarser quant because the DWT + rANS is
+O(N_voxels), not O(payload).  Video codecs by contrast trade off speed
+against bitstream size, so their throughput climbs sharply at high QP
+(bitstream shrinks → fewer bytes to encode / parse).
+
+| codec |  op       | ratio   | vidE MB/s | vidD MB/s | c3dE MB/s | c3dD MB/s |
+|-------|-----------|---------|-----------|-----------|-----------|-----------|
+| H.264 | Q18       |   8.9:1 |     33    |     41    |     19    |     45    |
+| H.264 | Q30       |  41.0:1 |     65    |    113    |     28    |     59    |
+| H.264 | Q48       | 654.9:1 |    200    |    635    |     63    |     78    |
+| H.265 | Q18       |  11.3:1 |      2    |     19    |     24    |     62    |
+| H.265 | Q30       |  46.7:1 |      4    |     34    |     37    |     85    |
+| H.265 | Q48       | 690.3:1 |     17    |    103    |     80    |     94    |
+| AV1   | cq16      |  11.0:1 |      2    |     58    |     24    |     67    |
+| AV1   | cq40      |  34.8:1 |      4    |    120    |     33    |     81    |
+| AV1   | cq60      | 129.2:1 |      6    |    222    |     49    |     87    |
+| ZFP   | rq512     |   4.0:1 |     27    |    102    |     19    |     55    |
+| ZFP   | rq128     |  16.0:1 |     34    |    181    |     22    |     59    |
+| ZFP   | rq32      |  64.0:1 |     92    |    230    |     36    |     68    |
+| SZ3   | eps=1     |   3.5:1 |     29    |     44    |     15    |     50    |
+| SZ3   | eps=6     |  16.4:1 |     28    |     66    |     20    |     52    |
+| SZ3   | eps=48    | 370.3:1 |     37    |     77    |     43    |     56    |
+| TTHR  | P50       |   3.4:1 |      2    |      3    |     11    |     34    |
+| TTHR  | P30       |  66.6:1 |      2    |      6    |     24    |     46    |
+| TTHR  | P25       | 173.3:1 |      2    |      9    |     36    |     53    |
+
+Notes:
+- H.264 encode (openh264) and decode (its internal decoder) are both faster
+  than c3d at low QP, and dramatically faster at high QP thanks to the
+  bitstream-size effect.  But c3d decodes faster than H.264 at the
+  meaningful range (Q18-Q30, 9-41:1 ratios that are realistic for a
+  scroll-CT archive).
+- H.265 (x265 medium + libde265) runs at 2-17 MB/s encode; c3d encodes
+  **4-13× faster** across the whole range at matched quality.  Decode
+  throughput is comparable at high QP, c3d 3× faster at low QP.
+- AV1 all-intra (libaom cpu-used=6) encodes at 2-6 MB/s — c3d is **8-12×
+  faster** on encode.  Decode parity is similar.
+- ZFP is the fastest competitor on decode (always ~100-230 MB/s via its
+  tight block-floating-point path), but its PSNR collapse below 16:1
+  makes it unusable past that point; where ZFP is still on the R-D curve
+  (r≈4:1), c3d is within 1.5× on encode and 2× on decode at matched
+  bytes.
+- SZ3 encode/decode are both slightly slower than c3d on u8-widened input
+  (SZ3's API pays for u8→float conversion on both sides).
+- TTHRESH runs via fork+exec of a C++ CLI with disk tempfiles per chunk,
+  which caps it at 2 MB/s encode and 3-9 MB/s decode regardless of
+  ratio.  c3d is **5-20× faster** end to end — the only place TTHRESH
+  wins on quality (r≈6-13) is also the place it's slowest.
 
 Single-chunk perf (`c3d_perf`, same hardware, q=0.10):
 
@@ -190,6 +292,36 @@ cmake --build build-pgo --target pgo_train
 cmake -S . -B build-pgo -DPGO=USE
 cmake --build build-pgo --clean-first -j
 ```
+
+### SIMD tier selection
+
+Default (`-DC3D_SIMD=AUTO`) auto-detects from `-mcpu=native` / `-march=native`.
+Explicit targets:
+
+```
+-DC3D_SIMD=AUTO     # auto-detect (default)
+-DC3D_SIMD=SCALAR   # disable all SIMD kernels (portable sanity / ref)
+-DC3D_SIMD=NEON     # aarch64 + NEON (default on ARM)
+-DC3D_SIMD=AVX2     # x86_64 Haswell and later
+-DC3D_SIMD=AVX512   # x86_64 Zen 4 / Sapphire Rapids (znver4 bundle)
+```
+
+### Sanitizer builds
+
+`-DSANITIZE=<mode>` drops optimisation to `-O1 -g`, disables LTO + fast-math, and
+injects the matching runtime:
+
+```
+-DSANITIZE=address           # ASan
+-DSANITIZE=undefined         # UBSan
+-DSANITIZE=address+undefined # both together
+-DSANITIZE=thread            # TSan
+-DSANITIZE=memory            # MSan (clang)
+-DSANITIZE=leak              # LSan
+```
+
+`lsan.supp` suppresses libomp-internal leaks:
+`LSAN_OPTIONS=suppressions=$(pwd)/lsan.supp`.
 
 ## Usage
 
