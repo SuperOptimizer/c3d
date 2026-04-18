@@ -3401,12 +3401,16 @@ size_t c3d_chunk_encode_max_size(void) { return C3D_CHUNK_ENCODE_MAX_SIZE; }
 static void c3d_fill_mask_ignore(const uint8_t *restrict in,
                                  uint8_t *restrict out)
 {
-    uint8_t m_min = 255;
+    uint8_t m_min = 0;
+    bool any_nonzero = false;
     for (size_t i = 0; i < C3D_VOXELS_PER_CHUNK; ++i) {
         uint8_t v = in[i];
-        if (v != 0 && v < m_min) m_min = v;
+        if (v != 0) {
+            if (!any_nonzero || v < m_min) m_min = v;
+            any_nonzero = true;
+        }
     }
-    if (m_min == 255) {
+    if (!any_nonzero) {
         memcpy(out, in, C3D_VOXELS_PER_CHUNK);
         return;
     }

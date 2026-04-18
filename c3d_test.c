@@ -1072,12 +1072,45 @@ static void test_chunk_encode_masked(void) {
     printf("  masked 50x material PSNR: %.2f dB\n", matP);
     CHECK(matP > 28.0);
 
-    /* All-zero input → empty-chunk fast path. */
+    /* All-zero input (e.g. pure-black padding chunk) → empty-chunk fast path. */
     memset(in, 0, C3D_VOXELS_PER_CHUNK);
     sz = c3d_chunk_encode_masked(in, 50.0f, NULL, enc, C3D_CHUNK_ENCODE_MAX_SIZE);
     CHECK_EQ(sz, (size_t)C3D_CHUNK_FIXED_SIZE);
     c3d_chunk_decode(enc, sz, NULL, dec);
     for (size_t i = 0; i < C3D_VOXELS_PER_CHUNK; ++i) CHECK_EQ(dec[i], 0);
+
+    /* 99%-air sparse chunk: a single thin 16³ cluster of material, rest 0.
+     * Should compress to a small chunk and recover the material accurately. */
+    memset(in, 0, C3D_VOXELS_PER_CHUNK);
+    for (uint32_t z = 120; z < 136; ++z)
+    for (uint32_t y = 120; y < 136; ++y)
+    for (uint32_t x = 120; x < 136; ++x)
+        in[(size_t)z*C3D_CHUNK_SIDE*C3D_CHUNK_SIDE + y*C3D_CHUNK_SIDE + x] = 150;
+    sz = c3d_chunk_encode_masked(in, 50.0f, NULL, enc, C3D_CHUNK_ENCODE_MAX_SIZE);
+    CHECK(c3d_chunk_validate(enc, sz));
+    c3d_chunk_decode(enc, sz, NULL, dec);
+    /* Material cluster should reconstruct close to 150. */
+    double s = 0; size_t n = 0;
+    for (uint32_t z = 120; z < 136; ++z)
+    for (uint32_t y = 120; y < 136; ++y)
+    for (uint32_t x = 120; x < 136; ++x) {
+        size_t i = (size_t)z*C3D_CHUNK_SIDE*C3D_CHUNK_SIDE + y*C3D_CHUNK_SIDE + x;
+        double d = 150.0 - (double)dec[i]; s += d * d; ++n;
+    }
+    double sparse_mat_psnr = 10.0 * log10(255.0 * 255.0 / (s / (double)n));
+    printf("  masked 99%%-air sparse cluster matP: %.2f dB  bytes=%zu\n", sparse_mat_psnr, sz);
+    CHECK(sparse_mat_psnr > 30.0);
+
+    /* All non-zero voxels are exactly 255 — exercise the former sentinel bug
+     * (m_min stayed at 255 and fill was skipped).  Fill should now replace
+     * every 0 with 255, giving a uniform chunk that hits the empty-chunk
+     * fast path. */
+    memset(in, 0, C3D_VOXELS_PER_CHUNK);
+    for (size_t i = 0; i < 1024; ++i) in[i * 1024] = 255;
+    sz = c3d_chunk_encode_masked(in, 50.0f, NULL, enc, C3D_CHUNK_ENCODE_MAX_SIZE);
+    CHECK_EQ(sz, (size_t)C3D_CHUNK_FIXED_SIZE);
+    c3d_chunk_decode(enc, sz, NULL, dec);
+    for (size_t i = 0; i < C3D_VOXELS_PER_CHUNK; ++i) CHECK_EQ(dec[i], 255);
 
     /* Determinism: same input → same output bytes under _masked. */
     make_test_chunk(in);
