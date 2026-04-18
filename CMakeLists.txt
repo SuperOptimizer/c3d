@@ -1,11 +1,16 @@
 cmake_minimum_required(VERSION 3.20)
-project(c3d C)
+project(c3d VERSION 1.0.0 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 23)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS ON)   # for __attribute__((optimize(...))) on the ref path
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
+# Make the static lib PIC by default so downstream shared consumers (e.g.
+# Volume-Cartographer's codec registry built as a plugin) can link against
+# the static libc3d.a without hitting R_X86_64_PC32 relocation errors.
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 # Common warning flags for all targets.
 #
@@ -186,18 +191,32 @@ elseif(NOT PGO STREQUAL "OFF")
     message(FATAL_ERROR "PGO must be one of OFF | GENERATE | USE (got '${PGO}')")
 endif()
 
-# Library targets: static + shared.  Shared is used by Python ctypes bindings
-# (e.g. c3d_zarr_to_c3d.py).
+# Library targets: static + shared.  Both are first-class install targets
+# (see the install() block near the bottom of this file).  The static lib
+# is what most C++ embedders link (Volume-Cartographer, etc.); the shared
+# lib is what Python ctypes bindings + dynamically-loaded plugins pick up.
+#
+# Include-interface uses generator expressions so install EXPORT writes the
+# correct include path downstream (source tree during local builds, the
+# installed header directory after `make install`).
 add_library(c3d STATIC c3d.c)
-target_include_directories(c3d PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_include_directories(c3d PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
+    $<INSTALL_INTERFACE:include>)
+target_link_libraries(c3d PUBLIC m)
 
 add_library(c3d_shared SHARED c3d.c)
-set_target_properties(c3d_shared PROPERTIES OUTPUT_NAME c3d)
-target_include_directories(c3d_shared PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(c3d_shared PRIVATE m)
-# Shared lib: PIC; also -fno-semantic-interposition so internal calls bind
-# direct instead of going through the PLT (small perf win on the hot path).
-target_compile_options(c3d_shared PRIVATE -fPIC -fno-semantic-interposition)
+set_target_properties(c3d_shared PROPERTIES
+    OUTPUT_NAME c3d
+    VERSION   ${PROJECT_VERSION}
+    SOVERSION ${PROJECT_VERSION_MAJOR})
+target_include_directories(c3d_shared PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
+    $<INSTALL_INTERFACE:include>)
+target_link_libraries(c3d_shared PUBLIC m)
+# -fno-semantic-interposition so internal calls bind direct instead of going
+# through the PLT (small perf win on the hot path).
+target_compile_options(c3d_shared PRIVATE -fno-semantic-interposition)
 
 # Test target: includes c3d.c directly to reach static internals; defines
 # C3D_BUILD_REF so the reference decoder path compiles in (later stages).
@@ -326,3 +345,46 @@ add_custom_target(pgo_train
     COMMENT "PGO training on 8-chunk mini corpus (r=10, r=50)"
     DEPENDS c3d_bench_par
     VERBATIM)
+
+# ---------------------------------------------------------------------------
+# Install rules + CMake package config + pkg-config — so downstream projects
+# (e.g. Volume-Cartographer) can `find_package(c3d)` or `pkg_check_modules(c3d)`
+# and link `c3d::c3d` (static) or `c3d::c3d_shared` (shared).
+# ---------------------------------------------------------------------------
+include(GNUInstallDirs)
+include(CMakePackageConfigHelpers)
+
+install(TARGETS c3d c3d_shared
+    EXPORT c3dTargets
+    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+    INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+
+install(FILES c3d.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+
+install(EXPORT c3dTargets
+    FILE c3dTargets.cmake
+    NAMESPACE c3d::
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/c3d)
+
+configure_package_config_file(
+    ${CMAKE_CURRENT_SOURCE_DIR}/cmake/c3d-config.cmake.in
+    ${CMAKE_CURRENT_BINARY_DIR}/c3d-config.cmake
+    INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/c3d)
+
+write_basic_package_version_file(
+    ${CMAKE_CURRENT_BINARY_DIR}/c3d-config-version.cmake
+    VERSION ${PROJECT_VERSION}
+    COMPATIBILITY SameMajorVersion)
+
+install(FILES
+    ${CMAKE_CURRENT_BINARY_DIR}/c3d-config.cmake
+    ${CMAKE_CURRENT_BINARY_DIR}/c3d-config-version.cmake
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/c3d)
+
+configure_file(
+    ${CMAKE_CURRENT_SOURCE_DIR}/cmake/c3d.pc.in
+    ${CMAKE_CURRENT_BINARY_DIR}/c3d.pc @ONLY)
+install(FILES ${CMAKE_CURRENT_BINARY_DIR}/c3d.pc
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig)

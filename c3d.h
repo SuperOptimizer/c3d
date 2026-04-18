@@ -22,6 +22,27 @@
 extern "C" {
 #endif
 
+/* ─── library + format version ───────────────────────────────────────────── */
+
+/* Format version written into every c3d chunk / shard / .c3dx blob.  Frozen
+ * at 1 for the lifetime of the codec (per PLAN §0: re-encoding from raw u8
+ * is the upgrade path during development, not on-the-wire compat).  Useful
+ * for downstream code that wants to record the codec identity in an
+ * enclosing metadata blob (e.g. zarr `.zarray` codec config). */
+#define C3D_FORMAT_VERSION 1u
+
+/* Library version string, semver.  Matches `project(c3d VERSION ...)` in
+ * CMakeLists.txt; written out at install time via the generated .pc file. */
+#define C3D_VERSION_MAJOR 1
+#define C3D_VERSION_MINOR 0
+#define C3D_VERSION_PATCH 0
+#define C3D_VERSION_STRING "1.0.0"
+
+/* Runtime accessors.  Useful when the caller links against the shared lib
+ * (libc3d.so) and wants to check the header-vs-library version match. */
+const char *c3d_version(void);           /* "1.0.0" */
+uint32_t    c3d_format_version(void);    /* C3D_FORMAT_VERSION */
+
 /* ─── fixed hierarchy constants ──────────────────────────────────────────── */
 
 #define C3D_BLOCK_SIDE     16u     /* caller-side RAM cache granularity          */
@@ -34,6 +55,51 @@ extern "C" {
 #define C3D_N_SUBBANDS     36u     /* 1 LLL_5 + 5*7 details = 36                 */
 
 #define C3D_ALIGN          32u     /* required alignment for raw voxel buffers   */
+
+/* ─── magic identifiers ──────────────────────────────────────────────────── */
+
+/* Every encoded chunk starts with the 4 bytes "C3DC" at offset 0.
+ * Every serialised shard starts with "C3DS".
+ * Every serialised .c3dx context block starts with "C3DX".
+ *
+ * Downstream zarr / archive tooling can sniff the chunk magic cheaply to
+ * dispatch between codecs (e.g. c3d vs legacy blosc/zstd) without parsing
+ * the full header. */
+#define C3D_CHUNK_MAGIC  "C3DC"
+#define C3D_SHARD_MAGIC  "C3DS"
+#define C3D_CTX_MAGIC    "C3DX"
+
+/* Side at the given LOD.  LOD 0 = 256³ (full), LOD 5 = 8³ (coarsest).
+ * Valid for lod ∈ [0, 5]; higher values clamp to 0.  The buffer passed to
+ * c3d_chunk_decode_lod() must be at least c3d_voxels_per_lod(lod) bytes. */
+static inline uint32_t c3d_side_per_lod(uint8_t lod) {
+    return (lod <= 5u) ? (C3D_CHUNK_SIDE >> lod) : 0u;
+}
+static inline size_t c3d_voxels_per_lod(uint8_t lod) {
+    size_t s = (size_t)c3d_side_per_lod(lod);
+    return s * s * s;
+}
+
+/* Cheap magic sniff.  True iff `in` has at least 4 bytes and the first 4
+ * are "C3DC".  Does NOT validate version, sizes, or entropy payload — use
+ * c3d_chunk_validate() for structural integrity.  The intended use is a
+ * codec-dispatch decision inside a multi-codec archive reader: "is this a
+ * c3d chunk?" → yes → call the c3d path; no → try the other codec. */
+static inline bool c3d_is_chunk(const uint8_t *in, size_t n) {
+    return n >= 4u
+        && in[0] == (uint8_t)'C' && in[1] == (uint8_t)'3'
+        && in[2] == (uint8_t)'D' && in[3] == (uint8_t)'C';
+}
+static inline bool c3d_is_shard(const uint8_t *in, size_t n) {
+    return n >= 4u
+        && in[0] == (uint8_t)'C' && in[1] == (uint8_t)'3'
+        && in[2] == (uint8_t)'D' && in[3] == (uint8_t)'S';
+}
+static inline bool c3d_is_ctx(const uint8_t *in, size_t n) {
+    return n >= 4u
+        && in[0] == (uint8_t)'C' && in[1] == (uint8_t)'3'
+        && in[2] == (uint8_t)'D' && in[3] == (uint8_t)'X';
+}
 
 /* Upper bound on a c3d_chunk_encode output: raw u8 + fixed header + tables
  * + a small range-coder safety margin.  Small enough to stack-allocate.
@@ -149,16 +215,39 @@ void c3d_chunk_inspect(const uint8_t *in, size_t in_len, c3d_chunk_info *info);
 /* Non-panicking structural check: magic, version, header sizes, table offsets,
  * per-subband frame sizes, TLV bounds.  Does NOT run entropy decode — a
  * structurally-valid chunk with a bad rANS state inside will still panic on
- * actual decode. */
+ * actual decode.
+ *
+ * Validate-then-decode pattern for untrusted input (e.g. reading zarr chunks
+ * from an archive that may contain corrupted or foreign bytes):
+ *
+ *     if (!c3d_is_chunk(in, in_len))           return CODEC_NOT_C3D;
+ *     if (!c3d_chunk_validate(in, in_len))     return CODEC_CORRUPT;
+ *     c3d_decoder_chunk_decode(dec, in, in_len, ctx, out);
+ *
+ * The library is fatal-on-error by design (c3d_panic → abort).  A caller
+ * who wants exception-like semantics (continue after a bad chunk) should
+ * (a) gate the decode on c3d_chunk_validate(), and (b) install a panic
+ * hook that `longjmp`s back to a known setjmp target BEFORE calling the
+ * decode path.  The longjmp-after-panic pattern is documented as UB
+ * against the library's own internal assertions, but it does work for
+ * the specific case of a deliberately-corrupt encoded byte stream, as
+ * long as the panic hook never returns. */
 bool c3d_chunk_validate(const uint8_t *in, size_t in_len);
 
 /* ─── stateless chunk codec ──────────────────────────────────────────────── */
 
 typedef struct c3d_ctx c3d_ctx;
 
-/* Reusable encoder/decoder scratch.  Owns ~150 MiB of buffers; create once per
- * thread, reuse across many chunks to avoid alloc/free churn (50-100 ms/chunk
- * saved).  All const-qualified member functions are safe for concurrent use. */
+/* Reusable encoder/decoder scratch.  Owns ~115 MiB (encoder) / ~80 MiB
+ * (decoder) of buffers; create once per thread, reuse across many chunks
+ * to avoid alloc/free churn (50-100 ms/chunk saved).
+ *
+ * Thread-safety: a c3d_encoder / c3d_decoder instance is NOT thread-safe.
+ * The internal scratch arenas are mutated on every call.  For multi-threaded
+ * encode/decode, allocate one encoder / decoder per worker thread.  The
+ * stateless functions (c3d_chunk_encode etc.) are safe to call concurrently
+ * from any thread — they malloc scratch per call, which is what you pay to
+ * avoid the per-thread-context dance. */
 typedef struct c3d_encoder c3d_encoder;
 typedef struct c3d_decoder c3d_decoder;
 

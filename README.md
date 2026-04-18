@@ -376,6 +376,47 @@ size_t n = c3d_encoder_chunk_encode(e, chunk, 25.0f, ctx, out, max_sz);
 `.c3dx` blobs are max 64 KiB and can live inside a shard or as a sidecar
 for streaming.
 
+### Embedding in another project
+
+`cmake --install . --prefix /your/prefix` lays down:
+- `<prefix>/lib/libc3d.a` + `libc3d.so.1.0.0` (+ SOVERSION symlinks)
+- `<prefix>/include/c3d.h`
+- `<prefix>/lib/cmake/c3d/c3d-config.cmake` (relocatable `find_package`)
+- `<prefix>/lib/pkgconfig/c3d.pc` (relocatable via `${pcfiledir}`)
+
+Downstream CMake:
+
+```cmake
+find_package(c3d REQUIRED)
+target_link_libraries(my_app PRIVATE c3d::c3d)          # static
+target_link_libraries(my_app PRIVATE c3d::c3d_shared)   # shared
+```
+
+Downstream pkg-config:
+
+```
+pkg-config --cflags --libs c3d
+```
+
+Integration-time entry points (see `c3d.h` for full API):
+
+```c
+/* cheap codec-dispatch sniff on a bytes-in-archive */
+if (c3d_is_chunk(bytes, n)) { ... }
+
+/* validate before decoding untrusted bytes — library is fatal-on-error */
+if (!c3d_chunk_validate(bytes, n)) reject_chunk();
+c3d_decoder_chunk_decode(dec, bytes, n, ctx, out);
+
+/* LOD serving (e.g. multiscale zarr groups) */
+uint8_t *buf = malloc(c3d_voxels_per_lod(lod));
+c3d_decoder_chunk_decode_lod(dec, bytes, n, lod, ctx, buf);
+```
+
+Thread-safety: one `c3d_encoder`/`c3d_decoder` per worker thread (each owns
+80-115 MiB of scratch).  The stateless `c3d_chunk_{encode,decode}` calls
+are safe to call concurrently but re-malloc scratch per call.
+
 ## Tools
 
 | binary           | purpose                                              |

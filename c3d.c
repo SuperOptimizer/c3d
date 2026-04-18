@@ -54,6 +54,9 @@
 
 static c3d_panic_fn s_panic_hook = NULL;
 
+const char *c3d_version(void)        { return C3D_VERSION_STRING; }
+uint32_t    c3d_format_version(void) { return C3D_FORMAT_VERSION; }
+
 void c3d_set_panic_hook(c3d_panic_fn hook) {
     s_panic_hook = hook;
 }

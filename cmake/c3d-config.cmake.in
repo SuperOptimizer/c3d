@@ -1,0 +1,16 @@
+@PACKAGE_INIT@
+
+# c3d — 3D volumetric u8 compression codec for scroll CT data.
+#
+# Usage:
+#   find_package(c3d REQUIRED)
+#   target_link_libraries(my_app PRIVATE c3d::c3d)         # static
+#   target_link_libraries(my_app PRIVATE c3d::c3d_shared)  # shared
+#
+# Both targets export the same c3d.h public header.
+
+include(CMakeFindDependencyMacro)
+
+include("${CMAKE_CURRENT_LIST_DIR}/c3dTargets.cmake")
+
+check_required_components(c3d)

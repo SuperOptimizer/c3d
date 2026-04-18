@@ -1,0 +1,16 @@
+# `prefix` is resolved relative to the .pc file's own directory so the
+# install is relocatable: `cmake --install . --prefix /custom` produces
+# a pkg-config that points at /custom even though the configure-time
+# CMAKE_INSTALL_PREFIX was unset (CMake's default /usr/local).
+# Requires pkg-config >= 0.27 (ubiquitous since 2012).
+prefix=${pcfiledir}/../..
+exec_prefix=${prefix}
+libdir=${exec_prefix}/@CMAKE_INSTALL_LIBDIR@
+includedir=${prefix}/@CMAKE_INSTALL_INCLUDEDIR@
+
+Name: c3d
+Description: 3D volumetric u8 compression codec for scroll CT data
+URL: https://github.com/SuperOptimizer/c3d
+Version: @PROJECT_VERSION@
+Libs: -L${libdir} -lc3d -lm
+Cflags: -I${includedir}
