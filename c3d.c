@@ -20,6 +20,10 @@
 #  error "c3d requires a little-endian target"
 #endif
 
+#if defined(_OPENMP)
+#  include <omp.h>
+#endif
+
 /* ========================================================================= *
  *  §A  Scaffolding                                                          *
  * ========================================================================= */
@@ -1703,10 +1707,19 @@ struct c3d_encoder {
     bool     has_log_rd_slope;
 };
 
+/* Max OpenMP threads we reserve per-thread scratch for.  Anything above
+ * this falls back to thread-0 scratch (still correct, just not parallel). */
+#define C3D_OMP_MAX_THREADS 32
+
 struct c3d_decoder {
     float   *coeff_buf;
     uint8_t *sub_symbols;
     float    dwt_scratch[2 * C3D_TILE_X * C3D_CHUNK_SIDE];
+    /* §S11 — per-thread sub_symbols scratch for the parallel subband
+     * decode.  Index 0 aliases `sub_symbols` (lazy-allocated above);
+     * indices 1..N-1 are allocated on first parallel decode and reused
+     * across chunks.  Arena-style to avoid malloc/free on the hot path. */
+    uint8_t *thread_sub_symbols[C3D_OMP_MAX_THREADS];
     /* rANS table cache for stable EXTERNAL ctx.  cached_tables is lazily
      * allocated (2.4 MiB total, 36 × ~65 KiB) on first EXTERNAL-ctx decode;
      * reused across chunks as long as the ctx id matches. */
@@ -1758,6 +1771,8 @@ c3d_decoder *c3d_decoder_new(void) {
     d->coeff_buf   = aligned_alloc(C3D_ALIGN, C3D_VOXELS_PER_CHUNK * sizeof(float));
     d->sub_symbols = malloc((size_t)128 * 128 * 128);
     c3d_assert(d->coeff_buf && d->sub_symbols);
+    memset(d->thread_sub_symbols, 0, sizeof d->thread_sub_symbols);
+    d->thread_sub_symbols[0] = d->sub_symbols;
     d->cached_tables = NULL;
     memset(d->cached_ctx_id, 0, 16);
     d->cached_valid = false;
@@ -1766,7 +1781,11 @@ c3d_decoder *c3d_decoder_new(void) {
 }
 void c3d_decoder_free(c3d_decoder *d) {
     if (!d) return;
-    free(d->coeff_buf); free(d->sub_symbols); free(d->cached_tables); free(d);
+    free(d->coeff_buf); free(d->sub_symbols); free(d->cached_tables);
+    /* Index 0 aliases sub_symbols (already freed).  Free the rest. */
+    for (unsigned i = 1; i < C3D_OMP_MAX_THREADS; ++i)
+        free(d->thread_sub_symbols[i]);
+    free(d);
 }
 
 /* -- Stage 1: ingest + DWT + compute coeff_scale, normalise. -------------- *
@@ -1826,6 +1845,9 @@ static bool c3d_prepare_chunk(const uint8_t *in, uint8_t *out,
      * the global max is just the max over the per-subband table — no extra
      * 64 MiB scan.  Saves ~12 ms/chunk vs separate loops. */
     float max_abs = 0.0f;
+    /* 36 independent per-subband scans.  Dynamic scheduling balances the
+     * wide range of subband sizes (8³=512 vox to 128³=2 M vox). */
+    #pragma omp parallel for reduction(max:max_abs) schedule(dynamic,1)
     for (unsigned i = 0; i < C3D_N_SUBBANDS; ++i) {
         c3d_subband_info sb; c3d_subband_info_of(i, &sb);
         float mx = 0.0f;
@@ -1927,6 +1949,9 @@ static bool c3d_prepare_chunk(const uint8_t *in, uint8_t *out,
 static void c3d_build_fine_hist(c3d_encoder *s) {
     if (s->has_fine_hist) return;
     c3d_assert(s->has_max_abs);
+    /* 36 independent per-subband histogram builds.  Each writes a
+     * disjoint fine_prefix[sidx] row.  Work is uneven so dynamic-1. */
+    #pragma omp parallel for schedule(dynamic,1)
     for (unsigned sidx = 0; sidx < C3D_N_SUBBANDS; ++sidx) {
         uint32_t *pref = s->fine_prefix[sidx];
         memset(pref, 0, (C3D_FINE_BINS + 1) * sizeof(uint32_t));
@@ -2606,6 +2631,14 @@ static void c3d_rd_allocate_hybrid(c3d_encoder *s, const c3d_ctx *ctx,
     double rate[C3D_N_SUBBANDS][C3D_RD_NCAND];
     double dist[C3D_N_SUBBANDS][C3D_RD_NCAND];
     float  step_grid[C3D_N_SUBBANDS][C3D_RD_NCAND];
+    /* Subbands vary 500×+ in voxel count (LL_5 = 512 vs LL_1 = 2 M).  Dynamic
+     * scheduling lets finished threads pick up the tiny LL_5 tail while a
+     * few threads grind through the 2-level subbands.  Dependencies: the
+     * fine_prefix cache (c3d_build_fine_hist) must already be populated —
+     * we called c3d_build_fine_hist() above, so the reads here are race-
+     * free.  `ctx`, `s` fields other than allocator_steps are read-only.
+     * rate/dist/step_grid writes are disjoint per `i`. */
+    #pragma omp parallel for schedule(dynamic,1)
     for (unsigned i = 0; i < C3D_N_SUBBANDS; ++i) {
         c3d_subband_info sb; c3d_subband_info_of(i, &sb);
         float base_step = q_center * c3d_emit_baseline(s, ctx, i) * s->coeff_scale;
@@ -2805,6 +2838,10 @@ static double c3d_estimate_entropy_at_q(float q, const c3d_encoder *s,
                                         const c3d_ctx *ctx)
 {
     double total = 0.0;
+    /* 36 subbands, each an independent full quant-scan over its
+     * coefficient cube.  Work is uneven (LL_5=512 vox vs LL_1=2 M) so
+     * dynamic scheduling with a chunk size of 1 avoids straggler threads. */
+    #pragma omp parallel for reduction(+:total) schedule(dynamic,1)
     for (unsigned i = 0; i < C3D_N_SUBBANDS; ++i) {
         c3d_subband_info sb;
         c3d_subband_info_of(i, &sb);
@@ -3277,67 +3314,78 @@ static void c3d_denoise_axis(float *restrict buf, size_t side,
                              float *restrict scratch_plane,
                              float *restrict scratch_row)
 {
+    (void)scratch_plane; (void)scratch_row;   /* per-thread now */
     const size_t SY = C3D_STRIDE_Y;
     const size_t SZ = C3D_STRIDE_Z;
     const float one_minus_a = 1.0f - alpha;
     const float third = alpha * (1.0f / 3.0f);
 
     if (axis == 2u) {
-        /* X pass: innermost contiguous row.  Uses the per-row helper. */
-        for (size_t z = 0; z < side; ++z)
-        for (size_t y = 0; y < side; ++y)
-            c3d_denoise_blur_x_row(&buf[z * SZ + y * SY], side, alpha, scratch_row);
+        /* X pass: each (z,y) row is independent.  One per-thread row scratch. */
+        #pragma omp parallel
+        {
+            float row_scratch[256];
+            #pragma omp for schedule(static)
+            for (size_t z = 0; z < side; ++z)
+            for (size_t y = 0; y < side; ++y)
+                c3d_denoise_blur_x_row(&buf[z * SZ + y * SY], side, alpha,
+                                       row_scratch);
+        }
         return;
     }
 
-    /* Y pass (axis == 1): for each z slice, for each y, we need rows y-1, y, y+1
-     * (contiguous in x) → write filtered row to scratch_plane[y], then copy
-     * scratch_plane back into buf's z-slice. */
+    /* Y pass: each z-slice is independent.  Per-thread plane scratch. */
     if (axis == 1u) {
-        for (size_t z = 0; z < side; ++z) {
-            float *plane = buf + z * SZ;
-            for (size_t y = 0; y < side; ++y) {
-                size_t y_l = (y > 0) ? y - 1 : y;
-                size_t y_r = (y + 1 < side) ? y + 1 : y;
-                const float *rl = plane + y_l * SY;
-                const float *rc = plane + y   * SY;
-                const float *rr = plane + y_r * SY;
-                float *out = scratch_plane + y * side;
-                for (size_t x = 0; x < side; ++x) {
-                    out[x] = one_minus_a * rc[x]
-                           + third * (rl[x] + rc[x] + rr[x]);
+        #pragma omp parallel
+        {
+            float plane_scratch[256 * 256];
+            #pragma omp for schedule(static)
+            for (size_t z = 0; z < side; ++z) {
+                float *plane = buf + z * SZ;
+                for (size_t y = 0; y < side; ++y) {
+                    size_t y_l = (y > 0) ? y - 1 : y;
+                    size_t y_r = (y + 1 < side) ? y + 1 : y;
+                    const float *rl = plane + y_l * SY;
+                    const float *rc = plane + y   * SY;
+                    const float *rr = plane + y_r * SY;
+                    float *out = plane_scratch + y * side;
+                    for (size_t x = 0; x < side; ++x) {
+                        out[x] = one_minus_a * rc[x]
+                               + third * (rl[x] + rc[x] + rr[x]);
+                    }
                 }
-            }
-            /* Copy scratch_plane back.  Memcpy is SIMD-fast. */
-            for (size_t y = 0; y < side; ++y) {
-                memcpy(plane + y * SY, scratch_plane + y * side,
-                       side * sizeof(float));
+                for (size_t y = 0; y < side; ++y) {
+                    memcpy(plane + y * SY, plane_scratch + y * side,
+                           side * sizeof(float));
+                }
             }
         }
         return;
     }
 
-    /* Z pass (axis == 0): for each y, for each z, we need slices z-1, z, z+1
-     * at (z, y, *).  Inner loop is over x (unit-stride). */
+    /* Z pass: each y-slab is independent.  Per-thread scratch. */
     if (axis == 0u) {
-        for (size_t y = 0; y < side; ++y) {
-            /* For each z we write one x-row of length `side` into
-             * scratch_plane[z].  After the z loop, copy back into buf. */
-            for (size_t z = 0; z < side; ++z) {
-                size_t z_l = (z > 0) ? z - 1 : z;
-                size_t z_r = (z + 1 < side) ? z + 1 : z;
-                const float *rl = buf + z_l * SZ + y * SY;
-                const float *rc = buf + z   * SZ + y * SY;
-                const float *rr = buf + z_r * SZ + y * SY;
-                float *out = scratch_plane + z * side;
-                for (size_t x = 0; x < side; ++x) {
-                    out[x] = one_minus_a * rc[x]
-                           + third * (rl[x] + rc[x] + rr[x]);
+        #pragma omp parallel
+        {
+            float plane_scratch[256 * 256];
+            #pragma omp for schedule(static)
+            for (size_t y = 0; y < side; ++y) {
+                for (size_t z = 0; z < side; ++z) {
+                    size_t z_l = (z > 0) ? z - 1 : z;
+                    size_t z_r = (z + 1 < side) ? z + 1 : z;
+                    const float *rl = buf + z_l * SZ + y * SY;
+                    const float *rc = buf + z   * SZ + y * SY;
+                    const float *rr = buf + z_r * SZ + y * SY;
+                    float *out = plane_scratch + z * side;
+                    for (size_t x = 0; x < side; ++x) {
+                        out[x] = one_minus_a * rc[x]
+                               + third * (rl[x] + rc[x] + rr[x]);
+                    }
                 }
-            }
-            for (size_t z = 0; z < side; ++z) {
-                memcpy(buf + z * SZ + y * SY, scratch_plane + z * side,
-                       side * sizeof(float));
+                for (size_t z = 0; z < side; ++z) {
+                    memcpy(buf + z * SZ + y * SY, plane_scratch + z * side,
+                           side * sizeof(float));
+                }
             }
         }
         return;
@@ -3549,7 +3597,6 @@ void c3d_decoder_chunk_decode_lod(c3d_decoder *d,
         return;
     }
 
-    c3d_rans_tables tbl;
     unsigned n_sb = c3d_n_subbands_for_lod[lod];
 
     /* Warm the per-subband EXTERNAL-table cache when the ctx changes.  All
@@ -3582,51 +3629,83 @@ void c3d_decoder_chunk_decode_lod(c3d_decoder *d,
      * — appending bytes can only improve quality. */
     size_t entropy_avail = (in_len > C3D_CHUNK_FIXED_SIZE)
                          ? (in_len - C3D_CHUNK_FIXED_SIZE) : 0;
+
+    /* Pre-scan the per-subband offset table to find the first truncated
+     * subband.  Subbands before it decode in parallel; subbands at or
+     * after it get zero-filled serially (cheap).  This hoists the
+     * data-dependent early-break out of the parallel region. */
+    unsigned first_trunc = n_sb;
     for (unsigned s = 0; s < n_sb; ++s) {
-        c3d_subband_info sb;
-        c3d_subband_info_of(s, &sb);
-        float step  = c3d_read_f32_le(qmul_ptr + 4 * s);
-        float alpha;
-        if (ctx && ctx->has_laplacian_alpha) {
-            alpha = ctx->laplacian_alpha[s];
-        } else {
-            uint8_t av = alpha_ptr[s];
-            alpha = av ? c3d_alpha_from_u8(av) : c3d_default_alpha(s);
-        }
-        const uint32_t *ext_freqs = (ctx && ctx->has_freq_tables) ? ctx->freqs[s] : NULL;
-        uint32_t ext_ds           = (ctx && ctx->has_freq_tables) ? ctx->denom_shifts[s] : 0u;
-        /* §T13: per-subband dz_ratio from ctx if trained; else kind-default. */
-        float dz_ratio = (ctx && ctx->has_dz_ratio) ? ctx->dz_ratio[s]
-                       : c3d_dz_ratio_for_kind(c3d_kind_h_count(sb.kind));
-
         uint32_t sub_start = c3d_read_u32_le(suboff_ptr + 4 * s);
-        uint32_t sub_end;
-        if (s + 1 < n_sb) {
-            sub_end = c3d_read_u32_le(suboff_ptr + 4 * (s + 1));
-        } else {
-            sub_end = lod_end;
-        }
+        uint32_t sub_end   = (s + 1 < n_sb)
+                           ? c3d_read_u32_le(suboff_ptr + 4 * (s + 1))
+                           : lod_end;
         c3d_assert(sub_end >= sub_start);
+        if (sub_end > entropy_avail) { first_trunc = s; break; }
+    }
 
-        bool truncated = (sub_end > entropy_avail);
-        if (truncated) {
-            /* §T9: zero-fill this subband and every later one.  Break early. */
-            for (unsigned sz = s; sz < n_sb; ++sz) {
-                c3d_subband_info sbz;
-                c3d_subband_info_of(sz, &sbz);
-                for (uint32_t z = sbz.z0; z < sbz.z0 + sbz.side; ++z)
-                for (uint32_t y = sbz.y0; y < sbz.y0 + sbz.side; ++y)
-                for (uint32_t x = sbz.x0; x < sbz.x0 + sbz.side; ++x)
-                    d->coeff_buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + x] = 0.0f;
+    /* Parallel decode of [0, first_trunc).  Each thread uses its own
+     * per-thread sub_symbols scratch from d->thread_sub_symbols (arena:
+     * allocated once, reused across chunks).  tbl is per-thread on stack
+     * (~100 KB — fine).  Dynamic scheduling with a chunk size of 1
+     * balances the wide range of subband sizes (8³=512 vox to 128³=2 M). */
+    #pragma omp parallel
+    {
+        int tid = 0;
+#ifdef _OPENMP
+        tid = omp_get_thread_num();
+#endif
+        uint8_t *tls_syms;
+        if (tid < C3D_OMP_MAX_THREADS) {
+            if (!d->thread_sub_symbols[tid]) {
+                d->thread_sub_symbols[tid] = malloc((size_t)128 * 128 * 128);
+                c3d_assert(d->thread_sub_symbols[tid]);
             }
-            break;
+            tls_syms = d->thread_sub_symbols[tid];
+        } else {
+            /* Over-subscribed: fall back to thread-0 scratch.  Rare but
+             * safe — only one such thread runs any given subband at a time
+             * under dynamic scheduling. */
+            tls_syms = d->thread_sub_symbols[0];
         }
+        c3d_rans_tables tls_tbl;
+        #pragma omp for schedule(dynamic,1)
+        for (unsigned s = 0; s < first_trunc; ++s) {
+            c3d_subband_info sb;
+            c3d_subband_info_of(s, &sb);
+            float step  = c3d_read_f32_le(qmul_ptr + 4 * s);
+            float alpha;
+            if (ctx && ctx->has_laplacian_alpha) {
+                alpha = ctx->laplacian_alpha[s];
+            } else {
+                uint8_t av = alpha_ptr[s];
+                alpha = av ? c3d_alpha_from_u8(av) : c3d_default_alpha(s);
+            }
+            const uint32_t *ext_freqs = (ctx && ctx->has_freq_tables) ? ctx->freqs[s] : NULL;
+            uint32_t ext_ds           = (ctx && ctx->has_freq_tables) ? ctx->denom_shifts[s] : 0u;
+            float dz_ratio = (ctx && ctx->has_dz_ratio) ? ctx->dz_ratio[s]
+                           : c3d_dz_ratio_for_kind(c3d_kind_h_count(sb.kind));
+            uint32_t sub_start = c3d_read_u32_le(suboff_ptr + 4 * s);
+            uint32_t sub_end   = (s + 1 < n_sb)
+                               ? c3d_read_u32_le(suboff_ptr + 4 * (s + 1))
+                               : lod_end;
+            c3d_decode_one_subband(entropy + sub_start, sub_end - sub_start,
+                                   step, dz_ratio, alpha,
+                                   ext_freqs, ext_ds,
+                                   d->coeff_buf, &sb, tls_syms, &tls_tbl,
+                                   cached_ext ? &cached_ext[s] : NULL);
+        }
+        /* tls_syms is arena-owned by the decoder; do not free here. */
+    }
 
-        c3d_decode_one_subband(entropy + sub_start, sub_end - sub_start,
-                               step, dz_ratio, alpha,
-                               ext_freqs, ext_ds,
-                               d->coeff_buf, &sb, d->sub_symbols, &tbl,
-                               cached_ext ? &cached_ext[s] : NULL);
+    /* Serial zero-fill for truncated tail (§T9). */
+    for (unsigned sz = first_trunc; sz < n_sb; ++sz) {
+        c3d_subband_info sbz;
+        c3d_subband_info_of(sz, &sbz);
+        for (uint32_t z = sbz.z0; z < sbz.z0 + sbz.side; ++z)
+        for (uint32_t y = sbz.y0; y < sbz.y0 + sbz.side; ++y)
+        for (uint32_t x = sbz.x0; x < sbz.x0 + sbz.side; ++x)
+            d->coeff_buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + x] = 0.0f;
     }
 
     /* §T1b + §S2 — add LL_5 reference back per the chunk's flag bits.
