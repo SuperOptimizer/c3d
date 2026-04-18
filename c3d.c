@@ -1638,11 +1638,23 @@ static const unsigned c3d_n_subbands_for_lod[C3D_N_LODS] = {
  * The stateless c3d_chunk_encode/decode functions are now thin wrappers that
  * allocate a temporary context per call. */
 
+/* Max OpenMP threads we reserve per-thread scratch for.  Anything above
+ * this falls back to thread-0 scratch (still correct, just not parallel). */
+#define C3D_OMP_MAX_THREADS 32
+
 struct c3d_encoder {
     float   *coeff_buf;
     uint8_t *sub_symbols;
     uint8_t *sub_escapes;
     uint8_t *rans_scratch;
+    /* §S11 — per-thread scratch pools for the parallel subband-encode.
+     * Each pointer aliases the above at index 0; [1..N-1] lazy-allocated
+     * on first parallel encode.  thread_out_scratch holds one subband's
+     * output bytes before they're concatenated into the chunk buffer. */
+    uint8_t *thread_sub_symbols[C3D_OMP_MAX_THREADS];
+    uint8_t *thread_sub_escapes[C3D_OMP_MAX_THREADS];
+    uint8_t *thread_rans_scratch[C3D_OMP_MAX_THREADS];
+    uint8_t *thread_out_scratch [C3D_OMP_MAX_THREADS];
     float    dwt_scratch[2 * C3D_TILE_X * C3D_CHUNK_SIDE];
     /* Dynamic per-subband baselines (adaptive perceptual softness).  Populated
      * by c3d_encoder_chunk_encode from target_ratio; unused by encode_at_q
@@ -1707,10 +1719,6 @@ struct c3d_encoder {
     bool     has_log_rd_slope;
 };
 
-/* Max OpenMP threads we reserve per-thread scratch for.  Anything above
- * this falls back to thread-0 scratch (still correct, just not parallel). */
-#define C3D_OMP_MAX_THREADS 32
-
 struct c3d_decoder {
     float   *coeff_buf;
     uint8_t *sub_symbols;
@@ -1744,6 +1752,15 @@ c3d_encoder *c3d_encoder_new(void) {
     e->sub_escapes  = malloc((size_t)128 * 128 * 128 / 4 + 1024);
     e->rans_scratch = malloc((size_t)128 * 128 * 128 * 2 + 1024);
     c3d_assert(e->coeff_buf && e->sub_symbols && e->sub_escapes && e->rans_scratch);
+    memset(e->thread_sub_symbols, 0, sizeof e->thread_sub_symbols);
+    memset(e->thread_sub_escapes, 0, sizeof e->thread_sub_escapes);
+    memset(e->thread_rans_scratch,0, sizeof e->thread_rans_scratch);
+    memset(e->thread_out_scratch, 0, sizeof e->thread_out_scratch);
+    e->thread_sub_symbols [0] = e->sub_symbols;
+    e->thread_sub_escapes [0] = e->sub_escapes;
+    e->thread_rans_scratch[0] = e->rans_scratch;
+    /* thread_out_scratch[0] stays NULL; thread 0 writes directly to `out` when
+     * it's the only thread (single-thread path bypasses the scratch copy). */
     e->has_dyn_baselines = false;
     e->has_max_abs = false;
     e->last_q = 0.0f;
@@ -1762,6 +1779,15 @@ void c3d_encoder_free(c3d_encoder *e) {
     if (!e) return;
     free(e->coeff_buf);   free(e->sub_symbols);
     free(e->sub_escapes); free(e->rans_scratch);
+    /* thread_* slot 0 aliased the three above; slots 1..N-1 are independently
+     * allocated.  thread_out_scratch[0] was NULL. */
+    for (unsigned i = 1; i < C3D_OMP_MAX_THREADS; ++i) {
+        free(e->thread_sub_symbols [i]);
+        free(e->thread_sub_escapes [i]);
+        free(e->thread_rans_scratch[i]);
+    }
+    for (unsigned i = 0; i < C3D_OMP_MAX_THREADS; ++i)
+        free(e->thread_out_scratch[i]);
     free(e);
 }
 
@@ -2868,54 +2894,163 @@ static double c3d_estimate_entropy_at_q(float q, const c3d_encoder *s,
  *   - has_freq_tables: uses ctx's freqs, emits freq_table_size = 0 per subband
  * Writes entropy payload into out[352..], fills qmul/subband_offset/lod_offset
  * tables.  Returns total chunk size (352 + entropy bytes). */
-static size_t c3d_emit_entropy_at_q(float q, const c3d_encoder *s,
+static size_t c3d_emit_entropy_at_q(float q, const c3d_encoder *s_const,
                                     const c3d_ctx *ctx,
                                     uint8_t *out, size_t out_cap)
 {
+    /* We need to mutate s->thread_* lazy pools on first use.  `s` is
+     * logically still `const` w.r.t. the compressed-data semantics. */
+    c3d_encoder *s = (c3d_encoder *)s_const;
+
     uint8_t *qmul_ptr   = out + 40;
     uint8_t *suboff_ptr = out + 40 + 144;
     uint8_t *lodoff_ptr = out + 40 + 144 + 144;
     uint8_t *alpha_ptr  = out + C3D_CHUNK_ALPHA_OFFSET;
 
-    size_t entropy_pos = 0;
     const size_t entropy_cap = out_cap - C3D_CHUNK_FIXED_SIZE;
     const size_t rans_scratch_size = (size_t)128 * 128 * 128 * 2 + 1024;
 
-
-    for (unsigned i = 0; i < C3D_N_SUBBANDS; ++i) {
-        c3d_subband_info sb;
-        c3d_subband_info_of(i, &sb);
-        float step;
-        if (s->has_allocator_steps) {
-            step = s->allocator_steps[i];
-        } else {
-            float baseline = (ctx && ctx->has_quantizer_baseline) ? ctx->quantizer_baseline[i]
-                           : s->has_dyn_baselines                 ? s->dyn_baselines[i]
-                                                                    : c3d_subband_baseline(i);
-            step = q * baseline * s->coeff_scale;
+    /* Fast path: single-thread.  Skip the parallel scaffolding (thread
+     * scratch allocation, per-subband malloc + memcpy) and write the
+     * subband bytes straight into `out` as before. */
+    int n_threads_now = 1;
+#ifdef _OPENMP
+    n_threads_now = omp_get_max_threads();
+#endif
+    if (n_threads_now <= 1) {
+        size_t entropy_pos = 0;
+        for (unsigned i = 0; i < C3D_N_SUBBANDS; ++i) {
+            c3d_subband_info sb;
+            c3d_subband_info_of(i, &sb);
+            float step;
+            if (s->has_allocator_steps) {
+                step = s->allocator_steps[i];
+            } else {
+                float baseline = (ctx && ctx->has_quantizer_baseline) ? ctx->quantizer_baseline[i]
+                               : s->has_dyn_baselines                 ? s->dyn_baselines[i]
+                                                                        : c3d_subband_baseline(i);
+                step = q * baseline * s->coeff_scale;
+            }
+            uint32_t denom_shift = (ctx && ctx->has_freq_tables) ? ctx->denom_shifts[i]
+                                                                  : c3d_default_denom_shift(i);
+            float dz_ratio = (ctx && ctx->has_dz_ratio) ? ctx->dz_ratio[i]
+                           : c3d_dz_ratio_for_kind(c3d_kind_h_count(sb.kind));
+            c3d_write_f32_le(qmul_ptr + 4 * i, step);
+            c3d_write_u32_le(suboff_ptr + 4 * i, (uint32_t)entropy_pos);
+            float max_abs = s->has_max_abs ? s->max_abs_per_subband[i] : s->coeff_scale;
+            float fitted_alpha = c3d_default_alpha(i);
+            size_t bytes = c3d_encode_one_subband(
+                s->coeff_buf, &sb, step, dz_ratio, denom_shift,
+                (ctx && ctx->has_freq_tables) ? ctx->freqs[i] : NULL,
+                s->sub_symbols, s->sub_escapes,
+                s->rans_scratch, rans_scratch_size,
+                out + C3D_CHUNK_FIXED_SIZE + entropy_pos,
+                entropy_cap - entropy_pos,
+                max_abs, &fitted_alpha);
+            alpha_ptr[i] = c3d_alpha_to_u8(fitted_alpha);
+            entropy_pos += bytes;
         }
-        uint32_t denom_shift = (ctx && ctx->has_freq_tables) ? ctx->denom_shifts[i]
-                                                              : c3d_default_denom_shift(i);
-        /* §T13: per-subband dz_ratio from ctx if trained; else kind-default. */
-        float dz_ratio = (ctx && ctx->has_dz_ratio) ? ctx->dz_ratio[i]
-                       : c3d_dz_ratio_for_kind(c3d_kind_h_count(sb.kind));
+        c3d_write_u32_le(lodoff_ptr + 4 * 5, c3d_read_u32_le(suboff_ptr + 4 * 1));
+        c3d_write_u32_le(lodoff_ptr + 4 * 4, c3d_read_u32_le(suboff_ptr + 4 * 8));
+        c3d_write_u32_le(lodoff_ptr + 4 * 3, c3d_read_u32_le(suboff_ptr + 4 * 15));
+        c3d_write_u32_le(lodoff_ptr + 4 * 2, c3d_read_u32_le(suboff_ptr + 4 * 22));
+        c3d_write_u32_le(lodoff_ptr + 4 * 1, c3d_read_u32_le(suboff_ptr + 4 * 29));
+        c3d_write_u32_le(lodoff_ptr + 4 * 0, (uint32_t)entropy_pos);
+        return C3D_CHUNK_FIXED_SIZE + entropy_pos;
+    }
 
-        c3d_write_f32_le(qmul_ptr + 4 * i, step);
+    /* Per-subband output sizes + fitted α, collected by the parallel region
+     * and consumed serially to compute offsets + copy bytes into `out`. */
+    size_t  sub_bytes[C3D_N_SUBBANDS];
+    float   sub_alpha[C3D_N_SUBBANDS];
+    float   sub_step [C3D_N_SUBBANDS];
+    uint8_t *sub_out_ptr[C3D_N_SUBBANDS];
+
+    /* Upper-bound the per-subband output: max is ~2× max subband bytes
+     * (worst-case after freq table + rANS). */
+    const size_t out_scratch_size = (size_t)2 * 128 * 128 * 128 + 4096;
+
+    #pragma omp parallel
+    {
+        int tid = 0;
+#ifdef _OPENMP
+        tid = omp_get_thread_num();
+#endif
+        if (tid >= C3D_OMP_MAX_THREADS) tid = 0;
+
+        /* Lazy-alloc per-thread scratch pools.  Thread 0 aliases the encoder's
+         * original sub_symbols / sub_escapes / rans_scratch — no extra alloc. */
+        #pragma omp critical(c3d_enc_alloc)
+        {
+            if (!s->thread_sub_symbols [tid]) s->thread_sub_symbols [tid] = malloc((size_t)128*128*128);
+            if (!s->thread_sub_escapes [tid]) s->thread_sub_escapes [tid] = malloc((size_t)128*128*128/4 + 1024);
+            if (!s->thread_rans_scratch[tid]) s->thread_rans_scratch[tid] = malloc(rans_scratch_size);
+            if (!s->thread_out_scratch [tid]) s->thread_out_scratch [tid] = malloc(out_scratch_size);
+            c3d_assert(s->thread_sub_symbols [tid]);
+            c3d_assert(s->thread_sub_escapes [tid]);
+            c3d_assert(s->thread_rans_scratch[tid]);
+            c3d_assert(s->thread_out_scratch [tid]);
+        }
+
+        uint8_t *t_syms = s->thread_sub_symbols [tid];
+        uint8_t *t_esc  = s->thread_sub_escapes [tid];
+        uint8_t *t_rans = s->thread_rans_scratch[tid];
+        uint8_t *t_out  = s->thread_out_scratch [tid];
+
+        /* 36 subbands with wide size range → dynamic,1. */
+        #pragma omp for schedule(dynamic,1)
+        for (unsigned i = 0; i < C3D_N_SUBBANDS; ++i) {
+            c3d_subband_info sb;
+            c3d_subband_info_of(i, &sb);
+            float step;
+            if (s->has_allocator_steps) {
+                step = s->allocator_steps[i];
+            } else {
+                float baseline = (ctx && ctx->has_quantizer_baseline) ? ctx->quantizer_baseline[i]
+                               : s->has_dyn_baselines                 ? s->dyn_baselines[i]
+                                                                        : c3d_subband_baseline(i);
+                step = q * baseline * s->coeff_scale;
+            }
+            uint32_t denom_shift = (ctx && ctx->has_freq_tables) ? ctx->denom_shifts[i]
+                                                                  : c3d_default_denom_shift(i);
+            float dz_ratio = (ctx && ctx->has_dz_ratio) ? ctx->dz_ratio[i]
+                           : c3d_dz_ratio_for_kind(c3d_kind_h_count(sb.kind));
+            float max_abs = s->has_max_abs ? s->max_abs_per_subband[i] : s->coeff_scale;
+
+            float fitted_alpha = c3d_default_alpha(i);
+            size_t bytes = c3d_encode_one_subband(
+                s->coeff_buf, &sb, step, dz_ratio, denom_shift,
+                (ctx && ctx->has_freq_tables) ? ctx->freqs[i] : NULL,
+                t_syms, t_esc, t_rans, rans_scratch_size,
+                t_out, out_scratch_size,
+                max_abs, &fitted_alpha);
+
+            sub_bytes[i] = bytes;
+            sub_alpha[i] = fitted_alpha;
+            sub_step [i] = step;
+            /* t_out gets overwritten on the worker's next iteration under
+             * dynamic scheduling, so copy the bytes into a per-subband
+             * owned buffer that survives.  36 small mallocs per encode —
+             * the serial concat loop below frees them. */
+            uint8_t *owned = malloc(bytes);
+            c3d_assert(owned);
+            memcpy(owned, t_out, bytes);
+            sub_out_ptr[i] = owned;
+        }
+    }
+
+    /* Serial: compute entropy offsets, copy each subband's bytes into `out`,
+     * free the per-subband owned buffers. */
+    size_t entropy_pos = 0;
+    for (unsigned i = 0; i < C3D_N_SUBBANDS; ++i) {
+        c3d_write_f32_le(qmul_ptr + 4 * i, sub_step[i]);
         c3d_write_u32_le(suboff_ptr + 4 * i, (uint32_t)entropy_pos);
-
-        float max_abs = s->has_max_abs ? s->max_abs_per_subband[i] : s->coeff_scale;
-
-        float fitted_alpha = c3d_default_alpha(i);
-        size_t bytes = c3d_encode_one_subband(
-            s->coeff_buf, &sb, step, dz_ratio, denom_shift,
-            (ctx && ctx->has_freq_tables) ? ctx->freqs[i] : NULL,
-            s->sub_symbols, s->sub_escapes,
-            s->rans_scratch, rans_scratch_size,
-            out + C3D_CHUNK_FIXED_SIZE + entropy_pos,
-            entropy_cap - entropy_pos,
-            max_abs, &fitted_alpha);
-        alpha_ptr[i] = c3d_alpha_to_u8(fitted_alpha);
-        entropy_pos += bytes;
+        alpha_ptr[i] = c3d_alpha_to_u8(sub_alpha[i]);
+        c3d_assert(entropy_pos + sub_bytes[i] <= entropy_cap);
+        memcpy(out + C3D_CHUNK_FIXED_SIZE + entropy_pos,
+               sub_out_ptr[i], sub_bytes[i]);
+        entropy_pos += sub_bytes[i];
+        free(sub_out_ptr[i]);
     }
 
     /* LOD offsets: the cumulative sizes at resolution boundaries.  Subband
