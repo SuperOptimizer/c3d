@@ -24,14 +24,28 @@
 #  include <omp.h>
 #endif
 
-/* Architecture-specific SIMD.  Guarded so portable C is always the fallback. */
-#if defined(__ARM_NEON)
-#  include <arm_neon.h>
-#  define C3D_HAVE_NEON 1
-#endif
-#if defined(__AVX2__)
+/* Architecture-specific SIMD.  Guarded so portable C is always the fallback.
+ *
+ * Selection priority: C3D_SIMD (from CMake) sets C3D_FORCE_SCALAR /
+ * C3D_FORCE_AVX2 / C3D_FORCE_AVX512 / C3D_FORCE_NEON; otherwise we auto-detect
+ * from compiler predefines.  Targets that hit neither branch fall through to
+ * the portable scalar path, which is always correct (just slower).
+ *
+ * C3D_HAVE_AVX512 implies C3D_HAVE_AVX2.  C3D_HAVE_NEON is aarch64-only.  The
+ * hot kernels are gated with `#if C3D_HAVE_AVX512 / #elif C3D_HAVE_AVX2 /
+ * #elif C3D_HAVE_NEON / #else scalar`. */
+#if defined(C3D_FORCE_SCALAR)
+    /* nothing */
+#elif defined(C3D_FORCE_AVX512) || (!defined(C3D_FORCE_AVX2) && !defined(C3D_FORCE_NEON) && defined(__AVX512F__))
 #  include <immintrin.h>
 #  define C3D_HAVE_AVX2 1
+#  define C3D_HAVE_AVX512 1
+#elif defined(C3D_FORCE_AVX2) || (!defined(C3D_FORCE_NEON) && defined(__AVX2__))
+#  include <immintrin.h>
+#  define C3D_HAVE_AVX2 1
+#elif defined(C3D_FORCE_NEON) || defined(__ARM_NEON)
+#  include <arm_neon.h>
+#  define C3D_HAVE_NEON 1
 #endif
 
 /* ========================================================================= *
@@ -115,6 +129,7 @@ static inline void c3d_check_voxel_alignment(const void *p) {
 /* ----- 12-bit Morton (shard chunk-index ordering) ------------------------- *
  * Chunk coords are 4 bits each; Morton interleaves as z3 y3 x3 ... z0 y0 x0. */
 
+C3D_CONST
 static inline uint32_t c3d_morton12(uint32_t cx, uint32_t cy, uint32_t cz) {
     c3d_assert(cx < 16 && cy < 16 && cz < 16);
     /* Spread 4 bits of each to every third bit, then combine. */
@@ -656,7 +671,9 @@ static void c3d_rans_dec_x8_ctx(const uint8_t *in, size_t in_len,
  * freq ≥ 1" invariant required by rANS (a zero-prob symbol can't be encoded).
  */
 
-/* Count each symbol value 0..64 into hist[65]. */
+#ifdef C3D_BUILD_REF
+/* Count each symbol value 0..64 into hist[65].  Only used by c3d_test for
+ * round-trip checks of the freq-table build path. */
 static void c3d_histogram65(const uint8_t *symbols, size_t n, uint32_t hist[65]) {
     memset(hist, 0, 65 * sizeof(uint32_t));
     for (size_t i = 0; i < n; ++i) {
@@ -664,6 +681,7 @@ static void c3d_histogram65(const uint8_t *symbols, size_t n, uint32_t hist[65])
         hist[symbols[i]]++;
     }
 }
+#endif
 
 /* Normalise a 65-entry histogram so the nonzero entries sum to M = 1<<denom_shift.
  * Every originally-nonzero entry ends ≥ 1.  Writes freqs[65].
@@ -873,7 +891,7 @@ static void c3d_cdf97_lift_inv(float *x, size_t N) {
  * stores emit the split halves.  ~2-3× speed vs the scalar two-pass loop. */
 static void c3d_deinterleave(float *x, size_t N, float *aux) {
     size_t half = N / 2;
-#if C3D_HAVE_NEON
+#ifdef C3D_HAVE_NEON
     size_t i = 0;
     for (; i + 8 <= N; i += 8) {
         float32x4x2_t p = vld2q_f32(x + i);
@@ -884,6 +902,14 @@ static void c3d_deinterleave(float *x, size_t N, float *aux) {
         aux[i / 2]        = x[i];
         aux[half + i / 2] = x[i + 1];
     }
+#elif defined(C3D_HAVE_AVX2)
+    /* AVX2 has no hardware stride-2 deinterleaving load (unlike NEON vld2q).
+     * Shuffle + permute2f128 chains are possible but the scalar pair-copy
+     * below vectorises cleanly under -O3 via gathers / simple lane swaps, so
+     * the extra code is not worth it for a rarely-called helper.  Left here
+     * as a hook if profiling shows this path is hot on amd64. */
+    for (size_t i = 0; i < half; ++i) aux[i]        = x[2 * i];
+    for (size_t i = 0; i < half; ++i) aux[half + i] = x[2 * i + 1];
 #else
     for (size_t i = 0; i < half; ++i) aux[i]        = x[2 * i];
     for (size_t i = 0; i < half; ++i) aux[half + i] = x[2 * i + 1];
@@ -893,7 +919,7 @@ static void c3d_deinterleave(float *x, size_t N, float *aux) {
 /* Interleave [evens | odds] back into x[0..N).  Mirror of the above. */
 static void c3d_interleave(float *x, size_t N, float *aux) {
     size_t half = N / 2;
-#if C3D_HAVE_NEON
+#ifdef C3D_HAVE_NEON
     size_t i = 0;
     for (; i + 8 <= N; i += 8) {
         float32x4x2_t p;
@@ -938,7 +964,7 @@ static void c3d_dwt_1d_inv(float *x, size_t N, float *aux) {
  * makes the hot inner memory ops inlineable.  Compiler trivially fuses
  * the pair when the data is aligned. */
 static inline void c3d_copy8(float *restrict dst, const float *restrict src) {
-#if C3D_HAVE_NEON
+#ifdef C3D_HAVE_NEON
     float32x4_t a = vld1q_f32(src);
     float32x4_t b = vld1q_f32(src + 4);
     vst1q_f32(dst,     a);
@@ -1052,8 +1078,12 @@ static void c3d_dwt_1d_inv_x4(float *restrict x, size_t N, float *restrict aux) 
 #define C3D_Y_TILE  C3D_TILE_X
 #define C3D_Z_TILE  C3D_TILE_X
 
-static void c3d_dwt3_fwd_level(float *buf, size_t side, float *scratch) {
+static void c3d_dwt3_fwd_level(float *restrict buf, size_t side, float *scratch) {
     (void)scratch;  /* per-thread buffers supersede the shared scratch. */
+    buf = __builtin_assume_aligned(buf, C3D_ALIGN);
+    /* side ∈ {256,128,64,32,16}: power-of-2 ≥ 16, ≤ 256. */
+    c3d_invariant(side >= 16u && side <= 256u);
+    c3d_invariant((side & (side - 1u)) == 0u);
 
     /* X pass — row stride 1, contiguous.  Outer z loop is parallelised;
      * each thread gets its own aux (512 floats = 2 KB on stack). */
@@ -1107,8 +1137,11 @@ static void c3d_dwt3_fwd_level(float *buf, size_t side, float *scratch) {
     }
 }
 
-static void c3d_dwt3_inv_level(float *buf, size_t side, float *scratch) {
+static void c3d_dwt3_inv_level(float *restrict buf, size_t side, float *scratch) {
     (void)scratch;  /* per-thread buffers supersede the shared scratch. */
+    buf = __builtin_assume_aligned(buf, C3D_ALIGN);
+    c3d_invariant(side >= 16u && side <= 256u);
+    c3d_invariant((side & (side - 1u)) == 0u);
 
     c3d_assert((side & 3u) == 0);
     /* Inverse order: Z, Y, X — each pass parallelised over its outer loop. */
@@ -1161,7 +1194,7 @@ static void c3d_dwt3_inv_level(float *buf, size_t side, float *scratch) {
 
 /* Full 5-level forward DWT on a 256³ f32 buffer.
  * scratch must be ≥ 8 * C3D_CHUNK_SIDE floats (2 KiB). */
-static void c3d_dwt3_fwd(float *buf, float *scratch) {
+static void c3d_dwt3_fwd(float *restrict buf, float *scratch) {
     size_t side = C3D_CHUNK_SIDE;
     for (unsigned lvl = 0; lvl < C3D_N_DWT_LEVELS; ++lvl) {
         c3d_dwt3_fwd_level(buf, side, scratch);
@@ -1173,7 +1206,7 @@ static void c3d_dwt3_fwd(float *buf, float *scratch) {
  *   n=0 → no inverse (output is LLL_5 at [0:8, 0:8, 0:8]).
  *   n=k → synthesise levels 5, 4, ..., 6-k; output is LLL_{5-k} at [0:(8<<k), ...].
  *   n=5 → full inverse, output at [0:256, 0:256, 0:256]. */
-static void c3d_dwt3_inv_levels(float *buf, unsigned n_synth_levels, float *scratch) {
+static void c3d_dwt3_inv_levels(float *restrict buf, unsigned n_synth_levels, float *scratch) {
     c3d_assert(n_synth_levels <= C3D_N_DWT_LEVELS);
     for (unsigned i = 0; i < n_synth_levels; ++i) {
         size_t active_side = (size_t)16u << i;   /* 16, 32, 64, 128, 256 */
@@ -1213,6 +1246,7 @@ static inline float c3d_dz_ratio_for_kind(unsigned h_count) {
  * the subband's kind via c3d_dz_ratio_for_kind() × step.
  *   |c| < dz_half     → 0
  *   |c| ≥ dz_half     → sign(c) * (floor((|c| - dz_half) / step) + 1) */
+C3D_CONST
 static inline int32_t c3d_quant(float c, float step, float dz_half) {
     float ac = (c < 0.0f) ? -c : c;
     if (ac < dz_half) return 0;
@@ -1223,6 +1257,7 @@ static inline int32_t c3d_quant(float c, float step, float dz_half) {
 /* Mid-tread dequantizer.  Bin k (k≥1) spans [dz_half + (k-1)·step,
  * dz_half + k·step]; reconstruction = dz_half + (k - 1 + α)·step
  * where α∈[0.25,0.50] picks the Laplacian-optimal position in the bin. */
+C3D_CONST
 static inline float c3d_dequant(int32_t q, float step, float dz_half, float alpha) {
     if (q == 0) return 0.0f;
     float aq  = (float)((q < 0) ? -q : q);
@@ -1231,17 +1266,20 @@ static inline float c3d_dequant(int32_t q, float step, float dz_half, float alph
 }
 
 /* Look up dz_half for a subband from its kind. */
+C3D_CONST
 static inline float c3d_dz_half_for_kind(unsigned kind, float step) {
     return c3d_dz_ratio_for_kind(c3d_kind_h_count(kind)) * step;
 }
 
 /* Standard 32-bit zigzag: signed ↔ unsigned bijection.
  *   0 → 0, -1 → 1, 1 → 2, -2 → 3, 2 → 4, ...  */
+C3D_CONST
 static inline uint32_t c3d_zigzag32(int32_t v) {
     return ((uint32_t)v << 1) ^ (uint32_t)(v >> 31);
 }
+C3D_CONST
 static inline int32_t c3d_unzigzag32(uint32_t z) {
-    return (int32_t)((z >> 1) ^ -(int32_t)(z & 1u));
+    return (int32_t)((z >> 1) ^ (uint32_t)-(int32_t)(z & 1u));
 }
 
 /* --- Sign-predictive symbol mapping ---
@@ -1301,6 +1339,7 @@ static inline int32_t c3d_symbol_to_quant(uint8_t sym, uint32_t escape_mag,
 
 /* Helper: extract |qv| from a sign-predictive symbol (for α fit / wsum).
  * Does NOT update sign_pred — read-only convenience. */
+C3D_CONST
 static inline uint32_t c3d_sym_magnitude(uint8_t sym) {
     if (sym == 0) return 0;
     if (C3D_SYM_IS_ESCAPE(sym)) return 32u; /* approximate; real mag in escape stream */
@@ -1371,8 +1410,10 @@ static void c3d_subband_info_of(unsigned idx, c3d_subband_info *info) {
     info->x0 = x_hi * s;
 }
 
-/* Extract a subband's coefficients from the 3D buffer into a flat array,
- * row-major (z outermost).  Returns count = side^3. */
+#ifdef C3D_BUILD_REF
+/* Extract / scatter a subband region into a packed flat array.  Only used
+ * by c3d_test for round-trip verification; the live codec path operates on
+ * the 3D buffer in place via subband_info coordinates. */
 static size_t c3d_subband_extract(const float *buf,
                                   const c3d_subband_info *sb,
                                   float *out_flat)
@@ -1396,79 +1437,7 @@ static void c3d_subband_scatter(float *buf,
         buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + x] = in_flat[count++];
     }
 }
-
-/* --- Cross-scale prediction ------------------------------------------------ *
- *
- * For detail subbands at levels 4..1, predict each coefficient from its
- * "parent" in the same-kind subband one level coarser.  The parent of
- * coefficient at local (z,y,x) within a side-S child subband is at
- * (z/2, y/2, x/2) in the side-S/2 parent (nearest-neighbour upsample).
- *
- * Parent index: for subband index i >= 8, parent = i - 7.  Level-5
- * subbands (indices 0-7) have no parent.
- *
- * Encoder: after encoding a parent subband, reconstruct it in coeff_buf
- * (quant+dequant).  Before encoding a child, subtract the parent prediction.
- * Decoder: after decoding a child, add the parent prediction (parent was
- * already decoded and is in coeff_buf).
- *
- * Reduces child subband variance → better entropy coding → +0.3-0.5 dB. */
-
-static inline int c3d_parent_subband(unsigned idx) {
-    return (idx >= 8) ? (int)(idx - 7) : -1;
-}
-
-static void c3d_reconstruct_subband_inplace(float *buf,
-                                            const c3d_subband_info *sb,
-                                            float step, float alpha)
-{
-    float dz_half = c3d_dz_half_for_kind(sb->kind, step);
-    for (uint32_t z = sb->z0; z < sb->z0 + sb->side; ++z)
-    for (uint32_t y = sb->y0; y < sb->y0 + sb->side; ++y)
-    for (uint32_t x = sb->x0; x < sb->x0 + sb->side; ++x) {
-        size_t pos = z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + x;
-        int32_t qv = c3d_quant(buf[pos], step, dz_half);
-        buf[pos] = c3d_dequant(qv, step, dz_half, alpha);
-    }
-}
-
-static float c3d_subtract_parent_prediction(float *buf,
-                                            const c3d_subband_info *child,
-                                            const c3d_subband_info *parent)
-{
-    float max_abs = 0.0f;
-    for (uint32_t z = 0; z < child->side; ++z)
-    for (uint32_t y = 0; y < child->side; ++y)
-    for (uint32_t x = 0; x < child->side; ++x) {
-        size_t cpos = (child->z0 + z) * C3D_STRIDE_Z
-                    + (child->y0 + y) * C3D_STRIDE_Y
-                    + (child->x0 + x);
-        size_t ppos = (parent->z0 + z / 2) * C3D_STRIDE_Z
-                    + (parent->y0 + y / 2) * C3D_STRIDE_Y
-                    + (parent->x0 + x / 2);
-        buf[cpos] -= buf[ppos];
-        float a = fabsf(buf[cpos]);
-        if (a > max_abs) max_abs = a;
-    }
-    return max_abs;
-}
-
-static void c3d_add_parent_prediction(float *buf,
-                                      const c3d_subband_info *child,
-                                      const c3d_subband_info *parent)
-{
-    for (uint32_t z = 0; z < child->side; ++z)
-    for (uint32_t y = 0; y < child->side; ++y)
-    for (uint32_t x = 0; x < child->side; ++x) {
-        size_t cpos = (child->z0 + z) * C3D_STRIDE_Z
-                    + (child->y0 + y) * C3D_STRIDE_Y
-                    + (child->x0 + x);
-        size_t ppos = (parent->z0 + z / 2) * C3D_STRIDE_Z
-                    + (parent->y0 + y / 2) * C3D_STRIDE_Y
-                    + (parent->x0 + x / 2);
-        buf[cpos] += buf[ppos];
-    }
-}
+#endif
 
 /* ========================================================================= *
  *  §G/§H/§I  Chunk encoder + decoder (SELF mode only for now)               *
@@ -1551,6 +1520,7 @@ static inline float c3d_alpha_from_u8(uint8_t v) {
 static float c3d_subband_baseline_table[C3D_N_SUBBANDS];
 static bool  c3d_subband_baseline_init = false;
 
+C3D_CONST
 static unsigned c3d_kind_h_count(unsigned kind) {
     switch (kind) {
     case 0: return 0;                       /* LLL_5               */
@@ -1598,6 +1568,7 @@ static inline float c3d_subband_baseline(unsigned i) {
  * finest HF bands to M=1024: LUT shrinks from 4 KiB to 1 KiB but each symbol
  * consumes fewer fractional bits of state → renorm reads ~12 % more bytes,
  * net decode regressed 15-20 % at fine q.  The LUT was already L1-resident. */
+C3D_CONST
 static inline uint32_t c3d_default_denom_shift(unsigned i) {
     return (i == 0) ? 14u : 12u;
 }
@@ -2047,7 +2018,7 @@ static void c3d_build_fine_hist(c3d_encoder *s) {
         for (uint32_t z = sb.z0; z < sb.z0 + sb.side; ++z)
         for (uint32_t y = sb.y0; y < sb.y0 + sb.side; ++y) {
             const float *row = &s->coeff_buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + sb.x0];
-#if C3D_HAVE_NEON
+#ifdef C3D_HAVE_NEON
             float32x4_t vinv = vdupq_n_f32(inv_w);
             uint32x4_t vclip = vdupq_n_u32(C3D_FINE_BINS - 1u);
             uint32_t xx = 0;
@@ -2071,7 +2042,7 @@ static void c3d_build_fine_hist(c3d_encoder *s) {
                 bin_row[xx] = b;
             }
 #endif
-            for (uint32_t xx = 0; xx < sb.side; ++xx) pref[bin_row[xx] + 1]++;
+            for (uint32_t xh = 0; xh < sb.side; ++xh) pref[bin_row[xh] + 1]++;
         }
         for (unsigned i = 1; i <= C3D_FINE_BINS; ++i) pref[i] += pref[i - 1];
     }
@@ -2085,14 +2056,19 @@ static void c3d_build_fine_hist(c3d_encoder *s) {
  * encoding panics.  freq_table_size is written as 0 in this mode.
  * §T13: dz_ratio is looked up by caller (ctx override or kind default). */
 static size_t c3d_encode_one_subband(
-    const float *coeff_buf, const c3d_subband_info *sb,
+    const float *restrict coeff_buf, const c3d_subband_info *sb,
     float step, float dz_ratio, uint32_t denom_shift,
     const uint32_t *external_freqs,
-    uint8_t *sub_symbols, uint8_t *sub_escapes,
-    uint8_t *rans_scratch, size_t rans_scratch_size,
-    uint8_t *out, size_t out_cap,
+    uint8_t *restrict sub_symbols, uint8_t *restrict sub_escapes,
+    uint8_t *restrict rans_scratch, size_t rans_scratch_size,
+    uint8_t *restrict out, size_t out_cap,
     float max_abs, float *out_alpha)
 {
+    /* Subband sides are always one of {8,16,32,64,128}, power-of-2, and
+     * ≥ 8 (LLL_5).  Telling the compiler lets it narrow loop bounds, pick
+     * aligned loads, and avoid the (rare) "side == 0" corner at codegen. */
+    c3d_invariant(sb->side >= 8u && sb->side <= 128u);
+    c3d_invariant((sb->side & (sb->side - 1u)) == 0u);
     size_t n = (size_t)sb->side * sb->side * sb->side;
 
     float dz_half = dz_ratio * step;
@@ -2136,12 +2112,14 @@ static size_t c3d_encode_one_subband(
      * state (sp, lane_ctx, hist) is unchanged; only the float arithmetic
      * moves to 4-lane NEON fma/fabs/vcvt. */
     int32_t qv_row[128];
+#ifdef C3D_HAVE_NEON
     const float inv_step = 1.0f / step;
+#endif
     for (uint32_t z = sb_z0; z < sb_z0 + sb_side; ++z)
     for (uint32_t y = sb_y0; y < sb_y0 + sb_side; ++y) {
         const float *crow = &coeff_buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + sb_x0];
         /* Phase 1. */
-#if C3D_HAVE_NEON
+#ifdef C3D_HAVE_NEON
         float32x4_t vdz    = vdupq_n_f32(dz_half);
         float32x4_t vinv   = vdupq_n_f32(inv_step);
         float32x4_t vzero  = vdupq_n_f32(0.0f);
@@ -2166,17 +2144,17 @@ static size_t c3d_encode_one_subband(
             qv_row[x] = c3d_quant(crow[x], step, dz_half);
 #endif
         /* Phase 2 — scalar, keeps sp/lane_ctx/hist/escape correct. */
-        for (uint32_t x = 0; x < sb_side; ++x) {
+        for (uint32_t xp = 0; xp < sb_side; ++xp) {
             uint32_t escape_mag;
-            bool *sp = &prev_sign_zy[(y - sb_y0) * sb_side + x];
-            uint8_t sym = c3d_quant_to_symbol(qv_row[x], &escape_mag, sp);
+            bool *sp = &prev_sign_zy[(y - sb_y0) * sb_side + xp];
+            uint8_t sym = c3d_quant_to_symbol(qv_row[xp], &escape_mag, sp);
             sub_symbols[idx] = sym;
             hist[sym]++;
             unsigned lane = idx & 7u;
             hist_ctx[lane_ctx[lane] ? 1 : 0][sym]++;
             lane_ctx[lane] = (sym != 0);
             idx++;
-            if (C3D_SYM_IS_ESCAPE(sym)) {
+            if (c3d_unlikely(C3D_SYM_IS_ESCAPE(sym))) {
                 escape_pos += c3d_leb128_encode(escape_mag,
                                                 sub_escapes + escape_pos, 5);
             }
@@ -2194,7 +2172,7 @@ static size_t c3d_encode_one_subband(
     {
         double wsum = 0.0;
         for (unsigned s = 1; s < C3D_SYM_ESCAPE_LO; ++s)
-            wsum += (double)c3d_sym_magnitude(s) * hist[s];
+            wsum += (double)c3d_sym_magnitude((uint8_t)s) * hist[s];
         wsum += 32.0 * (double)(hist[C3D_SYM_ESCAPE_LO] + hist[C3D_SYM_ESCAPE_HI]);
         double beta = (double)step * wsum / (double)n;
         if (beta <= 1e-12) {
@@ -2389,147 +2367,14 @@ static size_t c3d_encode_one_subband(
  * Returns estimated subband byte size (double so errors aggregate cleanly).
  * Matches c3d_encode_one_subband's "use external iff external covers every
  * symbol present in this chunk" decision so the estimate tracks reality. */
-/* Accurate rate+distortion estimator: one quant scan over the subband
- * produces bytes = same value c3d_estimate_one_subband_bytes would return,
- * plus sum-squared quant error (distortion) in the same pass.  Used by the
- * hybrid R-D allocator; kept separate so the rate-only path stays minimal.
- *
- * Distortion uses the Laplacian-fitted α derived from the histogram (same
- * formula as Q1 at emit time) so the estimate matches what the real emit
- * will reconstruct with. */
-static double c3d_estimate_one_subband_rd(
-    const float *coeff_buf, const c3d_subband_info *sb,
-    float step, uint32_t denom_shift,
-    const uint32_t *external_freqs,
-    float max_abs, double *out_distortion)
-{
-    float dz_half = c3d_dz_half_for_kind(sb->kind, step);
-    if (max_abs < dz_half) {
-        /* Empty-subband sentinel path. Distortion = Σc² for all voxels,
-         * since they all dequant to 0.  Upper bound ≈ n · dz_half²/3. */
-        size_t n = (size_t)sb->side * sb->side * sb->side;
-        double d_per_voxel = (double)dz_half * (double)dz_half / 3.0;
-        if (out_distortion) *out_distortion = d_per_voxel * (double)n;
-        return 2.0;
-    }
-
-    /* Pass 1: build hist + escape bytes + raw SSE accumulator (independent
-     * of α).  We use (c − |q|·step)² with the "natural" zero-alpha centre,
-     * then correct to α* after the hist is complete. */
-    size_t n = (size_t)sb->side * sb->side * sb->side;
-    uint32_t hist[65] = {0};
-    size_t escape_bytes = 0;
-    /* Per-bin accumulators: sum_c (sum of |c| for each bin).  Needed so we
-     * can re-compute distortion at α* without a second scan. */
-    double sumabs_bin[65] = {0};
-    double sumabs2_bin[65] = {0};
-    bool prev_sign_zy[128 * 128];
-    memset(prev_sign_zy, 0, (size_t)sb->side * sb->side);   /* §T12 */
-    for (uint32_t z = sb->z0; z < sb->z0 + sb->side; ++z)
-    for (uint32_t y = sb->y0; y < sb->y0 + sb->side; ++y)
-    for (uint32_t x = sb->x0; x < sb->x0 + sb->side; ++x) {
-        float c = coeff_buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + x];
-        float ac = c < 0.0f ? -c : c;
-        int32_t qv = c3d_quant(c, step, dz_half);
-        uint32_t escape_mag;
-        bool *sp = &prev_sign_zy[(y - sb->y0) * sb->side + (x - sb->x0)];
-        uint8_t sym = c3d_quant_to_symbol(qv, &escape_mag, sp);
-        hist[sym]++;
-        sumabs_bin[sym]  += (double)ac;
-        sumabs2_bin[sym] += (double)ac * (double)ac;
-        if (C3D_SYM_IS_ESCAPE(sym)) {
-            uint32_t v = escape_mag;
-            do { escape_bytes++; v >>= 7; } while (v);
-        }
-    }
-
-    /* Laplacian-fit α from the histogram — mirrors Q1 exactly.  This is
-     * the α the real emit will write and the decoder will use. */
-    double wsum = 0.0;
-    for (unsigned s = 1; s < C3D_SYM_ESCAPE_LO; ++s)
-        wsum += (double)c3d_sym_magnitude(s) * hist[s];
-    wsum += 32.0 * (double)(hist[C3D_SYM_ESCAPE_LO] + hist[C3D_SYM_ESCAPE_HI]);
-    float alpha;
-    if (wsum <= 0.0) {
-        alpha = 0.25f;
-    } else {
-        double beta = (double)step * wsum / (double)n;
-        if (beta <= 1e-12) {
-            alpha = 0.25f;
-        } else {
-            double u = (double)step / beta;
-            double denom = exp(u) - 1.0;
-            double a = 1.0 / u - (denom > 1e-12 ? 1.0 / denom : 0.0);
-            if (a < 0.40) a = 0.40;
-            if (a > 0.50) a = 0.50;
-            alpha = (float)a;
-        }
-    }
-
-    /* Distortion at α*: for each bin k ≥ 1, reconstruction =
-     *   dz_half + (k−1+α)·step;
-     *   Σ (|c| − recon)² over bin = Σ|c|² − 2·recon·Σ|c| + n_k·recon².
-     * Bin 0 reconstructs to 0 → Σc² = Σ|c|². */
-    double dist = 0.0;
-    dist += sumabs2_bin[0];
-    for (unsigned s = 1; s < C3D_SYM_ESCAPE_LO; ++s) {
-        uint32_t mag = c3d_sym_magnitude(s);
-        double recon = (double)dz_half + ((double)mag - 1.0 + alpha) * (double)step;
-        dist += sumabs2_bin[s] - 2.0 * recon * sumabs_bin[s] + (double)hist[s] * recon * recon;
-    }
-    /* Escape symbols: reconstruction ≈ dz_half + (|q|-1)·step.  Use the per-bin
-     * mean |c| as a proxy for |q|. */
-    for (unsigned es = C3D_SYM_ESCAPE_LO; es <= C3D_SYM_ESCAPE_HI; ++es) {
-        if (!hist[es]) continue;
-        double mean_ac = sumabs_bin[es] / (double)hist[es];
-        double recon = mean_ac;   /* |c| itself is a tight estimator of recon */
-        dist += sumabs2_bin[es] - 2.0 * recon * sumabs_bin[es]
-              + (double)hist[es] * recon * recon;
-    }
-
-    if (hist[0] == n) {
-        if (out_distortion) *out_distortion = dist;
-        return 2.0;
-    }
-
-    bool use_external = (external_freqs != NULL);
-    if (use_external) {
-        for (unsigned k = 0; k < 65; ++k) {
-            if (hist[k] > 0 && external_freqs[k] == 0) { use_external = false; break; }
-        }
-    }
-    double code_bits = 0.0;
-    if (use_external) {
-        double log2_M = (double)denom_shift;
-        for (unsigned k = 0; k < 65; ++k) {
-            if (!hist[k]) continue;
-            code_bits += (double)hist[k] * (log2_M - log2((double)external_freqs[k]));
-        }
-    } else {
-        double inv_n = 1.0 / (double)n;
-        for (unsigned k = 0; k < 65; ++k) {
-            if (!hist[k]) continue;
-            double p = (double)hist[k] * inv_n;
-            code_bits += -(double)hist[k] * log2(p);
-        }
-    }
-    double rans_bytes = code_bits / 8.0 + 32.0;
-    double ftable_bytes = 0.0;
-    if (!use_external) {
-        unsigned nnz = 0;
-        for (unsigned k = 0; k < 65; ++k) if (hist[k]) nnz++;
-        ftable_bytes = 2.0 + 3.0 * (double)nnz;
-    }
-    if (out_distortion) *out_distortion = dist;
-    return 2.0 + ftable_bytes + 8.0 + rans_bytes + (double)escape_bytes;
-}
-
 static double c3d_estimate_one_subband_bytes(
-    const float *coeff_buf, const c3d_subband_info *sb,
+    const float *restrict coeff_buf, const c3d_subband_info *sb,
     float step, float dz_ratio, uint32_t denom_shift,
     const uint32_t *external_freqs,
     float max_abs)
 {
+    c3d_invariant(sb->side >= 8u && sb->side <= 128u);
+    c3d_invariant((sb->side & (sb->side - 1u)) == 0u);
     float dz_half = dz_ratio * step;
     /* Fast reject: if max |c| in this subband quantizes to 0, the whole band
      * is empty → matches c3d_encode_one_subband's 2-byte sentinel, and we
@@ -2547,12 +2392,14 @@ static double c3d_estimate_one_subband_bytes(
     size_t est_idx = 0;
     /* §S11 two-phase quant (same as c3d_encode_one_subband). */
     int32_t qv_row[128];
+#ifdef C3D_HAVE_NEON
     const float inv_step = 1.0f / step;
+#endif
     const uint32_t sb_side = sb->side;
     for (uint32_t z = sb->z0; z < sb->z0 + sb_side; ++z)
     for (uint32_t y = sb->y0; y < sb->y0 + sb_side; ++y) {
         const float *crow = &coeff_buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + sb->x0];
-#if C3D_HAVE_NEON
+#ifdef C3D_HAVE_NEON
         float32x4_t vdz    = vdupq_n_f32(dz_half);
         float32x4_t vinv   = vdupq_n_f32(inv_step);
         float32x4_t vzero  = vdupq_n_f32(0.0f);
@@ -2576,16 +2423,16 @@ static double c3d_estimate_one_subband_bytes(
         for (uint32_t x = 0; x < sb_side; ++x)
             qv_row[x] = c3d_quant(crow[x], step, dz_half);
 #endif
-        for (uint32_t x = 0; x < sb_side; ++x) {
+        for (uint32_t xp = 0; xp < sb_side; ++xp) {
             uint32_t escape_mag;
-            bool *sp = &prev_sign_zy[(y - sb->y0) * sb_side + x];
-            uint8_t sym = c3d_quant_to_symbol(qv_row[x], &escape_mag, sp);
+            bool *sp = &prev_sign_zy[(y - sb->y0) * sb_side + xp];
+            uint8_t sym = c3d_quant_to_symbol(qv_row[xp], &escape_mag, sp);
             hist[sym]++;
             unsigned lane = est_idx & 7u;
             hist_ctx[lane_ctx_est[lane] ? 1 : 0][sym]++;
             lane_ctx_est[lane] = (sym != 0);
             est_idx++;
-            if (C3D_SYM_IS_ESCAPE(sym)) {
+            if (c3d_unlikely(C3D_SYM_IS_ESCAPE(sym))) {
                 uint32_t v = escape_mag;
                 do { escape_bytes++; v >>= 7; } while (v);
             }
@@ -2781,7 +2628,7 @@ static inline float c3d_emit_baseline(const c3d_encoder *s, const c3d_ctx *ctx,
 /* Hybrid R-D allocator (§Q3 v2): after global-q bisection determines the
  * byte budget, re-distribute bits across subbands to minimise total
  * distortion while keeping the total byte count close.  Uses the accurate
- * quant-scan estimator (c3d_estimate_one_subband_rd) so rate and distortion
+ * quant-scan estimator (c3d_estimate_one_subband_bytes) so rate and distortion
  * are internally consistent — sidesteps the calibration gap that sank the
  * fine-histogram-based first cut. */
 #define C3D_RD_NCAND 9
@@ -2810,13 +2657,9 @@ static void c3d_rd_allocate_hybrid(c3d_encoder *s, const c3d_ctx *ctx,
     for (unsigned i = 0; i < C3D_N_SUBBANDS; ++i) {
         c3d_subband_info sb; c3d_subband_info_of(i, &sb);
         float base_step = q_center * c3d_emit_baseline(s, ctx, i) * s->coeff_scale;
-        uint32_t ds = (ctx && ctx->has_freq_tables) ? ctx->denom_shifts[i]
-                                                    : c3d_default_denom_shift(i);
-        const uint32_t *ext = (ctx && ctx->has_freq_tables) ? ctx->freqs[i] : NULL;
-        float mx = s->has_max_abs ? s->max_abs_per_subband[i] : s->coeff_scale;
         unsigned h = c3d_kind_h_count(sb.kind);
-        double log_w = (double)(3u * (sb.level - 1u) + (3u - h)) * log(C3D_CDF97_GAIN_L_SQ)
-                     + (double)h * log(C3D_CDF97_GAIN_H_SQ);
+        double log_w = (double)(3u * (sb.level - 1u) + (3u - h)) * log((double)C3D_CDF97_GAIN_L_SQ)
+                     + (double)h * log((double)C3D_CDF97_GAIN_H_SQ);
         double w_px = exp(log_w);
 
         /* Per-subband rate calibration: ratio of actual rANS bytes (from
@@ -3036,14 +2879,10 @@ static double c3d_estimate_entropy_at_q(float q, const c3d_encoder *s,
  *   - has_freq_tables: uses ctx's freqs, emits freq_table_size = 0 per subband
  * Writes entropy payload into out[352..], fills qmul/subband_offset/lod_offset
  * tables.  Returns total chunk size (352 + entropy bytes). */
-static size_t c3d_emit_entropy_at_q(float q, const c3d_encoder *s_const,
+static size_t c3d_emit_entropy_at_q(float q, c3d_encoder *s,
                                     const c3d_ctx *ctx,
                                     uint8_t *out, size_t out_cap)
 {
-    /* We need to mutate s->thread_* lazy pools on first use.  `s` is
-     * logically still `const` w.r.t. the compressed-data semantics. */
-    c3d_encoder *s = (c3d_encoder *)s_const;
-
     uint8_t *qmul_ptr   = out + 40;
     uint8_t *suboff_ptr = out + 40 + 144;
     uint8_t *lodoff_ptr = out + 40 + 144 + 144;
@@ -3734,13 +3573,15 @@ static float c3d_denoise_strength(size_t in_len)
  * If `external_freqs` is non-NULL and freq_table_size == 0, uses those
  * frequencies with the provided `external_denom_shift`. */
 static void c3d_decode_one_subband(
-    const uint8_t *in, size_t in_size,
+    const uint8_t *restrict in, size_t in_size,
     float step, float dz_ratio, float alpha,
     const uint32_t *external_freqs, uint32_t external_denom_shift,
-    float *coeff_buf, const c3d_subband_info *sb,
-    uint8_t *sub_symbols, c3d_rans_tables *tbl_scratch,
+    float *restrict coeff_buf, const c3d_subband_info *sb,
+    uint8_t *restrict sub_symbols, c3d_rans_tables *tbl_scratch,
     const c3d_rans_tables *cached_external_tbl)
 {
+    c3d_invariant(sb->side >= 8u && sb->side <= 128u);
+    c3d_invariant((sb->side & (sb->side - 1u)) == 0u);
     size_t n = (size_t)sb->side * sb->side * sb->side;
     size_t r = 0;
 
@@ -3843,7 +3684,7 @@ static void c3d_decode_one_subband(
         for (uint32_t x = 0; x < sb_side; ++x) {
             uint8_t sym = sub_symbols[idx++];
             uint32_t escape_mag = 0;
-            if (C3D_SYM_IS_ESCAPE(sym)) {
+            if (c3d_unlikely(C3D_SYM_IS_ESCAPE(sym))) {
                 uint64_t zv = 0;
                 size_t c = c3d_leb128_decode(esc_ptr, esc_remaining, &zv);
                 c3d_assert(zv <= 0xffffffffull);
@@ -3856,7 +3697,7 @@ static void c3d_decode_one_subband(
         }
         /* Phase 2 — NEON dequant over the row. */
         float *out_row = &coeff_buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + sb_x0];
-#if C3D_HAVE_NEON
+#ifdef C3D_HAVE_NEON
         float32x4_t vdz    = vdupq_n_f32(dz_half);
         float32x4_t vstep  = vdupq_n_f32(step);
         float32x4_t vbias  = vdupq_n_f32(alpha - 1.0f);
@@ -4238,6 +4079,15 @@ typedef struct {
     bool          owned;      /* true → free(data) on shard_free              */
 } c3d_shard_slot;
 
+/* Drop the `const` qualifier for calls into free().  Slots store `data` as
+ * `const uint8_t *` because the common case (parsed shard) is a view into
+ * caller-owned bytes.  When `owned` is set we allocated with malloc, so the
+ * free call is legitimate; this wrapper encapsulates the cast to keep the
+ * cast-qual warnings off the shipping build. */
+static inline void c3d_free_owned(const uint8_t *p) {
+    free((void *)(uintptr_t)p);
+}
+
 struct c3d_shard {
     uint32_t       origin[3];
     uint8_t        shard_lod;
@@ -4273,7 +4123,7 @@ c3d_shard *c3d_shard_new(const uint32_t origin[3], uint8_t shard_lod) {
 void c3d_shard_free(c3d_shard *s) {
     if (!s) return;
     for (unsigned i = 0; i < 4096; ++i) {
-        if (s->slots[i].owned) free((void *)s->slots[i].data);
+        if (s->slots[i].owned) c3d_free_owned(s->slots[i].data);
     }
     free(s->ctx_bytes);
     c3d_ctx_free(s->parsed_ctx);
@@ -4407,7 +4257,7 @@ void c3d_shard_put_chunk(c3d_shard *s,
 {
     c3d_assert(in && in_len > 0);
     c3d_shard_slot *sl = &s->slots[c3d_shard_slot_idx(cx, cy, cz)];
-    if (sl->owned) free((void *)sl->data);
+    if (sl->owned) c3d_free_owned(sl->data);
     uint8_t *buf = malloc(in_len);
     c3d_assert(buf);
     memcpy(buf, in, in_len);
@@ -4419,7 +4269,7 @@ void c3d_shard_put_chunk(c3d_shard *s,
 
 void c3d_shard_mark_zero(c3d_shard *s, uint32_t cx, uint32_t cy, uint32_t cz) {
     c3d_shard_slot *sl = &s->slots[c3d_shard_slot_idx(cx, cy, cz)];
-    if (sl->owned) free((void *)sl->data);
+    if (sl->owned) c3d_free_owned(sl->data);
     sl->data       = NULL;
     sl->size       = 0;
     sl->raw_offset = 0;  /* (0, 0) = ZERO sentinel */
@@ -4523,11 +4373,12 @@ void c3d_shard_encode_all(c3d_shard *s,
                           float target_ratio)
 {
     c3d_assert(s && chunks && coords);
+    if (n_chunks == 0) return;
     /* Auto-train ctx if the caller hasn't provided one.  Use up to 64 of the
      * input chunks as the training set — large enough to get stable freq
      * tables and a representative LL_5 reference, small enough that ctx
      * training is a small fraction of total encode time. */
-    if (!c3d_shard_ctx(s) && n_chunks > 0) {
+    if (!c3d_shard_ctx(s)) {
         size_t n_train = n_chunks < 64 ? n_chunks : 64;
         c3d_shard_auto_train_ctx(s, chunks, n_train);
     }
@@ -5024,7 +4875,7 @@ const c3d_ctx *c3d_shard_ctx(const c3d_shard *s) {
     if (s->ctx_bytes != NULL) {
         /* Lazily parse for shards constructed via c3d_shard_parse (non-copy).
          * Cast away const for this cache fill; purely a memoisation. */
-        c3d_shard *mut = (c3d_shard *)s;
+        c3d_shard *mut = (c3d_shard *)(uintptr_t)s;
         mut->parsed_ctx = c3d_ctx_parse(s->ctx_bytes, s->ctx_size);
         return mut->parsed_ctx;
     }

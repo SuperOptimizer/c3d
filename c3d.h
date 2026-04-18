@@ -39,8 +39,12 @@ extern "C" {
  * + a small range-coder safety margin.  Small enough to stack-allocate.
  * (Fixed header = 388 B: 40 B base + 144 B qmul + 144 B subband_offset
  *  + 24 B lod_offset + 36 B per-subband Laplacian α.) */
+/* 16 MiB + header + slack, rounded up to a multiple of C3D_ALIGN so the
+ * constant is a valid `size` argument to aligned_alloc (standard C11
+ * requires `size` divide evenly by `align`; ASan enforces it strictly). */
 #define C3D_CHUNK_ENCODE_MAX_SIZE \
-    ((size_t)16 * 1024 * 1024 + 388 + 4096)
+    (((size_t)16 * 1024 * 1024 + 388 + 4096 + (size_t)(C3D_ALIGN - 1)) \
+     & ~(size_t)(C3D_ALIGN - 1))
 
 /* ─── panic / assert ─────────────────────────────────────────────────────── */
 
@@ -58,6 +62,49 @@ _Noreturn void c3d_panic(const char *file, int line, const char *msg);
     do {                                                                      \
         if (!(cond)) c3d_panic(__FILE__, __LINE__, #cond);                    \
     } while (0)
+
+/* c3d_invariant: hot-path invariant hint.
+ *
+ * Debug builds: same as c3d_assert — runtime check, panic on failure.
+ * Release builds: compiler hint (`[[assume]]` / `__builtin_unreachable`)
+ *                 — no runtime code, but the optimiser may narrow value
+ *                 ranges, drop bounds checks, pick aligned loads, etc.
+ *
+ * Use ONLY for invariants that are genuinely true by construction on every
+ * internal call path.  If one is false at runtime in release, the compiler
+ * assumes it's true and may emit UB-producing code: silent corruption, not
+ * a clean panic.  That's why safety-critical checks (buffer bounds, version
+ * match, external inputs) stay on c3d_assert. */
+#ifdef NDEBUG
+#  if defined(__clang__)
+#    define c3d_invariant(cond) __builtin_assume(cond)
+#  elif defined(__GNUC__)
+#    define c3d_invariant(cond) do { if (!(cond)) __builtin_unreachable(); } while (0)
+#  else
+#    define c3d_invariant(cond) ((void)0)
+#  endif
+#else
+#  define c3d_invariant(cond) c3d_assert(cond)
+#endif
+
+/* Portable branch hints. */
+#if defined(__GNUC__) || defined(__clang__)
+#  define c3d_likely(cond)   __builtin_expect(!!(cond), 1)
+#  define c3d_unlikely(cond) __builtin_expect(!!(cond), 0)
+#else
+#  define c3d_likely(cond)   (cond)
+#  define c3d_unlikely(cond) (cond)
+#endif
+
+/* Mark pure/const helpers for CSE.  pure = reads memory, no side effects.
+ * const = no memory reads (only args), no side effects — stronger. */
+#if defined(__GNUC__) || defined(__clang__)
+#  define C3D_CONST __attribute__((const))
+#  define C3D_PURE  __attribute__((pure))
+#else
+#  define C3D_CONST
+#  define C3D_PURE
+#endif
 
 /* ─── u64 voxel key ──────────────────────────────────────────────────────── */
 /* Layout: [ lod:4 ][ z:20 ][ y:20 ][ x:20 ].  Planar (not Morton). */
@@ -97,7 +144,7 @@ typedef struct {
     float    coeff_scale;
 } c3d_chunk_info;
 
-void c3d_chunk_inspect(const uint8_t *in, size_t in_len, c3d_chunk_info *out);
+void c3d_chunk_inspect(const uint8_t *in, size_t in_len, c3d_chunk_info *info);
 
 /* Non-panicking structural check: magic, version, header sizes, table offsets,
  * per-subband frame sizes, TLV bounds.  Does NOT run entropy decode — a
