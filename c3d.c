@@ -2106,22 +2106,56 @@ static size_t c3d_encode_one_subband(
      * reload them every inner iteration (sb is not restrict-qualified). */
     const uint32_t sb_z0 = sb->z0, sb_y0 = sb->y0, sb_x0 = sb->x0;
     const uint32_t sb_side = sb->side;
+    /* §S11 two-phase quant/symbol.  Phase 1 (SIMD): vectorised float→int
+     * quant over a full x-row into qv_row[].  Phase 2 (scalar): stateful
+     * sign-prediction + sym mapping + histogram + escape emit.  The scalar
+     * state (sp, lane_ctx, hist) is unchanged; only the float arithmetic
+     * moves to 4-lane NEON fma/fabs/vcvt. */
+    int32_t qv_row[128];
+    const float inv_step = 1.0f / step;
     for (uint32_t z = sb_z0; z < sb_z0 + sb_side; ++z)
-    for (uint32_t y = sb_y0; y < sb_y0 + sb_side; ++y)
-    for (uint32_t x = sb_x0; x < sb_x0 + sb_side; ++x) {
-        float c = coeff_buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + x];
-        int32_t qv = c3d_quant(c, step, dz_half);
-        uint32_t escape_mag;
-        bool *sp = &prev_sign_zy[(y - sb_y0) * sb_side + (x - sb_x0)];
-        uint8_t sym = c3d_quant_to_symbol(qv, &escape_mag, sp);
-        sub_symbols[idx] = sym;
-        hist[sym]++;
-        unsigned lane = idx & 7u;
-        hist_ctx[lane_ctx[lane] ? 1 : 0][sym]++;
-        lane_ctx[lane] = (sym != 0);
-        idx++;
-        if (C3D_SYM_IS_ESCAPE(sym)) {
-            escape_pos += c3d_leb128_encode(escape_mag, sub_escapes + escape_pos, 5);
+    for (uint32_t y = sb_y0; y < sb_y0 + sb_side; ++y) {
+        const float *crow = &coeff_buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + sb_x0];
+        /* Phase 1. */
+#if C3D_HAVE_NEON
+        float32x4_t vdz    = vdupq_n_f32(dz_half);
+        float32x4_t vinv   = vdupq_n_f32(inv_step);
+        float32x4_t vzero  = vdupq_n_f32(0.0f);
+        uint32_t x = 0;
+        for (; x + 4 <= sb_side; x += 4) {
+            float32x4_t c  = vld1q_f32(crow + x);
+            float32x4_t ac = vabsq_f32(c);
+            uint32x4_t below = vcltq_f32(ac, vdz);             /* zero mask */
+            float32x4_t s  = vmulq_f32(vsubq_f32(ac, vdz), vinv);
+            int32x4_t  qi  = vcvtq_s32_f32(s);
+            qi = vaddq_s32(qi, vdupq_n_s32(1));
+            uint32x4_t neg = vcltq_f32(c, vzero);
+            int32x4_t  qn  = vnegq_s32(qi);
+            int32x4_t  q   = vbslq_s32(neg, qn, qi);
+            q = vbslq_s32(below, vdupq_n_s32(0), q);
+            vst1q_s32(qv_row + x, q);
+        }
+        for (; x < sb_side; ++x)
+            qv_row[x] = c3d_quant(crow[x], step, dz_half);
+#else
+        for (uint32_t x = 0; x < sb_side; ++x)
+            qv_row[x] = c3d_quant(crow[x], step, dz_half);
+#endif
+        /* Phase 2 — scalar, keeps sp/lane_ctx/hist/escape correct. */
+        for (uint32_t x = 0; x < sb_side; ++x) {
+            uint32_t escape_mag;
+            bool *sp = &prev_sign_zy[(y - sb_y0) * sb_side + x];
+            uint8_t sym = c3d_quant_to_symbol(qv_row[x], &escape_mag, sp);
+            sub_symbols[idx] = sym;
+            hist[sym]++;
+            unsigned lane = idx & 7u;
+            hist_ctx[lane_ctx[lane] ? 1 : 0][sym]++;
+            lane_ctx[lane] = (sym != 0);
+            idx++;
+            if (C3D_SYM_IS_ESCAPE(sym)) {
+                escape_pos += c3d_leb128_encode(escape_mag,
+                                                sub_escapes + escape_pos, 5);
+            }
         }
     }
     c3d_assert(idx == n);
