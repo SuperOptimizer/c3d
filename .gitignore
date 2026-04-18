@@ -68,3 +68,7 @@ Makefile
 # third-party sources (submodule or fetched)
 /third_party/
 .claude/
+
+# IDE config
+.idea/
+.vscode/
