@@ -14,6 +14,19 @@ add_compile_options(
     -Wno-parentheses
 )
 
+# OpenMP — used by §E DWT per-level passes to parallelise the outer z/y loops
+# within a single chunk encode/decode.  Each pragma is a no-op when OpenMP is
+# unavailable (compilers gracefully fall through), but libgomp gives us real
+# thread-level scaling on the hot DWT kernels.
+find_package(OpenMP)
+if(OpenMP_C_FOUND)
+    add_compile_options(${OpenMP_C_FLAGS})
+    link_libraries(${OpenMP_C_LIBRARIES})
+    message(STATUS "OpenMP: ${OpenMP_C_FLAGS} (libs: ${OpenMP_C_LIBRARIES})")
+else()
+    message(STATUS "OpenMP not found — DWT passes stay single-threaded")
+endif()
+
 # Release defaults: -O3 + fast-math per PLAN §0.  Debug keeps fast-math off so
 # the debugger sees the canonical evaluation order.
 if(NOT CMAKE_BUILD_TYPE)

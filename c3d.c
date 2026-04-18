@@ -993,75 +993,108 @@ static void c3d_dwt_1d_inv_x4(float *restrict x, size_t N, float *restrict aux) 
 #define C3D_Z_TILE  C3D_TILE_X
 
 static void c3d_dwt3_fwd_level(float *buf, size_t side, float *scratch) {
-    float *tile = scratch;
-    float *aux  = scratch + C3D_TILE_X * C3D_CHUNK_SIDE;
+    (void)scratch;  /* per-thread buffers supersede the shared scratch. */
 
-    /* X pass — row stride 1, contiguous.  Unchanged (already vectorised). */
-    for (size_t z = 0; z < side; ++z) {
-        for (size_t y = 0; y < side; ++y) {
-            float *row = &buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y];
-            c3d_dwt_1d_fwd(row, side, aux);
+    /* X pass — row stride 1, contiguous.  Outer z loop is parallelised;
+     * each thread gets its own aux (512 floats = 2 KB on stack). */
+    #pragma omp parallel
+    {
+        float aux[C3D_CHUNK_SIDE];
+        #pragma omp for schedule(static)
+        for (size_t z = 0; z < side; ++z) {
+            for (size_t y = 0; y < side; ++y) {
+                float *row = &buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y];
+                c3d_dwt_1d_fwd(row, side, aux);
+            }
         }
     }
     /* Y pass — 4 adjacent X-columns at a time (cache-line-sized load/store). */
     c3d_assert((side & 3u) == 0);
-    for (size_t z = 0; z < side; ++z) {
-        for (size_t xb = 0; xb < side; xb += C3D_Y_TILE) {
-            for (size_t y = 0; y < side; ++y)
-                memcpy(&tile[y * C3D_TILE_X], &buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + xb],
-                       C3D_TILE_X * sizeof(float));
-            c3d_dwt_1d_fwd_x4(tile, side, aux);
-            for (size_t y = 0; y < side; ++y)
-                memcpy(&buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + xb], &tile[y * C3D_TILE_X],
-                       C3D_TILE_X * sizeof(float));
+    #pragma omp parallel
+    {
+        float tile[C3D_TILE_X * C3D_CHUNK_SIDE];
+        float aux [C3D_TILE_X * C3D_CHUNK_SIDE];
+        #pragma omp for schedule(static)
+        for (size_t z = 0; z < side; ++z) {
+            for (size_t xb = 0; xb < side; xb += C3D_Y_TILE) {
+                for (size_t y = 0; y < side; ++y)
+                    memcpy(&tile[y * C3D_TILE_X], &buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + xb],
+                           C3D_TILE_X * sizeof(float));
+                c3d_dwt_1d_fwd_x4(tile, side, aux);
+                for (size_t y = 0; y < side; ++y)
+                    memcpy(&buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + xb], &tile[y * C3D_TILE_X],
+                           C3D_TILE_X * sizeof(float));
+            }
         }
     }
-    /* Z pass — same tiling. */
-    for (size_t y = 0; y < side; ++y) {
-        for (size_t xb = 0; xb < side; xb += C3D_Z_TILE) {
-            for (size_t z = 0; z < side; ++z)
-                memcpy(&tile[z * C3D_TILE_X], &buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + xb],
-                       C3D_TILE_X * sizeof(float));
-            c3d_dwt_1d_fwd_x4(tile, side, aux);
-            for (size_t z = 0; z < side; ++z)
-                memcpy(&buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + xb], &tile[z * C3D_TILE_X],
-                       C3D_TILE_X * sizeof(float));
+    /* Z pass — same tiling, parallelise over outer y. */
+    #pragma omp parallel
+    {
+        float tile[C3D_TILE_X * C3D_CHUNK_SIDE];
+        float aux [C3D_TILE_X * C3D_CHUNK_SIDE];
+        #pragma omp for schedule(static)
+        for (size_t y = 0; y < side; ++y) {
+            for (size_t xb = 0; xb < side; xb += C3D_Z_TILE) {
+                for (size_t z = 0; z < side; ++z)
+                    memcpy(&tile[z * C3D_TILE_X], &buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + xb],
+                           C3D_TILE_X * sizeof(float));
+                c3d_dwt_1d_fwd_x4(tile, side, aux);
+                for (size_t z = 0; z < side; ++z)
+                    memcpy(&buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + xb], &tile[z * C3D_TILE_X],
+                           C3D_TILE_X * sizeof(float));
+            }
         }
     }
 }
 
 static void c3d_dwt3_inv_level(float *buf, size_t side, float *scratch) {
-    float *tile = scratch;
-    float *aux  = scratch + C3D_TILE_X * C3D_CHUNK_SIDE;
+    (void)scratch;  /* per-thread buffers supersede the shared scratch. */
 
-    /* Inverse order: Z, Y, X. */
     c3d_assert((side & 3u) == 0);
-    for (size_t y = 0; y < side; ++y) {
-        for (size_t xb = 0; xb < side; xb += C3D_Z_TILE) {
-            for (size_t z = 0; z < side; ++z)
-                memcpy(&tile[z * C3D_TILE_X], &buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + xb],
-                       C3D_TILE_X * sizeof(float));
-            c3d_dwt_1d_inv_x4(tile, side, aux);
-            for (size_t z = 0; z < side; ++z)
-                memcpy(&buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + xb], &tile[z * C3D_TILE_X],
-                       C3D_TILE_X * sizeof(float));
-        }
-    }
-    for (size_t z = 0; z < side; ++z) {
-        for (size_t xb = 0; xb < side; xb += C3D_Y_TILE) {
-            for (size_t y = 0; y < side; ++y)
-                memcpy(&tile[y * C3D_TILE_X], &buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + xb],
-                       C3D_TILE_X * sizeof(float));
-            c3d_dwt_1d_inv_x4(tile, side, aux);
-            for (size_t y = 0; y < side; ++y)
-                memcpy(&buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + xb], &tile[y * C3D_TILE_X],
-                       C3D_TILE_X * sizeof(float));
-        }
-    }
-    for (size_t z = 0; z < side; ++z) {
+    /* Inverse order: Z, Y, X — each pass parallelised over its outer loop. */
+    #pragma omp parallel
+    {
+        float tile[C3D_TILE_X * C3D_CHUNK_SIDE];
+        float aux [C3D_TILE_X * C3D_CHUNK_SIDE];
+        #pragma omp for schedule(static)
         for (size_t y = 0; y < side; ++y) {
-            float *row = &buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y];
-            c3d_dwt_1d_inv(row, side, aux);
+            for (size_t xb = 0; xb < side; xb += C3D_Z_TILE) {
+                for (size_t z = 0; z < side; ++z)
+                    memcpy(&tile[z * C3D_TILE_X], &buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + xb],
+                           C3D_TILE_X * sizeof(float));
+                c3d_dwt_1d_inv_x4(tile, side, aux);
+                for (size_t z = 0; z < side; ++z)
+                    memcpy(&buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + xb], &tile[z * C3D_TILE_X],
+                           C3D_TILE_X * sizeof(float));
+            }
+        }
+    }
+    #pragma omp parallel
+    {
+        float tile[C3D_TILE_X * C3D_CHUNK_SIDE];
+        float aux [C3D_TILE_X * C3D_CHUNK_SIDE];
+        #pragma omp for schedule(static)
+        for (size_t z = 0; z < side; ++z) {
+            for (size_t xb = 0; xb < side; xb += C3D_Y_TILE) {
+                for (size_t y = 0; y < side; ++y)
+                    memcpy(&tile[y * C3D_TILE_X], &buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + xb],
+                           C3D_TILE_X * sizeof(float));
+                c3d_dwt_1d_inv_x4(tile, side, aux);
+                for (size_t y = 0; y < side; ++y)
+                    memcpy(&buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + xb], &tile[y * C3D_TILE_X],
+                           C3D_TILE_X * sizeof(float));
+            }
+        }
+    }
+    #pragma omp parallel
+    {
+        float aux[C3D_CHUNK_SIDE];
+        #pragma omp for schedule(static)
+        for (size_t z = 0; z < side; ++z) {
+            for (size_t y = 0; y < side; ++y) {
+                float *row = &buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y];
+                c3d_dwt_1d_inv(row, side, aux);
+            }
         }
     }
 }
