@@ -323,6 +323,34 @@ size_t c3d_chunk_encode_at_q(const uint8_t *in,
                              const c3d_ctx *ctx,
                              uint8_t *out, size_t out_cap);
 
+/* "Zero means ignore" encode variants.  Voxels with value 0 in the input are
+ * treated as don't-care: the encoder replaces them with the minimum non-zero
+ * value found in the chunk, so the DWT sees no step between air and material
+ * and the bit budget concentrates on the material voxels.
+ *
+ * Output bitstream is a regular v1 chunk — any c3d decoder reads it normally,
+ * no format change, no version bump.
+ *
+ * Caller contract: mark don't-care voxels with 0 before calling.  After
+ * decode, re-apply your mask to re-zero those regions (wavelet ringing can
+ * leave small non-zero values in previously-zero regions).
+ *
+ * On Vesuvius scroll CT corpus (mean ~40% air across 64 chunks) this gives
+ * roughly +1 dB full-cube PSNR at matched target ratio vs encoding the raw
+ * noisy-air input.  Per-chunk gain varies with content. */
+size_t c3d_chunk_encode_masked(const uint8_t *in, float target_ratio,
+                               const c3d_ctx *ctx,
+                               uint8_t *out, size_t out_cap);
+size_t c3d_chunk_encode_masked_at_q(const uint8_t *in, float q,
+                                    const c3d_ctx *ctx,
+                                    uint8_t *out, size_t out_cap);
+size_t c3d_encoder_chunk_encode_masked(c3d_encoder *, const uint8_t *in,
+                                       float target_ratio, const c3d_ctx *ctx,
+                                       uint8_t *out, size_t out_cap);
+size_t c3d_encoder_chunk_encode_masked_at_q(c3d_encoder *, const uint8_t *in,
+                                            float q, const c3d_ctx *ctx,
+                                            uint8_t *out, size_t out_cap);
+
 /* LOD 0 decode — writes 256^3 u8 into out. */
 void c3d_chunk_decode(const uint8_t *in, size_t in_len,
                       const c3d_ctx *ctx,

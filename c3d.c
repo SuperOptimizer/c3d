@@ -1747,6 +1747,11 @@ struct c3d_encoder {
      * straight line in log-log.  Seeded to -1.5 on first encode. */
     float    log_rd_slope;
     bool     has_log_rd_slope;
+
+    /* Lazy-allocated 16 MiB u8 scratch used by the _masked encode variants
+     * as the filled-input buffer (0-voxels replaced by global-min non-zero
+     * before the regular encode path). */
+    uint8_t *in_scratch;
 };
 
 struct c3d_decoder {
@@ -1803,6 +1808,7 @@ c3d_encoder *c3d_encoder_new(void) {
     e->has_prev_ll5 = false;
     e->log_rd_slope = 0.0f;
     e->has_log_rd_slope = false;
+    e->in_scratch = NULL;   /* lazy-allocated on first _masked call */
     return e;
 }
 void c3d_encoder_free(c3d_encoder *e) {
@@ -1818,6 +1824,7 @@ void c3d_encoder_free(c3d_encoder *e) {
     }
     for (unsigned i = 0; i < C3D_OMP_MAX_THREADS; ++i)
         free(e->thread_out_scratch[i]);
+    free(e->in_scratch);
     free(e);
 }
 
@@ -3382,6 +3389,106 @@ void c3d_encoder_enable_inter_chunk(c3d_encoder *e, bool enabled) {
 }
 
 size_t c3d_chunk_encode_max_size(void) { return C3D_CHUNK_ENCODE_MAX_SIZE; }
+
+/* Fill `out` from `in`, replacing every voxel with value 0 by the minimum
+ * non-zero value found in `in`.  For scroll data preprocessed to zero all
+ * voxels below threshold, the minimum non-zero value is the threshold itself,
+ * so this reproduces floor-clamp semantics automatically — air and material
+ * sit at the same floor, so the DWT sees no boundary step and the detail
+ * bands stay concentrated near zero.  If the input contains no non-zero
+ * voxels, the output is a verbatim copy (the regular encoder's all-zero
+ * fast path handles that case cheaply). */
+static void c3d_fill_mask_ignore(const uint8_t *restrict in,
+                                 uint8_t *restrict out)
+{
+    uint8_t m_min = 255;
+    for (size_t i = 0; i < C3D_VOXELS_PER_CHUNK; ++i) {
+        uint8_t v = in[i];
+        if (v != 0 && v < m_min) m_min = v;
+    }
+    if (m_min == 255) {
+        memcpy(out, in, C3D_VOXELS_PER_CHUNK);
+        return;
+    }
+    for (size_t i = 0; i < C3D_VOXELS_PER_CHUNK; ++i) {
+        uint8_t v = in[i];
+        out[i] = v == 0 ? m_min : v;
+    }
+}
+
+/* Ensure e->in_scratch is allocated.  Called from the _masked entry points. */
+static void c3d_encoder_ensure_in_scratch(c3d_encoder *e) {
+    if (!e->in_scratch) {
+        e->in_scratch = aligned_alloc(C3D_ALIGN, C3D_VOXELS_PER_CHUNK);
+        c3d_assert(e->in_scratch);
+    }
+}
+
+/* Public: rate-controlled encode treating 0-valued voxels as don't-care.
+ *
+ * The encoder replaces every 0-voxel with the minimum non-zero value from
+ * the input before running the standard encode pipeline.  The output
+ * bitstream is a regular v1 chunk that any c3d decoder can read; no format
+ * changes, no version bump.
+ *
+ * Caller contract:
+ *   - Mark don't-care voxels by setting them to 0 in the input.
+ *   - At display / use time, re-apply your mask to re-zero those regions.
+ *     Small non-zero values (typically 1–3) may appear in previously-zero
+ *     regions due to wavelet ringing; either threshold them away or use
+ *     your own mask to gate decoded output.
+ *
+ * When is the win worth it?  When a meaningful fraction of voxels carry no
+ * information the caller cares about (e.g. air / void in CT scans).  On
+ * Vesuvius scroll data with ~40% air, c3d_encoder_chunk_encode_masked gives
+ * roughly +1 dB full-cube PSNR at matched target ratio vs compressing the
+ * raw noisy air region, and slightly better material-only PSNR.  The gain
+ * grows with air fraction. */
+size_t c3d_encoder_chunk_encode_masked(c3d_encoder *e, const uint8_t *in,
+                                       float target_ratio, const c3d_ctx *ctx,
+                                       uint8_t *out, size_t out_cap)
+{
+    c3d_assert(e && in && out);
+    c3d_check_voxel_alignment(in);
+    c3d_encoder_ensure_in_scratch(e);
+    c3d_fill_mask_ignore(in, e->in_scratch);
+    return c3d_encoder_chunk_encode(e, e->in_scratch, target_ratio, ctx,
+                                    out, out_cap);
+}
+
+/* Public: _at_q variant of the masked encode — bypasses rate control, uses
+ * the given q directly.  Useful for R-D sweeps and deterministic tests. */
+size_t c3d_encoder_chunk_encode_masked_at_q(c3d_encoder *e, const uint8_t *in,
+                                            float q, const c3d_ctx *ctx,
+                                            uint8_t *out, size_t out_cap)
+{
+    c3d_assert(e && in && out);
+    c3d_check_voxel_alignment(in);
+    c3d_encoder_ensure_in_scratch(e);
+    c3d_fill_mask_ignore(in, e->in_scratch);
+    return c3d_encoder_chunk_encode_at_q(e, e->in_scratch, q, ctx, out, out_cap);
+}
+
+/* Stateless wrappers — allocate a fresh encoder per call. */
+size_t c3d_chunk_encode_masked(const uint8_t *in, float target_ratio,
+                               const c3d_ctx *ctx,
+                               uint8_t *out, size_t out_cap)
+{
+    c3d_encoder *e = c3d_encoder_new();
+    size_t r = c3d_encoder_chunk_encode_masked(e, in, target_ratio, ctx, out, out_cap);
+    c3d_encoder_free(e);
+    return r;
+}
+
+size_t c3d_chunk_encode_masked_at_q(const uint8_t *in, float q,
+                                    const c3d_ctx *ctx,
+                                    uint8_t *out, size_t out_cap)
+{
+    c3d_encoder *e = c3d_encoder_new();
+    size_t r = c3d_encoder_chunk_encode_masked_at_q(e, in, q, ctx, out, out_cap);
+    c3d_encoder_free(e);
+    return r;
+}
 
 /* §I3.  Batched multi-chunk encode — loop the single-chunk API. */
 void c3d_encoder_chunks_encode(c3d_encoder *e,

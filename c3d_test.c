@@ -1028,6 +1028,73 @@ static void test_chunk_empty(void) {
     free(in); free(dec); free(enc);
 }
 
+/* "Zero means ignore" encode path: caller zeros out don't-care voxels and
+ * c3d_chunk_encode_masked fills them with min-non-zero before the regular
+ * encode.  Verify:
+ *   1. Non-zero (material) voxels are preserved within reasonable PSNR at
+ *      moderate q.
+ *   2. The encoded bitstream is a standard v1 chunk readable by any decoder.
+ *   3. At all-zero input, the masked encode produces the empty-chunk fast
+ *      path (C3D_CHUNK_FIXED_SIZE, 0-filled on decode). */
+static void test_chunk_encode_masked(void) {
+    uint8_t *in  = aligned_alloc(C3D_ALIGN, C3D_VOXELS_PER_CHUNK);
+    uint8_t *dec = aligned_alloc(C3D_ALIGN, C3D_VOXELS_PER_CHUNK);
+    uint8_t *enc = aligned_alloc(C3D_ALIGN, C3D_CHUNK_ENCODE_MAX_SIZE);
+    c3d_assert(in && dec && enc);
+
+    /* Build an input with a sharp 0/material boundary and some smooth
+     * material interior.  This mimics scroll-after-threshold: voxels below
+     * the material floor are 0, rest is real signal. */
+    make_test_chunk(in);
+    /* Zero out a half-cube: x < 128. */
+    for (uint32_t z = 0; z < C3D_CHUNK_SIDE; ++z)
+    for (uint32_t y = 0; y < C3D_CHUNK_SIDE; ++y)
+    for (uint32_t x = 0; x < 128; ++x)
+        in[(size_t)z * C3D_CHUNK_SIDE * C3D_CHUNK_SIDE + y * C3D_CHUNK_SIDE + x] = 0;
+
+    size_t sz = c3d_chunk_encode_masked(in, 50.0f, NULL, enc, C3D_CHUNK_ENCODE_MAX_SIZE);
+    CHECK(sz > 352 && sz <= C3D_CHUNK_ENCODE_MAX_SIZE);
+    CHECK(c3d_chunk_validate(enc, sz));
+
+    c3d_chunk_decode(enc, sz, NULL, dec);
+
+    /* Material-only PSNR (x >= 128): material voxels in `in` (non-zero) vs
+     * decoded values.  Should be reasonably high at 50× target. */
+    double sse = 0.0; size_t cnt = 0;
+    for (uint32_t z = 0; z < C3D_CHUNK_SIDE; ++z)
+    for (uint32_t y = 0; y < C3D_CHUNK_SIDE; ++y)
+    for (uint32_t x = 128; x < C3D_CHUNK_SIDE; ++x) {
+        size_t i = (size_t)z*C3D_CHUNK_SIDE*C3D_CHUNK_SIDE + y*C3D_CHUNK_SIDE + x;
+        double d = (double)in[i] - (double)dec[i];
+        sse += d * d; ++cnt;
+    }
+    double matP = 10.0 * log10(255.0 * 255.0 / (sse / (double)cnt));
+    printf("  masked 50x material PSNR: %.2f dB\n", matP);
+    CHECK(matP > 28.0);
+
+    /* All-zero input → empty-chunk fast path. */
+    memset(in, 0, C3D_VOXELS_PER_CHUNK);
+    sz = c3d_chunk_encode_masked(in, 50.0f, NULL, enc, C3D_CHUNK_ENCODE_MAX_SIZE);
+    CHECK_EQ(sz, (size_t)C3D_CHUNK_FIXED_SIZE);
+    c3d_chunk_decode(enc, sz, NULL, dec);
+    for (size_t i = 0; i < C3D_VOXELS_PER_CHUNK; ++i) CHECK_EQ(dec[i], 0);
+
+    /* Determinism: same input → same output bytes under _masked. */
+    make_test_chunk(in);
+    for (uint32_t z = 0; z < C3D_CHUNK_SIDE; ++z)
+    for (uint32_t y = 0; y < C3D_CHUNK_SIDE; ++y)
+    for (uint32_t x = 0; x < 128; ++x)
+        in[(size_t)z * C3D_CHUNK_SIDE * C3D_CHUNK_SIDE + y * C3D_CHUNK_SIDE + x] = 0;
+    uint8_t *enc2 = aligned_alloc(C3D_ALIGN, C3D_CHUNK_ENCODE_MAX_SIZE);
+    size_t sz1 = c3d_chunk_encode_masked(in, 50.0f, NULL, enc,  C3D_CHUNK_ENCODE_MAX_SIZE);
+    size_t sz2 = c3d_chunk_encode_masked(in, 50.0f, NULL, enc2, C3D_CHUNK_ENCODE_MAX_SIZE);
+    CHECK_EQ(sz1, sz2);
+    CHECK(memcmp(enc, enc2, sz1) == 0);
+    free(enc2);
+
+    free(in); free(dec); free(enc);
+}
+
 static void test_chunk_validate_rejects_garbage(void) {
     uint8_t buf[512] = {0};
     CHECK(!c3d_chunk_validate(buf, 512));       /* bad magic */
@@ -1407,6 +1474,7 @@ int main(void) {
     test_chunk_deterministic_encode();
     test_chunks_batched();
     test_chunk_lod_decode();
+    test_chunk_encode_masked();
 
     printf("§J shard + downsample\n");
     test_shard_empty_roundtrip();
