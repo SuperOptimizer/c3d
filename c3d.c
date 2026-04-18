@@ -2959,16 +2959,33 @@ static size_t c3d_emit_entropy_at_q(float q, const c3d_encoder *s_const,
         return C3D_CHUNK_FIXED_SIZE + entropy_pos;
     }
 
-    /* Per-subband output sizes + fitted α, collected by the parallel region
-     * and consumed serially to compute offsets + copy bytes into `out`. */
+    /* Per-subband output sizes + fitted α + step, collected by the parallel
+     * region and consumed serially below. */
     size_t  sub_bytes[C3D_N_SUBBANDS];
     float   sub_alpha[C3D_N_SUBBANDS];
     float   sub_step [C3D_N_SUBBANDS];
-    uint8_t *sub_out_ptr[C3D_N_SUBBANDS];
 
-    /* Upper-bound the per-subband output: max is ~2× max subband bytes
-     * (worst-case after freq table + rANS). */
-    const size_t out_scratch_size = (size_t)2 * 128 * 128 * 128 + 4096;
+    /* Precomputed upper-bound byte offsets per subband.  Each subband gets a
+     * dedicated slot in the encoder's subband_scratch region so threads can
+     * write directly to the final spot without a malloc/memcpy handoff.
+     * Upper bound per subband: 2× its raw voxel count + 1 KiB of framing.
+     * Sum across all 36 subbands = ~33 MiB — allocated once, reused. */
+    size_t sub_max_offset[C3D_N_SUBBANDS + 1];
+    sub_max_offset[0] = 0;
+    for (unsigned i = 0; i < C3D_N_SUBBANDS; ++i) {
+        c3d_subband_info sb;
+        c3d_subband_info_of(i, &sb);
+        size_t v = (size_t)sb.side * sb.side * sb.side;
+        sub_max_offset[i + 1] = sub_max_offset[i] + 2 * v + 1024;
+    }
+    const size_t subband_scratch_size = sub_max_offset[C3D_N_SUBBANDS];
+    /* Lazy-allocate the subband scratch in thread_out_scratch[0] — we repurpose
+     * this one existing pointer since the per-thread out_scratch is gone now. */
+    if (!s->thread_out_scratch[0]) {
+        s->thread_out_scratch[0] = malloc(subband_scratch_size);
+        c3d_assert(s->thread_out_scratch[0]);
+    }
+    uint8_t *subband_scratch = s->thread_out_scratch[0];
 
     #pragma omp parallel
     {
@@ -2979,25 +2996,26 @@ static size_t c3d_emit_entropy_at_q(float q, const c3d_encoder *s_const,
         if (tid >= C3D_OMP_MAX_THREADS) tid = 0;
 
         /* Lazy-alloc per-thread scratch pools.  Thread 0 aliases the encoder's
-         * original sub_symbols / sub_escapes / rans_scratch — no extra alloc. */
+         * original sub_symbols / sub_escapes / rans_scratch — no extra alloc.
+         * thread_out_scratch[0] is repurposed as the subband_scratch arena
+         * (allocated above), not a per-thread buffer. */
         #pragma omp critical(c3d_enc_alloc)
         {
             if (!s->thread_sub_symbols [tid]) s->thread_sub_symbols [tid] = malloc((size_t)128*128*128);
             if (!s->thread_sub_escapes [tid]) s->thread_sub_escapes [tid] = malloc((size_t)128*128*128/4 + 1024);
             if (!s->thread_rans_scratch[tid]) s->thread_rans_scratch[tid] = malloc(rans_scratch_size);
-            if (!s->thread_out_scratch [tid]) s->thread_out_scratch [tid] = malloc(out_scratch_size);
             c3d_assert(s->thread_sub_symbols [tid]);
             c3d_assert(s->thread_sub_escapes [tid]);
             c3d_assert(s->thread_rans_scratch[tid]);
-            c3d_assert(s->thread_out_scratch [tid]);
         }
 
         uint8_t *t_syms = s->thread_sub_symbols [tid];
         uint8_t *t_esc  = s->thread_sub_escapes [tid];
         uint8_t *t_rans = s->thread_rans_scratch[tid];
-        uint8_t *t_out  = s->thread_out_scratch [tid];
 
-        /* 36 subbands with wide size range → dynamic,1. */
+        /* 36 subbands with wide size range → dynamic,1.  Each worker writes
+         * its subband output directly into subband_scratch[sub_max_offset[i]..]
+         * — no intermediate t_out buffer, no per-subband malloc. */
         #pragma omp for schedule(dynamic,1)
         for (unsigned i = 0; i < C3D_N_SUBBANDS; ++i) {
             c3d_subband_info sb;
@@ -3018,29 +3036,23 @@ static size_t c3d_emit_entropy_at_q(float q, const c3d_encoder *s_const,
             float max_abs = s->has_max_abs ? s->max_abs_per_subband[i] : s->coeff_scale;
 
             float fitted_alpha = c3d_default_alpha(i);
+            uint8_t *slot = subband_scratch + sub_max_offset[i];
+            size_t slot_cap = sub_max_offset[i + 1] - sub_max_offset[i];
             size_t bytes = c3d_encode_one_subband(
                 s->coeff_buf, &sb, step, dz_ratio, denom_shift,
                 (ctx && ctx->has_freq_tables) ? ctx->freqs[i] : NULL,
                 t_syms, t_esc, t_rans, rans_scratch_size,
-                t_out, out_scratch_size,
+                slot, slot_cap,
                 max_abs, &fitted_alpha);
 
             sub_bytes[i] = bytes;
             sub_alpha[i] = fitted_alpha;
             sub_step [i] = step;
-            /* t_out gets overwritten on the worker's next iteration under
-             * dynamic scheduling, so copy the bytes into a per-subband
-             * owned buffer that survives.  36 small mallocs per encode —
-             * the serial concat loop below frees them. */
-            uint8_t *owned = malloc(bytes);
-            c3d_assert(owned);
-            memcpy(owned, t_out, bytes);
-            sub_out_ptr[i] = owned;
         }
     }
 
-    /* Serial: compute entropy offsets, copy each subband's bytes into `out`,
-     * free the per-subband owned buffers. */
+    /* Serial: compute entropy offsets, compact subband bytes from the
+     * slotted scratch into `out` (one memcpy per subband — no mallocs). */
     size_t entropy_pos = 0;
     for (unsigned i = 0; i < C3D_N_SUBBANDS; ++i) {
         c3d_write_f32_le(qmul_ptr + 4 * i, sub_step[i]);
@@ -3048,9 +3060,8 @@ static size_t c3d_emit_entropy_at_q(float q, const c3d_encoder *s_const,
         alpha_ptr[i] = c3d_alpha_to_u8(sub_alpha[i]);
         c3d_assert(entropy_pos + sub_bytes[i] <= entropy_cap);
         memcpy(out + C3D_CHUNK_FIXED_SIZE + entropy_pos,
-               sub_out_ptr[i], sub_bytes[i]);
+               subband_scratch + sub_max_offset[i], sub_bytes[i]);
         entropy_pos += sub_bytes[i];
-        free(sub_out_ptr[i]);
     }
 
     /* LOD offsets: the cumulative sizes at resolution boundaries.  Subband
