@@ -2041,13 +2041,37 @@ static void c3d_build_fine_hist(c3d_encoder *s) {
         if (mx <= 0.0f) continue;
         float inv_w = (float)C3D_FINE_BINS / mx;
         c3d_subband_info sb; c3d_subband_info_of(sidx, &sb);
+        /* Two-phase per row: NEON computes 4-wide fabs + bin index;
+         * scalar pass increments the histogram (scatter dependency). */
+        uint32_t bin_row[128];
         for (uint32_t z = sb.z0; z < sb.z0 + sb.side; ++z)
-        for (uint32_t y = sb.y0; y < sb.y0 + sb.side; ++y)
-        for (uint32_t x = sb.x0; x < sb.x0 + sb.side; ++x) {
-            float ac = fabsf(s->coeff_buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + x]);
-            uint32_t b = (uint32_t)(ac * inv_w);
-            if (b >= C3D_FINE_BINS) b = C3D_FINE_BINS - 1u;
-            pref[b + 1]++;
+        for (uint32_t y = sb.y0; y < sb.y0 + sb.side; ++y) {
+            const float *row = &s->coeff_buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + sb.x0];
+#if C3D_HAVE_NEON
+            float32x4_t vinv = vdupq_n_f32(inv_w);
+            uint32x4_t vclip = vdupq_n_u32(C3D_FINE_BINS - 1u);
+            uint32_t xx = 0;
+            for (; xx + 4 <= sb.side; xx += 4) {
+                float32x4_t a = vabsq_f32(vld1q_f32(row + xx));
+                uint32x4_t b = vcvtq_u32_f32(vmulq_f32(a, vinv));
+                b = vminq_u32(b, vclip);
+                vst1q_u32(bin_row + xx, b);
+            }
+            for (; xx < sb.side; ++xx) {
+                float ac = fabsf(row[xx]);
+                uint32_t b = (uint32_t)(ac * inv_w);
+                if (b >= C3D_FINE_BINS) b = C3D_FINE_BINS - 1u;
+                bin_row[xx] = b;
+            }
+#else
+            for (uint32_t xx = 0; xx < sb.side; ++xx) {
+                float ac = fabsf(row[xx]);
+                uint32_t b = (uint32_t)(ac * inv_w);
+                if (b >= C3D_FINE_BINS) b = C3D_FINE_BINS - 1u;
+                bin_row[xx] = b;
+            }
+#endif
+            for (uint32_t xx = 0; xx < sb.side; ++xx) pref[bin_row[xx] + 1]++;
         }
         for (unsigned i = 1; i <= C3D_FINE_BINS; ++i) pref[i] += pref[i - 1];
     }
@@ -3169,17 +3193,23 @@ static size_t c3d_emit_entropy_at_q(float q, const c3d_encoder *s_const,
         }
     }
 
-    /* Serial: compute entropy offsets, compact subband bytes from the
-     * slotted scratch into `out` (one memcpy per subband — no mallocs). */
+    /* Compute final entropy offsets serially (data dependency), write
+     * qmul/suboff/alpha metadata, then parallel-memcpy the subband bytes
+     * from scratch to `out` at the tight offsets. */
     size_t entropy_pos = 0;
+    size_t sub_final_off[C3D_N_SUBBANDS];
     for (unsigned i = 0; i < C3D_N_SUBBANDS; ++i) {
         c3d_write_f32_le(qmul_ptr + 4 * i, sub_step[i]);
         c3d_write_u32_le(suboff_ptr + 4 * i, (uint32_t)entropy_pos);
         alpha_ptr[i] = c3d_alpha_to_u8(sub_alpha[i]);
+        sub_final_off[i] = entropy_pos;
         c3d_assert(entropy_pos + sub_bytes[i] <= entropy_cap);
-        memcpy(out + C3D_CHUNK_FIXED_SIZE + entropy_pos,
-               subband_scratch + sub_max_offset[i], sub_bytes[i]);
         entropy_pos += sub_bytes[i];
+    }
+    #pragma omp parallel for schedule(dynamic,1)
+    for (unsigned i = 0; i < C3D_N_SUBBANDS; ++i) {
+        memcpy(out + C3D_CHUNK_FIXED_SIZE + sub_final_off[i],
+               subband_scratch + sub_max_offset[i], sub_bytes[i]);
     }
 
     /* LOD offsets: the cumulative sizes at resolution boundaries.  Subband
