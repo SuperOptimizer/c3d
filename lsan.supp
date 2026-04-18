@@ -1,0 +1,3 @@
+leak:libomp.so
+leak:libgomp.so
+leak:__kmp_

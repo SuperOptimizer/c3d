@@ -1,0 +1,25 @@
+---
+# Curated clang-tidy for a single-file C23 codec.
+#
+# Include: correctness, portability, security.
+# Exclude: checks that fight idiomatic C, policing, or C++/STL patterns.
+# Project-specific carve-outs:
+#   - bugprone-implicit-widening-of-multiplication-result: chunk/subband
+#     sides are power-of-2 <= 256; uint32 * uint32 can't overflow at our scales.
+#   - cert-env33-c, cert-err34-c, bugprone-unsafe-functions: CLI tools
+#     legitimately use atoi/fopen/sprintf; POSIX _s variants aren't portable.
+#   - performance-no-int-to-ptr: (char *)(uintptr_t)<string-literal> is a
+#     standard idiom for building exec() argv arrays.
+#   - readability-misleading-indentation: conflicts with our triple-for
+#     compact loop style (for/for/for one-liner is idiomatic here).
+#   - readability-uppercase-literal-suffix: project convention uses lowercase.
+
+Checks: 'bugprone-*,cert-*,clang-analyzer-*,misc-*,performance-*,portability-*,readability-inconsistent-declaration-parameter-name,readability-redundant-*,readability-simplify-*,readability-string-compare,-bugprone-easily-swappable-parameters,-bugprone-assignment-in-if-condition,-bugprone-narrowing-conversions,-bugprone-branch-clone,-bugprone-switch-missing-default-case,-bugprone-macro-parentheses,-bugprone-multi-level-implicit-pointer-conversion,-bugprone-suspicious-realloc-usage,-bugprone-implicit-widening-of-multiplication-result,-bugprone-unsafe-functions,-cert-env33-c,-cert-err33-c,-cert-err34-c,-cert-flp30-c,-cert-dcl03-c,-cert-dcl16-c,-cert-msc30-c,-cert-msc32-c,-cert-msc50-cpp,-cert-msc51-cpp,-cert-err58-cpp,-clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling,-performance-no-int-to-ptr,-misc-include-cleaner,-misc-unused-parameters,-misc-no-recursion,-misc-static-assert,-misc-header-include-cycle,-readability-redundant-preprocessor'
+
+WarningsAsErrors: ''
+HeaderFilterRegex: '^(c3d\.h|c3d_.*\.h)$'
+FormatStyle: file
+CheckOptions:
+  - key: misc-non-private-member-variables-in-classes.IgnoreClassesWithAllMemberVariablesBeingPublic
+    value: true
+...
