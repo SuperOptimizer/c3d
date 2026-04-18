@@ -255,6 +255,112 @@ lod   side   bytes_read    out_vox     dec_ms dec_MB/s_out
   0    256       126395   16777216     108.57      147.4
 ```
 
+## LOD structure and viewer-cache design
+
+A single c3d bitstream embeds all 6 LODs (256³ → 8³) in resolution-first
+order — no duplicate coefficients across LODs, one file on disk.  The
+chunk header contains `lod_offset[6]`, a prefix-length table; feed the
+decoder `388 + lod_offset[lod]` bytes and it'll produce exactly that LOD.
+
+### Byte fraction per LOD vs quantizer
+
+Fraction of the bitstream needed to reach each LOD, measured on one scroll
+chunk across the R-D curve:
+
+```
+       q    total_B    LOD5%    LOD4%    LOD3%    LOD2%    LOD1%    LOD0%
+ 0.01562    1215875    0.09%    0.43%    2.18%   12.37%   54.38%  100.00%  (~14:1 near-lossless)
+ 0.03125     505642    0.20%    0.88%    4.25%   22.95%   82.06%  100.00%  (~33:1)
+ 0.06250     224404    0.39%    1.60%    7.45%   36.91%   95.70%  100.00%  (~75:1)
+ 0.12500      93694    0.80%    3.01%   13.03%   54.71%   98.16%  100.00%  (~180:1)
+ 0.25000      29977    2.19%    7.19%   26.67%   79.74%   99.95%  100.00%  (~560:1)
+ 0.50000       9116    6.36%   17.26%   48.15%   96.20%   99.85%  100.00%  (~1840:1)
+```
+
+The level-1 detail subbands (the finest-scale wavelet coefficients, holding
+87.5% of all coefficient *slots*) carry most of the *bytes* at near-lossless
+but collapse to near-zero at high compression — they're mostly dead-zone
+quantized, each empty subband hits a 2-byte sentinel.
+
+Practical reading: **at near-lossless a coarse-browse tier (LOD 3-5) reads
+< 5% of the bitstream; at lossy it reads < 15%**.  Range-read / HTTP partial-
+content requests give a real I/O win across the whole R-D curve.  LOD 1 is
+a much smaller win than LOD 3 unless you're at near-lossless.
+
+### Decode time per LOD
+
+Decode time is NOT proportional to bitstream bytes — it scales with
+*output voxels* because the inverse DWT synthesis cost grows 8× per level.
+Measurements across the same R-D points (single-thread, X1E, Release + PGO):
+
+```
+             LOD 5    LOD 4    LOD 3    LOD 2    LOD 1    LOD 0
+q=0.016     0.01 ms  0.05 ms  0.35 ms  2.83 ms 25.87 ms 142.92 ms
+q=0.063     0.01     0.05     0.40     3.13    18.80   120.34
+q=0.100     0.01     0.05     0.42     2.86    16.52   113.97
+q=0.500     0.01     0.04     0.28     1.58    12.49   103.76
+```
+
+Observations:
+
+- **LOD 1 → LOD 0 always costs ~100 ms** of added decode time, independent
+  of q.  That's the 256³ DWT synthesis pass + quant + u8 clip — voxel-count-
+  bound, not byte-count-bound.
+- **Each step coarser is ~8× cheaper.**  LOD 2 (3 ms) → LOD 3 (0.4 ms) →
+  LOD 4 (0.05 ms) → LOD 5 (0.01 ms).  Thumbnail-scale decoding is essentially
+  free.
+- **Entropy-decode cost varies with q** (26 ms vs 12 ms at LOD 1 for
+  near-lossless vs lossy) but it's a minor slice under the DWT floor.
+
+### Is LOD 0 worth materialising at high compression?
+
+Yes at 50-100× (the typical interactive-viewer target), no at >500×.
+
+At each operating point, PSNR of LOD 0 (full decode) vs LOD 1 upscaled to
+256³ via trilinear interpolation, both compared against the original:
+
+```
+    q    ratio   |  LOD 0 PSNR   upscaled LOD 1   gap
+ 0.063    75:1   |    35.07         30.50        +4.57 dB   ← interactive
+ 0.100   133:1   |    32.16         29.53        +2.63 dB   ← interactive
+ 0.250   558:1   |    26.78         26.19        +0.59 dB
+ 0.500  1840:1   |    23.48         23.37        +0.11 dB   ← collapses
+ 1.000  6000:1   |    20.56         20.58         0.00 dB
+```
+
+In the 50-100× band, LOD 0 holds **+3-5 dB of genuine fine-edge structure**
+that no cheap upscale can recover.  That's visually significant for fiber
+detail in scroll CT.  The collapse only happens past ~500:1 where the
+level-1 detail subbands have been quantized to near-zero.
+
+### Architectural guidance for a tile-pyramid viewer
+
+For interactive browsing of a scroll archive at 50-100× compression:
+
+- **Disk store:** the compressed bitstream.  ~100 KiB–1 MiB per 256³ chunk.
+  One file per spatial region covers the whole pyramid.
+- **Always-resident cache tier:** the bitstream bytes themselves.  Cheap
+  to keep, lossless, sufficient to produce any LOD on demand.
+- **LOD 2 (64³, ~3 ms decode):** overview / thumbnail tier for zoom-out
+  views where many chunks are on screen.  Trivially parallel.
+- **LOD 1 (128³, ~17 ms decode):** default scrub tier.  Good enough for any
+  render target up to ~128 screen pixels tall without quality loss.
+- **LOD 0 (256³, ~115 ms decode):** committed-view tier.  Trigger on
+  dwell (≥ 150 ms), zoom level past a pixel-ratio threshold, or explicit
+  full-res tools (segmentation, annotation).  The 100 ms cost is within
+  normal human dwell latency — fine for interactive use as long as you're
+  not blocking cursor-move.
+- **Eviction:** LOD 0 u8 buffers (16 MiB each) get evicted first under
+  pressure; LOD 1 (2 MiB) persists longer; LOD 5 (512 B) essentially
+  free to hold indefinitely.  Re-decoding LOD 0 from a cached bitstream
+  is a normal hot path, not a fallback.
+
+Note: a fetched LOD 1 prefix already contains 98% of the bytes at 50-100×
+compression.  If you've paid the bandwidth to get LOD 1, range-reading the
+last 2% to have the full bitstream is essentially free.  The cost of
+"upgrading" a view from LOD 1 to LOD 0 is compute (the 256³ DWT pass), not
+I/O.
+
 ## Design constraints
 
 - **C23**, single `c3d.c` + `c3d.h`, libc only. Video-codec baselines
