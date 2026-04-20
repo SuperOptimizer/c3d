@@ -39,7 +39,7 @@ int main(int argc, char **argv) {
     c3d_decoder *decoder = c3d_decoder_new();
 
     /* Warm up caches / JIT / etc. */
-    (void)c3d_encoder_chunk_encode_at_q(encoder, in, 0.1f, NULL, enc, c3d_chunk_encode_max_size());
+    (void)c3d_encoder_chunk_encode_at_q(encoder, in, 0.1f, enc, c3d_chunk_encode_max_size());
 
     const float qs[] = { 1.0f/32.0f, 0.05f, 0.1f, 0.5f };
     const int N_REPEAT = 3;
@@ -52,11 +52,11 @@ int main(int argc, char **argv) {
         double t_enc = 0.0, t_dec = 0.0;
         for (int r = 0; r < N_REPEAT; ++r) {
             double t0 = now_s();
-            esz = c3d_encoder_chunk_encode_at_q(encoder, in, q, NULL, enc, c3d_chunk_encode_max_size());
+            esz = c3d_encoder_chunk_encode_at_q(encoder, in, q, enc, c3d_chunk_encode_max_size());
             t_enc += now_s() - t0;
 
             t0 = now_s();
-            c3d_decoder_chunk_decode(decoder, enc, esz, NULL, dec);
+            c3d_decoder_chunk_decode(decoder, enc, esz, dec);
             t_dec += now_s() - t0;
         }
         double enc_ms = 1000.0 * t_enc / N_REPEAT;
@@ -72,7 +72,7 @@ int main(int argc, char **argv) {
      * k = coarser resolution = fewer bytes read and fewer IDWT levels run. */
     {
         float q_fixed = 0.1f;
-        size_t esz = c3d_encoder_chunk_encode_at_q(encoder, in, q_fixed, NULL,
+        size_t esz = c3d_encoder_chunk_encode_at_q(encoder, in, q_fixed,
                                                    enc, c3d_chunk_encode_max_size());
         c3d_chunk_info info;
         c3d_chunk_inspect(enc, esz, &info);
@@ -94,7 +94,7 @@ int main(int argc, char **argv) {
             double t0 = now_s();
             for (int r = 0; r < REPS; ++r) {
                 c3d_decoder_chunk_decode_lod(decoder, enc, esz, (uint8_t)lod,
-                                             NULL, out_lod);
+                                             out_lod);
             }
             double t = (now_s() - t0) / REPS;
             double mbps_out = ((double)out_vox / (1024.0 * 1024.0)) / t;

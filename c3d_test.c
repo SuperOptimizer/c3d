@@ -772,26 +772,26 @@ static void test_chunk_encode_decode_at_q(void) {
     make_test_chunk(in);
 
     /* Smallest allowed q (per C3D_Q_MIN = 2^-6) → finest possible quantization. */
-    size_t sz = c3d_chunk_encode_at_q(in, 1.0f / 64.0f, NULL, enc, C3D_CHUNK_ENCODE_MAX_SIZE);
+    size_t sz = c3d_chunk_encode_at_q(in, 1.0f / 64.0f, enc, C3D_CHUNK_ENCODE_MAX_SIZE);
     CHECK(sz > 352 && sz <= C3D_CHUNK_ENCODE_MAX_SIZE);
     CHECK(c3d_chunk_validate(enc, sz));
-    c3d_chunk_decode(enc, sz, NULL, dec);
+    c3d_chunk_decode(enc, sz, dec);
     double psnr_fine = measure_psnr(in, dec, C3D_VOXELS_PER_CHUNK);
     printf("  q=1/64 (finest):  size=%zu PSNR=%.1f dB\n", sz, psnr_fine);
     CHECK(psnr_fine > 40.0);
 
     /* Moderate q. */
-    sz = c3d_chunk_encode_at_q(in, 0.1f, NULL, enc, C3D_CHUNK_ENCODE_MAX_SIZE);
+    sz = c3d_chunk_encode_at_q(in, 0.1f, enc, C3D_CHUNK_ENCODE_MAX_SIZE);
     CHECK(sz < C3D_VOXELS_PER_CHUNK / 2);
-    c3d_chunk_decode(enc, sz, NULL, dec);
+    c3d_chunk_decode(enc, sz, dec);
     double psnr_mid = measure_psnr(in, dec, C3D_VOXELS_PER_CHUNK);
     printf("  q=0.1   (moderate): size=%zu PSNR=%.1f dB\n", sz, psnr_mid);
     CHECK(psnr_mid > 30.0);
 
     /* Aggressive. */
-    sz = c3d_chunk_encode_at_q(in, 2.0f, NULL, enc, C3D_CHUNK_ENCODE_MAX_SIZE);
+    sz = c3d_chunk_encode_at_q(in, 2.0f, enc, C3D_CHUNK_ENCODE_MAX_SIZE);
     CHECK(sz < 20000);
-    c3d_chunk_decode(enc, sz, NULL, dec);
+    c3d_chunk_decode(enc, sz, dec);
     double psnr_coarse = measure_psnr(in, dec, C3D_VOXELS_PER_CHUNK);
     printf("  q=2.0   (coarse):   size=%zu PSNR=%.1f dB\n", sz, psnr_coarse);
     CHECK(psnr_coarse > 15.0);
@@ -813,7 +813,7 @@ static void test_chunk_rate_control(void) {
     float ratios[] = {2.0f, 10.0f, 100.0f};
     for (size_t i = 0; i < sizeof ratios / sizeof ratios[0]; ++i) {
         float r = ratios[i];
-        size_t sz = c3d_chunk_encode(in, r, NULL, enc, C3D_CHUNK_ENCODE_MAX_SIZE);
+        size_t sz = c3d_chunk_encode(in, r, enc, C3D_CHUNK_ENCODE_MAX_SIZE);
         size_t target = (size_t)((double)C3D_VOXELS_PER_CHUNK / (double)r);
         double rel_err = (double)((long)sz - (long)target) / (double)target;
         if (rel_err < 0) rel_err = -rel_err;
@@ -823,7 +823,7 @@ static void test_chunk_rate_control(void) {
         CHECK(rel_err < 3.0);
         CHECK(c3d_chunk_validate(enc, sz));
 
-        c3d_chunk_decode(enc, sz, NULL, dec);
+        c3d_chunk_decode(enc, sz, dec);
         /* On this smooth input, even 100:1 should give OK PSNR. */
         double psnr = measure_psnr(in, dec, C3D_VOXELS_PER_CHUNK);
         CHECK(psnr > 20.0);
@@ -848,10 +848,10 @@ static void test_chunk_truncated_decode(void) {
     c3d_assert(in && dec && enc);
     make_test_chunk(in);
 
-    size_t full = c3d_chunk_encode(in, 10.0f, NULL, enc, C3D_CHUNK_ENCODE_MAX_SIZE);
+    size_t full = c3d_chunk_encode(in, 10.0f, enc, C3D_CHUNK_ENCODE_MAX_SIZE);
     CHECK(full > 400);
 
-    c3d_chunk_decode(enc, full, NULL, dec);
+    c3d_chunk_decode(enc, full, dec);
     double psnr_full = measure_psnr(in, dec, C3D_VOXELS_PER_CHUNK);
     CHECK(psnr_full > 30.0);
 
@@ -861,7 +861,7 @@ static void test_chunk_truncated_decode(void) {
     for (size_t i = 0; i < sizeof fracs / sizeof fracs[0]; ++i) {
         size_t trunc = (size_t)((double)full * fracs[i]);
         if (trunc < C3D_CHUNK_FIXED_SIZE) trunc = C3D_CHUNK_FIXED_SIZE;
-        c3d_chunk_decode(enc, trunc, NULL, dec);
+        c3d_chunk_decode(enc, trunc, dec);
         double p = measure_psnr(in, dec, C3D_VOXELS_PER_CHUNK);
         printf("  frac=%.2f  bytes=%7zu  PSNR=%.2f dB\n", fracs[i], trunc, p);
         CHECK(p > 15.0);   /* above LL-only floor for this synthetic chunk */
@@ -870,7 +870,7 @@ static void test_chunk_truncated_decode(void) {
     /* Header-only decode (exactly C3D_CHUNK_FIXED_SIZE bytes): no entropy
      * payload at all; every subband zero-filled; output is the chunk's
      * dc_offset + 128 (constant value).  Must still not panic. */
-    c3d_chunk_decode(enc, C3D_CHUNK_FIXED_SIZE, NULL, dec);
+    c3d_chunk_decode(enc, C3D_CHUNK_FIXED_SIZE, dec);
 
     free(in); free(dec); free(enc);
 }
@@ -893,17 +893,17 @@ static void test_chunk_deterministic_encode(void) {
     for (size_t i = 0; i < sizeof ratios / sizeof ratios[0]; ++i) {
         float r = ratios[i];
         /* Path 1: stateless API, two separate calls. */
-        size_t sz_a = c3d_chunk_encode(in, r, NULL, a, C3D_CHUNK_ENCODE_MAX_SIZE);
-        size_t sz_b = c3d_chunk_encode(in, r, NULL, b, C3D_CHUNK_ENCODE_MAX_SIZE);
+        size_t sz_a = c3d_chunk_encode(in, r, a, C3D_CHUNK_ENCODE_MAX_SIZE);
+        size_t sz_b = c3d_chunk_encode(in, r, b, C3D_CHUNK_ENCODE_MAX_SIZE);
         CHECK_EQ(sz_a, sz_b);
         CHECK(memcmp(a, b, sz_a) == 0);
 
         /* Path 2: reused encoder context — must produce same bytes as fresh. */
         c3d_encoder *e = c3d_encoder_new();
         /* Warm the context once so last_q is set; then re-encode. */
-        size_t sz_warm = c3d_encoder_chunk_encode(e, in, r, NULL, b,
+        size_t sz_warm = c3d_encoder_chunk_encode(e, in, r, b,
                                                   C3D_CHUNK_ENCODE_MAX_SIZE);
-        size_t sz_c    = c3d_encoder_chunk_encode(e, in, r, NULL, b,
+        size_t sz_c    = c3d_encoder_chunk_encode(e, in, r, b,
                                                   C3D_CHUNK_ENCODE_MAX_SIZE);
         CHECK_EQ(sz_warm, sz_c);
         CHECK_EQ(sz_a, sz_c);
@@ -911,8 +911,8 @@ static void test_chunk_deterministic_encode(void) {
         c3d_encoder_free(e);
 
         /* Path 3: round-trip must match between the two paths. */
-        c3d_chunk_decode(a, sz_a, NULL, dec_a);
-        c3d_chunk_decode(b, sz_a, NULL, dec_b);
+        c3d_chunk_decode(a, sz_a, dec_a);
+        c3d_chunk_decode(b, sz_a, dec_b);
         CHECK(memcmp(dec_a, dec_b, C3D_VOXELS_PER_CHUNK) == 0);
     }
     free(in); free(a); free(b); free(dec_a); free(dec_b);
@@ -946,18 +946,18 @@ static void test_chunks_batched(void) {
     c3d_decoder *dc = c3d_decoder_new();
 
     /* Batched path. */
-    c3d_encoder_chunks_encode(e, ins_const, N, 25.0f, NULL,
+    c3d_encoder_chunks_encode(e, ins_const, N, 25.0f,
                               outs_batch, sizes_batch);
     const uint8_t *batch_ins[3] = { outs_batch[0], outs_batch[1], outs_batch[2] };
-    c3d_decoder_chunks_decode(dc, batch_ins, sizes_batch, N, NULL, decs_batch);
+    c3d_decoder_chunks_decode(dc, batch_ins, sizes_batch, N, decs_batch);
 
     /* Reference path — same encoder/decoder, called per chunk. */
     c3d_encoder *e2 = c3d_encoder_new();
     c3d_decoder *dc2 = c3d_decoder_new();
     for (size_t i = 0; i < N; ++i) {
         sizes_one[i] = c3d_encoder_chunk_encode(
-            e2, ins[i], 25.0f, NULL, outs_one[i], C3D_CHUNK_ENCODE_MAX_SIZE);
-        c3d_decoder_chunk_decode(dc2, outs_one[i], sizes_one[i], NULL, decs_one[i]);
+            e2, ins[i], 25.0f, outs_one[i], C3D_CHUNK_ENCODE_MAX_SIZE);
+        c3d_decoder_chunk_decode(dc2, outs_one[i], sizes_one[i], decs_one[i]);
     }
 
     for (size_t i = 0; i < N; ++i) {
@@ -980,7 +980,7 @@ static void test_chunk_lod_decode(void) {
     c3d_assert(in && enc);
     make_test_chunk(in);
 
-    size_t sz = c3d_chunk_encode_at_q(in, 0.05f, NULL, enc, C3D_CHUNK_ENCODE_MAX_SIZE);
+    size_t sz = c3d_chunk_encode_at_q(in, 0.05f, enc, C3D_CHUNK_ENCODE_MAX_SIZE);
     CHECK(sz > 352);
 
     /* Every LOD decode must succeed and produce the correct sized buffer. */
@@ -988,7 +988,7 @@ static void test_chunk_lod_decode(void) {
         size_t side = (size_t)C3D_CHUNK_SIDE >> k;
         uint8_t *out = aligned_alloc(C3D_ALIGN, side * side * side);
         c3d_assert(out);
-        c3d_chunk_decode_lod(enc, sz, (uint8_t)k, NULL, out);
+        c3d_chunk_decode_lod(enc, sz, (uint8_t)k, out);
         /* Output must be u8 values — just check at least one non-zero
          * (on this non-trivial input).  Values 128 all over would still
          * be "valid" for a uniform chunk, but our input isn't uniform. */
@@ -1010,7 +1010,7 @@ static void test_chunk_empty(void) {
     c3d_assert(in && dec && enc);
 
     memset(in, 77, C3D_VOXELS_PER_CHUNK);   /* uniform */
-    size_t sz = c3d_chunk_encode_at_q(in, 1.0f / 32.0f, NULL, enc, C3D_CHUNK_ENCODE_MAX_SIZE);
+    size_t sz = c3d_chunk_encode_at_q(in, 1.0f / 32.0f, enc, C3D_CHUNK_ENCODE_MAX_SIZE);
     CHECK_EQ(sz, (size_t)C3D_CHUNK_FIXED_SIZE);
 
     c3d_chunk_info info;
@@ -1018,7 +1018,7 @@ static void test_chunk_empty(void) {
     for (unsigned k = 0; k < C3D_N_LODS; ++k) CHECK_EQ(info.lod_offsets[k], 0u);
     CHECK(c3d_chunk_validate(enc, sz));
 
-    c3d_chunk_decode(enc, sz, NULL, dec);
+    c3d_chunk_decode(enc, sz, dec);
     /* All dec voxels should be 77 (recovered from dc_offset). */
     bool all_77 = true;
     for (size_t i = 0; i < C3D_VOXELS_PER_CHUNK; ++i) {
@@ -1052,11 +1052,11 @@ static void test_chunk_encode_masked(void) {
     for (uint32_t x = 0; x < 128; ++x)
         in[(size_t)z * C3D_CHUNK_SIDE * C3D_CHUNK_SIDE + y * C3D_CHUNK_SIDE + x] = 0;
 
-    size_t sz = c3d_chunk_encode_masked(in, 50.0f, NULL, enc, C3D_CHUNK_ENCODE_MAX_SIZE);
+    size_t sz = c3d_chunk_encode_masked(in, 50.0f, enc, C3D_CHUNK_ENCODE_MAX_SIZE);
     CHECK(sz > 352 && sz <= C3D_CHUNK_ENCODE_MAX_SIZE);
     CHECK(c3d_chunk_validate(enc, sz));
 
-    c3d_chunk_decode(enc, sz, NULL, dec);
+    c3d_chunk_decode(enc, sz, dec);
 
     /* Material-only PSNR (x >= 128): material voxels in `in` (non-zero) vs
      * decoded values.  Should be reasonably high at 50× target. */
@@ -1074,9 +1074,9 @@ static void test_chunk_encode_masked(void) {
 
     /* All-zero input (e.g. pure-black padding chunk) → empty-chunk fast path. */
     memset(in, 0, C3D_VOXELS_PER_CHUNK);
-    sz = c3d_chunk_encode_masked(in, 50.0f, NULL, enc, C3D_CHUNK_ENCODE_MAX_SIZE);
+    sz = c3d_chunk_encode_masked(in, 50.0f, enc, C3D_CHUNK_ENCODE_MAX_SIZE);
     CHECK_EQ(sz, (size_t)C3D_CHUNK_FIXED_SIZE);
-    c3d_chunk_decode(enc, sz, NULL, dec);
+    c3d_chunk_decode(enc, sz, dec);
     for (size_t i = 0; i < C3D_VOXELS_PER_CHUNK; ++i) CHECK_EQ(dec[i], 0);
 
     /* 99%-air sparse chunk: a single thin 16³ cluster of material, rest 0.
@@ -1086,9 +1086,9 @@ static void test_chunk_encode_masked(void) {
     for (uint32_t y = 120; y < 136; ++y)
     for (uint32_t x = 120; x < 136; ++x)
         in[(size_t)z*C3D_CHUNK_SIDE*C3D_CHUNK_SIDE + y*C3D_CHUNK_SIDE + x] = 150;
-    sz = c3d_chunk_encode_masked(in, 50.0f, NULL, enc, C3D_CHUNK_ENCODE_MAX_SIZE);
+    sz = c3d_chunk_encode_masked(in, 50.0f, enc, C3D_CHUNK_ENCODE_MAX_SIZE);
     CHECK(c3d_chunk_validate(enc, sz));
-    c3d_chunk_decode(enc, sz, NULL, dec);
+    c3d_chunk_decode(enc, sz, dec);
     /* Material cluster should reconstruct close to 150. */
     double s = 0; size_t n = 0;
     for (uint32_t z = 120; z < 136; ++z)
@@ -1107,9 +1107,9 @@ static void test_chunk_encode_masked(void) {
      * fast path. */
     memset(in, 0, C3D_VOXELS_PER_CHUNK);
     for (size_t i = 0; i < 1024; ++i) in[i * 1024] = 255;
-    sz = c3d_chunk_encode_masked(in, 50.0f, NULL, enc, C3D_CHUNK_ENCODE_MAX_SIZE);
+    sz = c3d_chunk_encode_masked(in, 50.0f, enc, C3D_CHUNK_ENCODE_MAX_SIZE);
     CHECK_EQ(sz, (size_t)C3D_CHUNK_FIXED_SIZE);
-    c3d_chunk_decode(enc, sz, NULL, dec);
+    c3d_chunk_decode(enc, sz, dec);
     for (size_t i = 0; i < C3D_VOXELS_PER_CHUNK; ++i) CHECK_EQ(dec[i], 255);
 
     /* Determinism: same input → same output bytes under _masked. */
@@ -1119,8 +1119,8 @@ static void test_chunk_encode_masked(void) {
     for (uint32_t x = 0; x < 128; ++x)
         in[(size_t)z * C3D_CHUNK_SIDE * C3D_CHUNK_SIDE + y * C3D_CHUNK_SIDE + x] = 0;
     uint8_t *enc2 = aligned_alloc(C3D_ALIGN, C3D_CHUNK_ENCODE_MAX_SIZE);
-    size_t sz1 = c3d_chunk_encode_masked(in, 50.0f, NULL, enc,  C3D_CHUNK_ENCODE_MAX_SIZE);
-    size_t sz2 = c3d_chunk_encode_masked(in, 50.0f, NULL, enc2, C3D_CHUNK_ENCODE_MAX_SIZE);
+    size_t sz1 = c3d_chunk_encode_masked(in, 50.0f, enc,  C3D_CHUNK_ENCODE_MAX_SIZE);
+    size_t sz2 = c3d_chunk_encode_masked(in, 50.0f, enc2, C3D_CHUNK_ENCODE_MAX_SIZE);
     CHECK_EQ(sz1, sz2);
     CHECK(memcmp(enc, enc2, sz1) == 0);
     free(enc2);
@@ -1138,127 +1138,9 @@ static void test_chunk_validate_rejects_garbage(void) {
     c3d_write_u16_le(buf + 4, 2);               /* wrong version */
     CHECK(!c3d_chunk_validate(buf, 512));
 
-    c3d_write_u16_le(buf + 4, 1);
-    buf[6] = 2;                                 /* invalid context_mode */
-    CHECK(!c3d_chunk_validate(buf, 512));
 }
 
 /* ─── §J  shard tests ────────────────────────────────────────────────────── */
-
-static void test_shard_empty_roundtrip(void) {
-    uint32_t origin[3] = {1024, 2048, 4096};
-    c3d_shard *s = c3d_shard_new(origin, 2);
-    /* All slots ABSENT by default. */
-    CHECK_EQ(c3d_shard_chunk_count(s, C3D_CHUNK_ABSENT), 4096u);
-    CHECK_EQ(c3d_shard_chunk_count(s, C3D_CHUNK_ZERO), 0u);
-    CHECK_EQ(c3d_shard_chunk_count(s, C3D_CHUNK_PRESENT), 0u);
-
-    size_t need = c3d_shard_max_serialized_size(s);
-    CHECK_EQ(need, (size_t)C3D_SHARD_PAYLOADS_MIN_OFFSET);   /* header + index, no ctx, no payloads */
-    uint8_t *buf = malloc(need);
-    c3d_assert(buf);
-    size_t wrote = c3d_shard_serialize(s, buf, need);
-    CHECK_EQ(wrote, need);
-
-    c3d_shard *s2 = c3d_shard_parse(buf, wrote);
-    CHECK_EQ(c3d_shard_chunk_count(s2, C3D_CHUNK_ABSENT), 4096u);
-    c3d_shard_free(s2);
-
-    c3d_shard_free(s);
-    free(buf);
-}
-
-static void test_shard_sentinels(void) {
-    uint32_t origin[3] = {0, 0, 0};
-    c3d_shard *s = c3d_shard_new(origin, 0);
-
-    c3d_shard_mark_zero(s, 3, 7, 11);
-    c3d_shard_mark_zero(s, 15, 15, 15);
-    CHECK_EQ(c3d_shard_chunk_count(s, C3D_CHUNK_ZERO), 2u);
-    CHECK_EQ(c3d_shard_chunk_count(s, C3D_CHUNK_ABSENT), 4094u);
-    CHECK_EQ(c3d_shard_chunk_state(s, 3, 7, 11), C3D_CHUNK_ZERO);
-    CHECK_EQ(c3d_shard_chunk_state(s, 0, 0, 0), C3D_CHUNK_ABSENT);
-
-    /* Round-trip preserves sentinels. */
-    size_t need = c3d_shard_max_serialized_size(s);
-    uint8_t *buf = malloc(need); c3d_assert(buf);
-    size_t wrote = c3d_shard_serialize(s, buf, need);
-
-    c3d_shard *s2 = c3d_shard_parse(buf, wrote);
-    CHECK_EQ(c3d_shard_chunk_count(s2, C3D_CHUNK_ZERO), 2u);
-    CHECK_EQ(c3d_shard_chunk_count(s2, C3D_CHUNK_ABSENT), 4094u);
-    CHECK_EQ(c3d_shard_chunk_state(s2, 3, 7, 11), C3D_CHUNK_ZERO);
-    CHECK_EQ(c3d_shard_chunk_state(s2, 15, 15, 15), C3D_CHUNK_ZERO);
-    c3d_shard_free(s); c3d_shard_free(s2); free(buf);
-}
-
-static void test_shard_put_encode_decode(void) {
-    uint32_t origin[3] = {100, 200, 300};
-    c3d_shard *s = c3d_shard_new(origin, 0);
-
-    uint8_t *chunk_in  = aligned_alloc(C3D_ALIGN, C3D_VOXELS_PER_CHUNK);
-    uint8_t *chunk_out = aligned_alloc(C3D_ALIGN, C3D_VOXELS_PER_CHUNK);
-    c3d_assert(chunk_in && chunk_out);
-    make_test_chunk(chunk_in);
-
-    /* Install into slot (4, 8, 12). */
-    c3d_shard_encode_chunk(s, 4, 8, 12, chunk_in, 10.0f);
-    CHECK_EQ(c3d_shard_chunk_state(s, 4, 8, 12), C3D_CHUNK_PRESENT);
-    CHECK_EQ(c3d_shard_chunk_count(s, C3D_CHUNK_PRESENT), 1u);
-
-    /* Decode through shard. */
-    c3d_shard_decode_chunk(s, 4, 8, 12, chunk_out);
-    double psnr = measure_psnr(chunk_in, chunk_out, C3D_VOXELS_PER_CHUNK);
-    CHECK(psnr > 25.0);
-
-    /* Round-trip through serialize/parse (non-copy), decode again, must match. */
-    size_t need = c3d_shard_max_serialized_size(s);
-    uint8_t *buf = malloc(need); c3d_assert(buf);
-    size_t wrote = c3d_shard_serialize(s, buf, need);
-    CHECK(wrote > C3D_SHARD_PAYLOADS_MIN_OFFSET);
-
-    c3d_shard *s2 = c3d_shard_parse(buf, wrote);
-    CHECK_EQ(c3d_shard_chunk_state(s2, 4, 8, 12), C3D_CHUNK_PRESENT);
-
-    uint8_t *chunk_out2 = aligned_alloc(C3D_ALIGN, C3D_VOXELS_PER_CHUNK);
-    c3d_assert(chunk_out2);
-    c3d_shard_decode_chunk(s2, 4, 8, 12, chunk_out2);
-    CHECK(memcmp(chunk_out, chunk_out2, C3D_VOXELS_PER_CHUNK) == 0);
-
-    /* parse_copy path. */
-    c3d_shard *s3 = c3d_shard_parse_copy(buf, wrote);
-    memset(chunk_out2, 0, C3D_VOXELS_PER_CHUNK);
-    c3d_shard_decode_chunk(s3, 4, 8, 12, chunk_out2);
-    CHECK(memcmp(chunk_out, chunk_out2, C3D_VOXELS_PER_CHUNK) == 0);
-    /* Free the source bytes — copy shard must still work. */
-    free(buf); buf = NULL;
-    memset(chunk_out2, 0, C3D_VOXELS_PER_CHUNK);
-    c3d_shard_decode_chunk(s3, 4, 8, 12, chunk_out2);
-    CHECK(memcmp(chunk_out, chunk_out2, C3D_VOXELS_PER_CHUNK) == 0);
-
-    c3d_shard_free(s); c3d_shard_free(s2); c3d_shard_free(s3);
-    free(chunk_in); free(chunk_out); free(chunk_out2);
-}
-
-static void test_shard_decode_zero_slot(void) {
-    uint32_t origin[3] = {0, 0, 0};
-    c3d_shard *s = c3d_shard_new(origin, 0);
-    c3d_shard_mark_zero(s, 1, 2, 3);
-
-    uint8_t *chunk_out = aligned_alloc(C3D_ALIGN, C3D_VOXELS_PER_CHUNK);
-    c3d_assert(chunk_out);
-    memset(chunk_out, 0xff, C3D_VOXELS_PER_CHUNK);   /* pre-fill garbage */
-    c3d_shard_decode_chunk(s, 1, 2, 3, chunk_out);
-    for (size_t i = 0; i < C3D_VOXELS_PER_CHUNK; ++i) CHECK_EQ(chunk_out[i], 0u);
-
-    /* LOD-partial decode of ZERO: also zero-filled at the appropriate size. */
-    uint8_t thumbnail[32*32*32];
-    memset(thumbnail, 0xff, sizeof thumbnail);
-    c3d_shard_decode_chunk_lod(s, 1, 2, 3, 3, thumbnail);
-    for (size_t i = 0; i < sizeof thumbnail; ++i) CHECK_EQ(thumbnail[i], 0u);
-
-    c3d_shard_free(s); free(chunk_out);
-}
 
 /* ─── downsample helper ──────────────────────────────────────────────────── */
 
@@ -1286,175 +1168,6 @@ static void test_downsample_2x(void) {
     memset(in, 100, sizeof in);
     c3d_downsample_chunk_2x(in, 16, out);
     for (size_t i = 0; i < sizeof out; ++i) CHECK_EQ(out[i], 100u);
-}
-
-/* ─── §K  .c3dx ctx + EXTERNAL-mode chunk tests ──────────────────────────── */
-
-static void test_ctx_empty_roundtrip(void) {
-    /* Builder with zero observations, include_freq_tables=false → minimal ctx. */
-    c3d_ctx_builder *b = c3d_ctx_builder_new();
-    c3d_ctx *ctx = c3d_ctx_builder_finish(b, false);
-    CHECK(ctx != NULL);
-
-    size_t sz = c3d_ctx_serialized_size(ctx);
-    CHECK_EQ(sz, 24u);   /* header only */
-
-    uint8_t buf[65535];
-    size_t wrote = c3d_ctx_serialize(ctx, buf, sizeof buf);
-    CHECK_EQ(wrote, 24u);
-
-    /* Verify self_hash: hash of bytes [24..24) = hash of empty. */
-    uint8_t expect[16];
-    c3d_hash128(buf + 24, 0, expect);
-    CHECK(memcmp(buf + 8, expect, 16) == 0);
-
-    /* Round-trip parse. */
-    c3d_ctx *ctx2 = c3d_ctx_parse(buf, wrote);
-    uint8_t id1[16], id2[16];
-    c3d_ctx_id(ctx, id1);
-    c3d_ctx_id(ctx2, id2);
-    CHECK(memcmp(id1, id2, 16) == 0);
-
-    c3d_ctx_free(ctx); c3d_ctx_free(ctx2);
-}
-
-static void test_ctx_with_freq_tables(void) {
-    c3d_ctx_builder *b = c3d_ctx_builder_new();
-
-    uint8_t *chunk = aligned_alloc(C3D_ALIGN, C3D_VOXELS_PER_CHUNK);
-    c3d_assert(chunk);
-    make_test_chunk(chunk);
-
-    /* Observe a few copies of a representative chunk (in production a corpus
-     * of distinct chunks would go here). */
-    for (int i = 0; i < 3; ++i) {
-        c3d_ctx_builder_observe_chunk(b, chunk);
-    }
-    c3d_ctx *ctx = c3d_ctx_builder_finish(b, true);
-    c3d_assert(ctx != NULL);
-    CHECK(ctx->has_freq_tables);
-
-    size_t sz = c3d_ctx_serialized_size(ctx);
-    CHECK(sz > 24);
-    CHECK(sz < 65535);
-
-    uint8_t buf[65535];
-    size_t wrote = c3d_ctx_serialize(ctx, buf, sizeof buf);
-    CHECK_EQ(wrote, sz);
-
-    c3d_ctx *ctx2 = c3d_ctx_parse(buf, wrote);
-    CHECK(ctx2->has_freq_tables);
-    for (unsigned s = 0; s < C3D_N_SUBBANDS; ++s) {
-        CHECK_EQ(ctx->denom_shifts[s], ctx2->denom_shifts[s]);
-        for (unsigned k = 0; k < 65; ++k) {
-            CHECK_EQ(ctx->freqs[s][k], ctx2->freqs[s][k]);
-        }
-    }
-    uint8_t id1[16], id2[16];
-    c3d_ctx_id(ctx, id1); c3d_ctx_id(ctx2, id2);
-    CHECK(memcmp(id1, id2, 16) == 0);
-
-    c3d_ctx_free(ctx); c3d_ctx_free(ctx2);
-    free(chunk);
-}
-
-static void test_external_chunk_roundtrip(void) {
-    /* Build a ctx from the test chunk, then encode+decode with it. */
-    uint8_t *in  = aligned_alloc(C3D_ALIGN, C3D_VOXELS_PER_CHUNK);
-    uint8_t *dec = aligned_alloc(C3D_ALIGN, C3D_VOXELS_PER_CHUNK);
-    uint8_t *enc = aligned_alloc(C3D_ALIGN, C3D_CHUNK_ENCODE_MAX_SIZE);
-    c3d_assert(in && dec && enc);
-    make_test_chunk(in);
-
-    c3d_ctx_builder *b = c3d_ctx_builder_new();
-    c3d_ctx_builder_observe_chunk(b, in);
-    c3d_ctx *ctx = c3d_ctx_builder_finish(b, true);
-
-    size_t sz = c3d_chunk_encode_at_q(in, 0.1f, ctx, enc, C3D_CHUNK_ENCODE_MAX_SIZE);
-    CHECK(sz > 352);
-    CHECK(c3d_chunk_validate(enc, sz));
-
-    c3d_chunk_info info;
-    c3d_chunk_inspect(enc, sz, &info);
-    CHECK_EQ(info.context_mode, 1u);
-    /* context_id must match ctx's hash. */
-    uint8_t id[16];
-    c3d_ctx_id(ctx, id);
-    CHECK(memcmp(info.context_id, id, 16) == 0);
-
-    /* Decode with the right ctx. */
-    c3d_chunk_decode(enc, sz, ctx, dec);
-    double psnr_ext = measure_psnr(in, dec, C3D_VOXELS_PER_CHUNK);
-    printf("  EXTERNAL q=0.1: size=%zu PSNR=%.1f dB\n", sz, psnr_ext);
-    CHECK(psnr_ext > 25.0);
-
-    /* Decoding without the ctx should panic (mismatched mode). */
-    EXPECT_PANIC(c3d_chunk_decode(enc, sz, NULL, dec));
-
-    /* Control: same input, SELF mode, same q → should be larger (in-band tables). */
-    size_t sz_self = c3d_chunk_encode_at_q(in, 0.1f, NULL, enc, C3D_CHUNK_ENCODE_MAX_SIZE);
-    CHECK(sz_self > sz);   /* EXTERNAL saves the per-chunk freq table bytes */
-    printf("  SELF    q=0.1: size=%zu   (EXTERNAL saved %zu B)\n",
-           sz_self, sz_self - sz);
-
-    c3d_ctx_free(ctx);
-    free(in); free(dec); free(enc);
-}
-
-static void test_shard_with_embedded_ctx(void) {
-    /* Create a shard, attach a ctx, encode chunks with it, serialise, parse,
-     * decode — must be consistent. */
-    uint8_t *chunk = aligned_alloc(C3D_ALIGN, C3D_VOXELS_PER_CHUNK);
-    uint8_t *dec   = aligned_alloc(C3D_ALIGN, C3D_VOXELS_PER_CHUNK);
-    c3d_assert(chunk && dec);
-    make_test_chunk(chunk);
-
-    /* Build ctx. */
-    c3d_ctx_builder *b = c3d_ctx_builder_new();
-    c3d_ctx_builder_observe_chunk(b, chunk);
-    c3d_ctx *ctx = c3d_ctx_builder_finish(b, true);
-
-    uint32_t origin[3] = {0, 0, 0};
-    c3d_shard *s = c3d_shard_new(origin, 0);
-    c3d_shard_set_ctx(s, ctx);
-    CHECK(c3d_shard_ctx(s) != NULL);
-
-    /* Encode uses the shard's ctx automatically → EXTERNAL mode. */
-    c3d_shard_encode_chunk(s, 2, 3, 4, chunk, 10.0f);
-    size_t clen;
-    const uint8_t *cbytes = c3d_shard_chunk_bytes(s, 2, 3, 4, &clen);
-    c3d_chunk_info info;
-    c3d_chunk_inspect(cbytes, clen, &info);
-    CHECK_EQ(info.context_mode, 1u);
-
-    c3d_shard_decode_chunk(s, 2, 3, 4, dec);
-    double psnr = measure_psnr(chunk, dec, C3D_VOXELS_PER_CHUNK);
-    CHECK(psnr > 25.0);
-
-    /* Serialise the shard (which embeds the ctx) and re-parse; decode via the
-     * re-parsed shard must still work. */
-    size_t need = c3d_shard_max_serialized_size(s);
-    uint8_t *buf = malloc(need); c3d_assert(buf);
-    size_t wrote = c3d_shard_serialize(s, buf, need);
-
-    c3d_shard *s2 = c3d_shard_parse_copy(buf, wrote);
-    CHECK(c3d_shard_ctx(s2) != NULL);
-    uint8_t *dec2 = aligned_alloc(C3D_ALIGN, C3D_VOXELS_PER_CHUNK);
-    c3d_assert(dec2);
-    c3d_shard_decode_chunk(s2, 2, 3, 4, dec2);
-    CHECK(memcmp(dec, dec2, C3D_VOXELS_PER_CHUNK) == 0);
-
-    /* Detach ctx: subsequent put + encode defaults to SELF mode. */
-    c3d_shard *s3 = c3d_shard_new(origin, 0);
-    c3d_shard_encode_chunk(s3, 1, 1, 1, chunk, 10.0f);
-    const uint8_t *self_bytes = c3d_shard_chunk_bytes(s3, 1, 1, 1, &clen);
-    c3d_chunk_info info3;
-    c3d_chunk_inspect(self_bytes, clen, &info3);
-    CHECK_EQ(info3.context_mode, 0u);
-
-    c3d_ctx_free(ctx);
-    c3d_shard_free(s); c3d_shard_free(s2); c3d_shard_free(s3);
-    free(buf); free(chunk); free(dec); free(dec2);
 }
 
 /* ─── main ───────────────────────────────────────────────────────────────── */
@@ -1509,18 +1222,8 @@ int main(void) {
     test_chunk_lod_decode();
     test_chunk_encode_masked();
 
-    printf("§J shard + downsample\n");
-    test_shard_empty_roundtrip();
-    test_shard_sentinels();
-    test_shard_put_encode_decode();
-    test_shard_decode_zero_slot();
+    printf("§J downsample\n");
     test_downsample_2x();
-
-    printf("§K .c3dx ctx + EXTERNAL mode\n");
-    test_ctx_empty_roundtrip();
-    test_ctx_with_freq_tables();
-    test_external_chunk_roundtrip();
-    test_shard_with_embedded_ctx();
 
     printf("\n%d tests, %d failures\n", g_tests_run, g_tests_fail);
     return g_tests_fail ? 1 : 0;

@@ -138,7 +138,7 @@ int main(int argc, char **argv) {
         if (trunc > enc_size) trunc = enc_size;
         memset(out, 0xaa, CHUNK_BYTES);
         double t0 = now_s();
-        c3d_decoder_chunk_decode(dec, enc, trunc, NULL, out);
+        c3d_decoder_chunk_decode(dec, enc, trunc, out);
         double dt = now_s() - t0;
         double p = psnr_u8(orig, out, CHUNK_BYTES);
         double s = ssim_u8(orig, out, SIDE);
