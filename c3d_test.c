@@ -1140,8 +1140,6 @@ static void test_chunk_validate_rejects_garbage(void) {
 
 }
 
-/* ─── §J  shard tests ────────────────────────────────────────────────────── */
-
 /* ─── downsample helper ──────────────────────────────────────────────────── */
 
 static void test_downsample_2x(void) {
@@ -1168,6 +1166,408 @@ static void test_downsample_2x(void) {
     memset(in, 100, sizeof in);
     c3d_downsample_chunk_2x(in, 16, out);
     for (size_t i = 0; i < sizeof out; ++i) CHECK_EQ(out[i], 100u);
+}
+
+/* ─── §M  label tests ────────────────────────────────────────────────────── */
+
+/* Allocate a 32B-aligned 256³ u8 buffer, zero-initialised. */
+static uint8_t *alloc_chan(void) {
+    uint8_t *p = aligned_alloc(C3D_ALIGN, C3D_VOXELS_PER_CHUNK);
+    CHECK(p != NULL);
+    memset(p, 0, C3D_VOXELS_PER_CHUNK);
+    return p;
+}
+
+/* Paint a dense "wrap-id"-like pattern into buf with IDs in [1..max_id].
+ * A few large uniform regions + some noise at the boundaries. */
+static void paint_wraps(uint8_t *buf, uint8_t max_id) {
+    for (uint32_t z = 0; z < 256; ++z)
+    for (uint32_t y = 0; y < 256; ++y)
+    for (uint32_t x = 0; x < 256; ++x) {
+        uint32_t r = (x + y + z);
+        uint8_t  id = 1u + (uint8_t)((r / 32u) % max_id);
+        buf[(size_t)z * 256 * 256 + y * 256 + x] = id;
+    }
+}
+
+/* Paint a sparse ink mask: ~0.5% of voxels = 1, rest = 0. */
+static void paint_ink(uint8_t *buf) {
+    uint32_t x = 0x9e3779b9u;
+    for (size_t i = 0; i < C3D_VOXELS_PER_CHUNK; ++i) {
+        x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+        buf[i] = ((x & 0xFFu) < 2u) ? 1u : 0u;  /* ~2/256 ≈ 0.8% */
+    }
+}
+
+static void test_label_schema_roundtrip(void) {
+    c3d_label_schema *s = c3d_label_schema_new();
+    c3d_label_schema_add_channel(s, "wrap_id", 100);
+    c3d_label_schema_add_channel(s, "ink", 2);
+    c3d_label_schema_add_channel(s, "damage", 2);
+    CHECK_EQ(c3d_label_schema_channel_count(s), 3u);
+    CHECK_EQ(c3d_label_schema_channel_num_values(s, 0), 100u);
+    CHECK_EQ(c3d_label_schema_channel_num_values(s, 1), 2u);
+    CHECK(strcmp(c3d_label_schema_channel_name(s, 0), "wrap_id") == 0);
+
+    size_t sz = c3d_label_schema_serialized_size(s);
+    uint8_t *buf = malloc(sz);
+    CHECK(buf != NULL);
+    size_t w = c3d_label_schema_serialize(s, buf, sz);
+    CHECK_EQ(w, sz);
+
+    uint8_t h_original[16];
+    c3d_label_schema_hash(s, h_original);
+
+    c3d_label_schema *s2 = c3d_label_schema_parse(buf, sz);
+    CHECK_EQ(c3d_label_schema_channel_count(s2), 3u);
+    CHECK(strcmp(c3d_label_schema_channel_name(s2, 0), "wrap_id") == 0);
+    CHECK_EQ(c3d_label_schema_channel_num_values(s2, 0), 100u);
+    uint8_t h_reparsed[16];
+    c3d_label_schema_hash(s2, h_reparsed);
+    CHECK(memcmp(h_original, h_reparsed, 16) == 0);
+
+    c3d_label_schema_free(s);
+    c3d_label_schema_free(s2);
+    free(buf);
+}
+
+static void test_label_schema_rejects_duplicate(void) {
+    c3d_label_schema *s = c3d_label_schema_new();
+    c3d_label_schema_add_channel(s, "wrap_id", 100);
+    EXPECT_PANIC({ c3d_label_schema_add_channel(s, "wrap_id", 2); });
+    c3d_label_schema_free(s);
+}
+
+static void test_label_schema_rejects_bad_num_values(void) {
+    c3d_label_schema *s = c3d_label_schema_new();
+    EXPECT_PANIC({ c3d_label_schema_add_channel(s, "x", 1); });
+    c3d_label_schema_free(s);
+}
+
+static void test_label_schema_bad_hash_panics(void) {
+    c3d_label_schema *s = c3d_label_schema_new();
+    c3d_label_schema_add_channel(s, "x", 4);
+    size_t sz = c3d_label_schema_serialized_size(s);
+    uint8_t *buf = malloc(sz);
+    CHECK(buf != NULL);
+    c3d_label_schema_serialize(s, buf, sz);
+    buf[sz - 1] ^= 0xFFu;  /* corrupt trailing hash byte */
+    EXPECT_PANIC({ c3d_label_schema *bad = c3d_label_schema_parse(buf, sz); (void)bad; });
+    c3d_label_schema_free(s);
+    free(buf);
+}
+
+static void test_label_schema_bad_magic_panics(void) {
+    uint8_t buf[64] = {0};
+    memcpy(buf, "xxxxxxxx", 8);
+    EXPECT_PANIC({ c3d_label_schema *bad = c3d_label_schema_parse(buf, sizeof buf); (void)bad; });
+}
+
+static void test_label_chunk_all_zero(void) {
+    c3d_label_schema *s = c3d_label_schema_new();
+    c3d_label_schema_add_channel(s, "ink", 2);
+
+    c3d_label_encoder *e = c3d_label_encoder_new(s);
+    c3d_label_decoder *d = c3d_label_decoder_new(s);
+    uint8_t *zero_buf = alloc_chan();
+    uint8_t *out = malloc(c3d_label_encoder_max_chunk_size(e));
+    CHECK(out != NULL);
+
+    const uint8_t *inputs[]  = { zero_buf };
+    size_t n = c3d_label_encoder_chunk_encode(e, inputs, out, c3d_label_encoder_max_chunk_size(e));
+    CHECK(n < 40u);   /* ABSENT payload ≤ ~24 B */
+
+    uint8_t *rt = alloc_chan();
+    uint8_t *outs[] = { rt };
+    c3d_label_decoder_chunk_decode(d, out, n, outs);
+    CHECK(memcmp(zero_buf, rt, C3D_VOXELS_PER_CHUNK) == 0);
+
+    c3d_label_chunk_info info;
+    c3d_label_chunk_inspect(s, out, n, &info);
+    CHECK_EQ(info.chan_count, 1u);
+    CHECK_EQ(info.channel_state[0], C3D_LABEL_STATE_ABSENT);
+
+    CHECK(c3d_label_chunk_validate(s, out, n));
+
+    free(out); free(zero_buf); free(rt);
+    c3d_label_decoder_free(d); c3d_label_encoder_free(e);
+    c3d_label_schema_free(s);
+}
+
+static void test_label_chunk_uniform(void) {
+    c3d_label_schema *s = c3d_label_schema_new();
+    c3d_label_schema_add_channel(s, "wrap_id", 100);
+
+    c3d_label_encoder *e = c3d_label_encoder_new(s);
+    c3d_label_decoder *d = c3d_label_decoder_new(s);
+    uint8_t *buf = alloc_chan();
+    memset(buf, 42u, C3D_VOXELS_PER_CHUNK);
+
+    uint8_t *out = malloc(c3d_label_encoder_max_chunk_size(e));
+    const uint8_t *inputs[] = { buf };
+    size_t n = c3d_label_encoder_chunk_encode(e, inputs, out, c3d_label_encoder_max_chunk_size(e));
+    CHECK(n < 40u);  /* UNIFORM payload: header + state + value */
+
+    uint8_t *rt = alloc_chan();
+    uint8_t *outs[] = { rt };
+    c3d_label_decoder_chunk_decode(d, out, n, outs);
+    CHECK(memcmp(buf, rt, C3D_VOXELS_PER_CHUNK) == 0);
+
+    c3d_label_chunk_info info;
+    c3d_label_chunk_inspect(s, out, n, &info);
+    CHECK_EQ(info.channel_state[0], C3D_LABEL_STATE_UNIFORM);
+    CHECK_EQ(info.channel_uniform_value[0], 42u);
+
+    free(out); free(buf); free(rt);
+    c3d_label_decoder_free(d); c3d_label_encoder_free(e);
+    c3d_label_schema_free(s);
+}
+
+static void test_label_chunk_encoded_wraps(void) {
+    c3d_label_schema *s = c3d_label_schema_new();
+    c3d_label_schema_add_channel(s, "wrap_id", 100);
+
+    c3d_label_encoder *e = c3d_label_encoder_new(s);
+    c3d_label_decoder *d = c3d_label_decoder_new(s);
+    uint8_t *buf = alloc_chan();
+    paint_wraps(buf, 50);  /* ~50 distinct IDs, structured pattern */
+
+    size_t cap = c3d_label_encoder_max_chunk_size(e);
+    uint8_t *out = malloc(cap);
+    const uint8_t *inputs[] = { buf };
+    size_t n = c3d_label_encoder_chunk_encode(e, inputs, out, cap);
+    CHECK(n > 100u);  /* must have a real encoded stream */
+    CHECK(n < C3D_VOXELS_PER_CHUNK);  /* and must compress */
+
+    uint8_t *rt = alloc_chan();
+    uint8_t *outs[] = { rt };
+    c3d_label_decoder_chunk_decode(d, out, n, outs);
+    CHECK(memcmp(buf, rt, C3D_VOXELS_PER_CHUNK) == 0);
+
+    c3d_label_chunk_info info;
+    c3d_label_chunk_inspect(s, out, n, &info);
+    CHECK_EQ(info.channel_state[0], C3D_LABEL_STATE_ENCODED);
+    CHECK(info.channel_stream_bytes[0] > 0u);
+
+    free(out); free(buf); free(rt);
+    c3d_label_decoder_free(d); c3d_label_encoder_free(e);
+    c3d_label_schema_free(s);
+}
+
+static void test_label_chunk_binary_sparse(void) {
+    c3d_label_schema *s = c3d_label_schema_new();
+    c3d_label_schema_add_channel(s, "ink", 2);
+
+    c3d_label_encoder *e = c3d_label_encoder_new(s);
+    c3d_label_decoder *d = c3d_label_decoder_new(s);
+    uint8_t *buf = alloc_chan();
+    paint_ink(buf);
+
+    size_t cap = c3d_label_encoder_max_chunk_size(e);
+    uint8_t *out = malloc(cap);
+    const uint8_t *inputs[] = { buf };
+    size_t n = c3d_label_encoder_chunk_encode(e, inputs, out, cap);
+    /* Very sparse binary should compress at least 4× vs raw. */
+    CHECK(n < C3D_VOXELS_PER_CHUNK / 4u);
+
+    uint8_t *rt = alloc_chan();
+    uint8_t *outs[] = { rt };
+    c3d_label_decoder_chunk_decode(d, out, n, outs);
+    CHECK(memcmp(buf, rt, C3D_VOXELS_PER_CHUNK) == 0);
+
+    free(out); free(buf); free(rt);
+    c3d_label_decoder_free(d); c3d_label_encoder_free(e);
+    c3d_label_schema_free(s);
+}
+
+static void test_label_chunk_random_noise(void) {
+    /* High-entropy random with num_values=16 — exercises RAW_BLOCK leaves. */
+    c3d_label_schema *s = c3d_label_schema_new();
+    c3d_label_schema_add_channel(s, "noise", 16);
+
+    c3d_label_encoder *e = c3d_label_encoder_new(s);
+    c3d_label_decoder *d = c3d_label_decoder_new(s);
+    uint8_t *buf = alloc_chan();
+    uint32_t x = 0xdeadbeefu;
+    for (size_t i = 0; i < C3D_VOXELS_PER_CHUNK; ++i) {
+        x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+        buf[i] = (uint8_t)(x & 0x0Fu);
+    }
+
+    size_t cap = c3d_label_encoder_max_chunk_size(e);
+    uint8_t *out = malloc(cap);
+    const uint8_t *inputs[] = { buf };
+    size_t n = c3d_label_encoder_chunk_encode(e, inputs, out, cap);
+
+    uint8_t *rt = alloc_chan();
+    uint8_t *outs[] = { rt };
+    c3d_label_decoder_chunk_decode(d, out, n, outs);
+    CHECK(memcmp(buf, rt, C3D_VOXELS_PER_CHUNK) == 0);
+
+    free(out); free(buf); free(rt);
+    c3d_label_decoder_free(d); c3d_label_encoder_free(e);
+    c3d_label_schema_free(s);
+}
+
+static void test_label_chunk_multichannel_mixed(void) {
+    c3d_label_schema *s = c3d_label_schema_new();
+    c3d_label_schema_add_channel(s, "wrap_id", 100);
+    c3d_label_schema_add_channel(s, "ink", 2);
+    c3d_label_schema_add_channel(s, "future_placeholder", 10);  /* will be ABSENT */
+
+    c3d_label_encoder *e = c3d_label_encoder_new(s);
+    c3d_label_decoder *d = c3d_label_decoder_new(s);
+    uint8_t *wraps = alloc_chan();
+    uint8_t *ink   = alloc_chan();
+    paint_wraps(wraps, 40);
+    paint_ink(ink);
+
+    const uint8_t *inputs[] = { wraps, ink, NULL };  /* last = ABSENT */
+
+    size_t cap = c3d_label_encoder_max_chunk_size(e);
+    uint8_t *out = malloc(cap);
+    size_t n = c3d_label_encoder_chunk_encode(e, inputs, out, cap);
+
+    uint8_t *rt_wraps = alloc_chan();
+    uint8_t *rt_ink   = alloc_chan();
+    uint8_t *rt_plh   = alloc_chan();
+    uint8_t *outs[] = { rt_wraps, rt_ink, rt_plh };
+    c3d_label_decoder_chunk_decode(d, out, n, outs);
+    CHECK(memcmp(wraps, rt_wraps, C3D_VOXELS_PER_CHUNK) == 0);
+    CHECK(memcmp(ink,   rt_ink,   C3D_VOXELS_PER_CHUNK) == 0);
+    /* future_placeholder was NULL input → encoded as ABSENT → all zeros on decode */
+    for (size_t i = 0; i < C3D_VOXELS_PER_CHUNK; ++i) CHECK_EQ(rt_plh[i], 0u);
+
+    c3d_label_chunk_info info;
+    c3d_label_chunk_inspect(s, out, n, &info);
+    CHECK_EQ(info.chan_count, 3u);
+    CHECK_EQ(info.channel_state[0], C3D_LABEL_STATE_ENCODED);
+    CHECK_EQ(info.channel_state[1], C3D_LABEL_STATE_ENCODED);
+    CHECK_EQ(info.channel_state[2], C3D_LABEL_STATE_ABSENT);
+
+    free(out); free(wraps); free(ink);
+    free(rt_wraps); free(rt_ink); free(rt_plh);
+    c3d_label_decoder_free(d); c3d_label_encoder_free(e);
+    c3d_label_schema_free(s);
+}
+
+static void test_label_chunk_skip_channels(void) {
+    /* Decode with some channels NULL — skip them, still decode others correctly. */
+    c3d_label_schema *s = c3d_label_schema_new();
+    c3d_label_schema_add_channel(s, "wrap_id", 100);
+    c3d_label_schema_add_channel(s, "ink", 2);
+
+    c3d_label_encoder *e = c3d_label_encoder_new(s);
+    c3d_label_decoder *d = c3d_label_decoder_new(s);
+    uint8_t *wraps = alloc_chan();
+    uint8_t *ink   = alloc_chan();
+    paint_wraps(wraps, 30);
+    paint_ink(ink);
+
+    const uint8_t *inputs[] = { wraps, ink };
+    size_t cap = c3d_label_encoder_max_chunk_size(e);
+    uint8_t *out = malloc(cap);
+    size_t n = c3d_label_encoder_chunk_encode(e, inputs, out, cap);
+
+    /* Decode only the ink channel. */
+    uint8_t *rt_ink = alloc_chan();
+    uint8_t *outs[] = { NULL, rt_ink };
+    c3d_label_decoder_chunk_decode(d, out, n, outs);
+    CHECK(memcmp(ink, rt_ink, C3D_VOXELS_PER_CHUNK) == 0);
+
+    free(out); free(wraps); free(ink); free(rt_ink);
+    c3d_label_decoder_free(d); c3d_label_encoder_free(e);
+    c3d_label_schema_free(s);
+}
+
+static void test_label_chunk_hash_mismatch_panics(void) {
+    c3d_label_schema *s  = c3d_label_schema_new();
+    c3d_label_schema *s2 = c3d_label_schema_new();
+    c3d_label_schema_add_channel(s,  "wrap_id", 100);
+    c3d_label_schema_add_channel(s2, "different_name", 100);
+
+    c3d_label_encoder *e = c3d_label_encoder_new(s);
+    c3d_label_decoder *d = c3d_label_decoder_new(s2);  /* mismatched! */
+    uint8_t *buf = alloc_chan();
+    memset(buf, 7, C3D_VOXELS_PER_CHUNK);
+
+    const uint8_t *inputs[] = { buf };
+    size_t cap = c3d_label_encoder_max_chunk_size(e);
+    uint8_t *out = malloc(cap);
+    size_t n = c3d_label_encoder_chunk_encode(e, inputs, out, cap);
+
+    uint8_t *rt = alloc_chan();
+    uint8_t *outs[] = { rt };
+    EXPECT_PANIC({ c3d_label_decoder_chunk_decode(d, out, n, outs); });
+
+    free(out); free(buf); free(rt);
+    c3d_label_decoder_free(d); c3d_label_encoder_free(e);
+    c3d_label_schema_free(s); c3d_label_schema_free(s2);
+}
+
+static void test_label_chunk_deterministic(void) {
+    c3d_label_schema *s = c3d_label_schema_new();
+    c3d_label_schema_add_channel(s, "wrap_id", 64);
+
+    c3d_label_encoder *e = c3d_label_encoder_new(s);
+    uint8_t *buf = alloc_chan();
+    paint_wraps(buf, 40);
+
+    size_t cap = c3d_label_encoder_max_chunk_size(e);
+    uint8_t *out1 = malloc(cap);
+    uint8_t *out2 = malloc(cap);
+    const uint8_t *inputs[] = { buf };
+    size_t n1 = c3d_label_encoder_chunk_encode(e, inputs, out1, cap);
+    size_t n2 = c3d_label_encoder_chunk_encode(e, inputs, out2, cap);
+    CHECK_EQ(n1, n2);
+    CHECK(memcmp(out1, out2, n1) == 0);
+
+    free(out1); free(out2); free(buf);
+    c3d_label_encoder_free(e);
+    c3d_label_schema_free(s);
+}
+
+static void test_label_chunk_validate(void) {
+    c3d_label_schema *s = c3d_label_schema_new();
+    c3d_label_schema_add_channel(s, "ink", 2);
+
+    c3d_label_encoder *e = c3d_label_encoder_new(s);
+    uint8_t *buf = alloc_chan();
+    paint_ink(buf);
+    size_t cap = c3d_label_encoder_max_chunk_size(e);
+    uint8_t *out = malloc(cap);
+    const uint8_t *inputs[] = { buf };
+    size_t n = c3d_label_encoder_chunk_encode(e, inputs, out, cap);
+
+    CHECK(c3d_label_chunk_validate(s, out, n));
+
+    /* Truncate → invalid. */
+    CHECK(!c3d_label_chunk_validate(s, out, n - 1u));
+    /* Bad magic → invalid. */
+    out[0] ^= 0xFFu;
+    CHECK(!c3d_label_chunk_validate(s, out, n));
+
+    free(out); free(buf);
+    c3d_label_encoder_free(e);
+    c3d_label_schema_free(s);
+}
+
+static void run_label_tests(void) {
+    test_label_schema_roundtrip();
+    test_label_schema_rejects_duplicate();
+    test_label_schema_rejects_bad_num_values();
+    test_label_schema_bad_hash_panics();
+    test_label_schema_bad_magic_panics();
+    test_label_chunk_all_zero();
+    test_label_chunk_uniform();
+    test_label_chunk_encoded_wraps();
+    test_label_chunk_binary_sparse();
+    test_label_chunk_random_noise();
+    test_label_chunk_multichannel_mixed();
+    test_label_chunk_skip_channels();
+    test_label_chunk_hash_mismatch_panics();
+    test_label_chunk_deterministic();
+    test_label_chunk_validate();
 }
 
 /* ─── main ───────────────────────────────────────────────────────────────── */
@@ -1224,6 +1624,9 @@ int main(void) {
 
     printf("§J downsample\n");
     test_downsample_2x();
+
+    printf("§M labels\n");
+    run_label_tests();
 
     printf("\n%d tests, %d failures\n", g_tests_run, g_tests_fail);
     return g_tests_fail ? 1 : 0;

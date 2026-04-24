@@ -235,6 +235,16 @@ target_link_libraries(c3d_perf PRIVATE m)
 target_include_directories(c3d_perf PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_options(c3d_perf PRIVATE -Wno-unused-function)
 
+add_executable(c3d_labels_inspect c3d_labels_inspect.c)
+target_link_libraries(c3d_labels_inspect PRIVATE m)
+target_include_directories(c3d_labels_inspect PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_options(c3d_labels_inspect PRIVATE -Wno-unused-function)
+
+add_executable(c3d_labels_codec c3d_labels_codec.c)
+target_link_libraries(c3d_labels_codec PRIVATE m)
+target_include_directories(c3d_labels_codec PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_options(c3d_labels_codec PRIVATE -Wno-unused-function)
+
 enable_testing()
 add_test(NAME c3d_test COMMAND c3d_test)
 
