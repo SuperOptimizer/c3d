@@ -2,7 +2,7 @@
  *
  * Usage: c3d_progressive <encoded.c3dc> <original.u8> [truncation_fractions...]
  *
- * Encoded chunk is already a raw c3d_chunk_encode output (not a shard).
+ * Encoded chunk is a raw c3d_chunk_encode output.
  * Original raw-u8 chunk is used for PSNR/SSIM computation.  If no fractions
  * given, sweeps {1.0, 0.75, 0.50, 0.25, 0.10, 0.05, 0.02, 0.01}.
  *

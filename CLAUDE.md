@@ -25,38 +25,24 @@ See `PLAN.md` for the full design spec; CLAUDE.md only summarises what shapes da
 
 u8 256³ chunk → f32−128 ingest → 5-level 3D CDF 9/7 DWT (symmetric, float32, lifting) → per-subband uniform dead-zone quantizer → per-subband static-model rANS (8-way interleaved, `ryg_rans_byte`-style, 65-symbol alphabet: zigzag 0..63 + escape) → bytes. Rate control is a bisection loop on a single chunk-level quantizer scalar; no PCRD-opt, no tier-1/tier-2 distinction, no code-blocks.
 
-## Fixed hierarchy (all power-of-2, cubic)
+## Fixed sizes (all power-of-2, cubic)
 
-| level     | side      | role                                                    |
-|-----------|-----------|---------------------------------------------------------|
-| block     | 16        | caller-side RAM cache granularity                       |
-| chunk     | 256       | **codec atom** — one encode/decode call                 |
-| shard     | 4 096     | 16³ = 4 096 chunks + 64 KiB Morton-ordered index        |
-| subvolume | 65 536    | shard grid                                              |
-| volume    | 1 048 576 | max (20 bits / axis)                                    |
+| level   | side | role                                     |
+|---------|------|------------------------------------------|
+| block   | 16   | caller-side RAM cache granularity        |
+| chunk   | 256  | **codec atom** — one encode/decode call  |
 
-6 native LODs per chunk (256³, 128³, 64³, 32³, 16³, 8³) decoded from prefixes of one bitstream — no duplicated coefficients across LODs. Further zoom-out = caller-layered pyramid of separate shards (`c3d_downsample_chunk_2x` helper does 2³-box downsamples).
+Chunks stand alone — there is no codec-level container above the chunk. Callers pick their own addressing (OME-zarr-style tiled arrays, flat directory, custom DB, etc.) and just hand chunk bytes to the library.
+
+6 native LODs per chunk (256³, 128³, 64³, 32³, 16³, 8³) decoded from prefixes of one bitstream — no duplicated coefficients across LODs. Further zoom-out = caller-layered pyramid of separate arrays (`c3d_downsample_chunk_2x` helper does 2³-box downsamples).
 
 ## u64 voxel key
 
-`[lod:4][z:20][y:20][x:20]` — planar (not Morton). The shard *chunk index* is Morton-ordered for prefetch locality; individual voxel keys are not.
+`[lod:4][z:20][y:20][x:20]` — planar (not Morton).
 
-## Sparse / sentinel handling (first-class)
+## Sparse chunks
 
-Shard chunk-index entry `(offset:u64, size:u64)` uses two sentinels:
-- `ABSENT = (UINT64_MAX, 0)` — never written
-- `ALL_ZERO = (0, 0)` — definitionally empty, no payload bytes
-- `PRESENT` → any real `(offset ≥ 64 + 65536, size > 0)`
-
-Empty chunks cost zero storage and zero decode. Critical for scroll data (75-85 % of chunks are uniformly zero after masking).
-
-## External context block (`.c3dx`)
-
-Every chunk is `SELF` or `EXTERNAL` per its `context_mode` byte:
-- `SELF`: standalone, uses library default α = 0.375 and in-band frequency tables.
-- `EXTERNAL`: requires a `.c3dx` context block whose `c3d_hash128` matches the chunk's `context_id`. Context blocks live either inside a shard (shard header points at them) or as a sidecar byte buffer (for streaming).
-
-`.c3dx` is a TLV bag (tags: `LAPLACIAN_ALPHA`, `QUANTIZER_BASELINE`, `SUBBAND_FREQ_TABLES`). Max 65 535 B. `c3d_hash128` = XXH3-128 truncated to 16 bytes.
+An all-zero 256³ chunk encodes to a small constant (tiny header + one flag) and decodes to a memset. Critical for scroll data (75-85 % of chunks are uniformly zero after masking). Callers can skip encoding entirely for known-empty regions and reconstruct zeros on demand.
 
 ## Public API shape
 
@@ -64,20 +50,18 @@ Every chunk is `SELF` or `EXTERNAL` per its `context_mode` byte:
 - Stateless chunk codec (allocates scratch each call): `c3d_chunk_encode`, `c3d_chunk_decode`, `c3d_chunk_decode_lod`.
 - Debug / bench: `c3d_chunk_encode_at_q(in, q, ctx, out, cap)` bypasses rate control; `c3d_chunk_validate(in, len) → bool` non-panicking structural check.
 - Inspect: `c3d_chunk_inspect(in, len, &info)`.
-- Context: `c3d_ctx_parse`, `c3d_ctx_serialize`, `c3d_ctx_builder_*`.
-- Shard: `c3d_shard_new`, `c3d_shard_parse` (non-copy), `c3d_shard_parse_copy`, `c3d_shard_serialize`, per-chunk ops (`_chunk_bytes`, `_put_chunk`, `_mark_zero`, `_encode_chunk`, `_decode_chunk`, `_decode_chunk_lod`, `_chunk_count`).
 
 Full signatures in `PLAN.md` §5.
 
 ## Alignment
 
 - Raw voxel buffers (256³ u8 inputs, LOD outputs): **32-byte aligned**, panic otherwise.
-- Encoded byte buffers (chunk payloads, shard bytes, `.c3dx` blobs): no alignment requirement; multi-byte on-disk reads go through `memcpy` into typed locals.
+- Encoded byte buffers (chunk payloads, label chunk payloads, schema sidecars): no alignment requirement; multi-byte reads go through `memcpy` into typed locals.
 
-## Code layout (`c3d.c`, single TU, ~3650 lines target)
+## Code layout (`c3d.c`, single TU)
 
 ```
-§A  types, c3d_panic, c3d_assert, bit-io, alignment, Morton-12 helpers
+§A  types, c3d_panic, c3d_assert, bit-io, alignment, Morton-12 helper
 §B  c3d_hash128 (XXH3-128, inlined public-domain)
 §C  rANS engine (encode, decode, 8-way interleaved, ryg_rans-style)
 §D  frequency-table build + serialise/parse
@@ -86,9 +70,8 @@ Full signatures in `PLAN.md` §5.
 §G  rate-control loop (Laplacian warm-start + bisection, q ∈ [2^-12, 2^12])
 §H  chunk encoder pipeline
 §I  chunk decoder pipeline + LOD partial decoder
-§J  shard parse/serialise (in-memory, Morton-indexed)
-§K  .c3dx parse/serialise + builder
-§L  public API wrappers
+§M  labels codec — schema + octree helpers
+§N  labels codec — multi-channel encode/decode pipeline
 ```
 
 Reference decoder lives alongside the fast path under `#ifdef C3D_BUILD_REF` (defined by `c3d_test.c`, not by shipped library builds). Reference functions are annotated `__attribute__((optimize("no-fast-math","no-associative-math")))`.
@@ -102,9 +85,8 @@ c3d/
 ├── c3d.c
 ├── c3d_test.c       (defines C3D_BUILD_REF)
 ├── c3d_bench.c      (links openh264 + x265 + libde265 + libaom baselines)
-├── c3d_train.c      (offline .c3dx builder CLI)
-├── c3d_inspect.c    (CLI: dump chunk/shard/.c3dx metadata)
-├── c3d_compact.c    (CLI: parse+serialize to drop any orphaned bytes)
+├── c3d_labels_inspect.c (CLI: dump label chunk + schema metadata)
+├── c3d_labels_codec.c   (CLI: round-trip label chunk encode/decode)
 ├── third_party/openh264/   (bench only; submodule or fetched)
 ├── corpus/                  (gitignored; user supplies raw 256³ u8 files, env var C3D_CORPUS points at it)
 ├── PLAN.md         (the full design spec — canonical)
@@ -119,7 +101,7 @@ Every `c3d*.{c,h}` file begins with a short header comment pointing at `LICENSE`
 
 - **PLAN.md is canonical** for format bytes and algorithm spec. If code disagrees with PLAN.md, the bug is in the code.
 - **Don't add features not in PLAN.md §5 or §11** without the user's explicit ask. PLAN.md §11 enumerates what's deliberately out of v1.
-- **Don't bake corpus-learned priors into `c3d.c`** as compile-time constants; they belong in `.c3dx` data.
+- **Don't bake corpus-learned priors into `c3d.c`** as compile-time constants. If a future prior needs to ride with the data, build it as a sidecar blob the caller passes in — never as a hard-coded table in the library.
 - **No intrinsics, no target-specific SIMD in v1.** Plain loops over aligned arrays; let the compiler autovectorise.
 - **`c3d_assert(cond)`** = `do { if (!(cond)) c3d_panic(__FILE__, __LINE__, #cond); } while (0)`. Use it liberally on invariants. Never use plain `assert`.
 - **No `errno`, no status-code returns.** Library functions either succeed or panic.
