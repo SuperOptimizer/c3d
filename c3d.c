@@ -32,8 +32,8 @@
  * the portable scalar path, which is always correct (just slower).
  *
  * C3D_HAVE_AVX512 implies C3D_HAVE_AVX2.  C3D_HAVE_NEON is aarch64-only.  The
- * hot kernels are gated with `#if C3D_HAVE_AVX512 / #elif C3D_HAVE_AVX2 /
- * #elif C3D_HAVE_NEON / #else scalar`. */
+ * hot kernels are gated with `#if defined(C3D_HAVE_AVX512) / #elif defined(C3D_HAVE_AVX2) /
+ * #elif defined(C3D_HAVE_NEON) / #else scalar`. */
 #if defined(C3D_FORCE_SCALAR)
     /* nothing */
 #elif defined(C3D_FORCE_AVX512) || (!defined(C3D_FORCE_AVX2) && !defined(C3D_FORCE_NEON) && defined(__AVX512F__))
@@ -908,14 +908,48 @@ static void c3d_deinterleave(float *x, size_t N, float *aux) {
         aux[i / 2]        = x[i];
         aux[half + i / 2] = x[i + 1];
     }
+#elif defined(C3D_HAVE_AVX512)
+    /* x86 has no stride-2 deinterleaving load (unlike NEON vld2q).  Two
+     * 16-float loads → one permutexvar gathering evens, one gathering odds. */
+    const __m512i evi = _mm512_setr_epi32(0,2,4,6,8,10,12,14,
+                                          16,18,20,22,24,26,28,30);
+    const __m512i odi = _mm512_setr_epi32(1,3,5,7,9,11,13,15,
+                                          17,19,21,23,25,27,29,31);
+    size_t i = 0;
+    for (; i + 32 <= N; i += 32) {
+        __m512 a = _mm512_loadu_ps(x + i);
+        __m512 b = _mm512_loadu_ps(x + i + 16);
+        _mm512_storeu_ps(aux + i / 2,
+                         _mm512_permutex2var_ps(a, evi, b));
+        _mm512_storeu_ps(aux + half + i / 2,
+                         _mm512_permutex2var_ps(a, odi, b));
+    }
+    for (; i < N; i += 2) {
+        aux[i / 2]        = x[i];
+        aux[half + i / 2] = x[i + 1];
+    }
 #elif defined(C3D_HAVE_AVX2)
-    /* AVX2 has no hardware stride-2 deinterleaving load (unlike NEON vld2q).
-     * Shuffle + permute2f128 chains are possible but the scalar pair-copy
-     * below vectorises cleanly under -O3 via gathers / simple lane swaps, so
-     * the extra code is not worth it for a rarely-called helper.  Left here
-     * as a hook if profiling shows this path is hot on amd64. */
-    for (size_t i = 0; i < half; ++i) aux[i]        = x[2 * i];
-    for (size_t i = 0; i < half; ++i) aux[half + i] = x[2 * i + 1];
+    const __m256i evi = _mm256_setr_epi32(0,2,4,6, 8,10,12,14);
+    const __m256i odi = _mm256_setr_epi32(1,3,5,7, 9,11,13,15);
+    size_t i = 0;
+    for (; i + 16 <= N; i += 16) {
+        /* gather 8 evens / 8 odds out of a 16-float window via two
+         * permutevar8x32 + a 128-bit blend across the two lanes. */
+        __m256 a = _mm256_loadu_ps(x + i);
+        __m256 b = _mm256_loadu_ps(x + i + 8);
+        __m256 ae = _mm256_permutevar8x32_ps(a, evi);   /* a evens in lo 4 */
+        __m256 be = _mm256_permutevar8x32_ps(b, evi);   /* b evens in lo 4 */
+        __m256 ao = _mm256_permutevar8x32_ps(a, odi);
+        __m256 bo = _mm256_permutevar8x32_ps(b, odi);
+        _mm256_storeu_ps(aux + i / 2,
+            _mm256_permute2f128_ps(ae, be, 0x20));
+        _mm256_storeu_ps(aux + half + i / 2,
+            _mm256_permute2f128_ps(ao, bo, 0x20));
+    }
+    for (; i < N; i += 2) {
+        aux[i / 2]        = x[i];
+        aux[half + i / 2] = x[i + 1];
+    }
 #else
     for (size_t i = 0; i < half; ++i) aux[i]        = x[2 * i];
     for (size_t i = 0; i < half; ++i) aux[half + i] = x[2 * i + 1];
@@ -932,6 +966,42 @@ static void c3d_interleave(float *x, size_t N, float *aux) {
         p.val[0] = vld1q_f32(x + i / 2);
         p.val[1] = vld1q_f32(x + half + i / 2);
         vst2q_f32(aux + i, p);
+    }
+    for (; i < N; i += 2) {
+        aux[i]     = x[i / 2];
+        aux[i + 1] = x[half + i / 2];
+    }
+#elif defined(C3D_HAVE_AVX512)
+    /* lo[k]=evens[k], hi[k]=odds[k]; permutex2var with interleave indices
+     * writes 32 interleaved outputs from two 16-float halves. */
+    const __m512i lo = _mm512_setr_epi32(0,16,1,17,2,18,3,19,
+                                         4,20,5,21,6,22,7,23);
+    const __m512i hi = _mm512_setr_epi32(8,24,9,25,10,26,11,27,
+                                         12,28,13,29,14,30,15,31);
+    size_t i = 0;
+    for (; i + 32 <= N; i += 32) {
+        __m512 e = _mm512_loadu_ps(x + i / 2);
+        __m512 o = _mm512_loadu_ps(x + half + i / 2);
+        _mm512_storeu_ps(aux + i,      _mm512_permutex2var_ps(e, lo, o));
+        _mm512_storeu_ps(aux + i + 16, _mm512_permutex2var_ps(e, hi, o));
+    }
+    for (; i < N; i += 2) {
+        aux[i]     = x[i / 2];
+        aux[i + 1] = x[half + i / 2];
+    }
+#elif defined(C3D_HAVE_AVX2)
+    size_t i = 0;
+    for (; i + 16 <= N; i += 16) {
+        __m256 e = _mm256_loadu_ps(x + i / 2);
+        __m256 o = _mm256_loadu_ps(x + half + i / 2);
+        /* unpacklo/hi interleave within 128-bit lanes; permute2f128
+         * reassembles the contiguous 16-float interleaved run. */
+        __m256 ul = _mm256_unpacklo_ps(e, o);   /* e0 o0 e1 o1 | e4 o4 e5 o5 */
+        __m256 uh = _mm256_unpackhi_ps(e, o);   /* e2 o2 e3 o3 | e6 o6 e7 o7 */
+        _mm256_storeu_ps(aux + i,
+            _mm256_permute2f128_ps(ul, uh, 0x20));
+        _mm256_storeu_ps(aux + i + 8,
+            _mm256_permute2f128_ps(ul, uh, 0x31));
     }
     for (; i < N; i += 2) {
         aux[i]     = x[i / 2];
@@ -970,7 +1040,9 @@ static void c3d_dwt_1d_inv(float *x, size_t N, float *aux) {
  * makes the hot inner memory ops inlineable.  Compiler trivially fuses
  * the pair when the data is aligned. */
 static inline void c3d_copy8(float *restrict dst, const float *restrict src) {
-#ifdef C3D_HAVE_NEON
+#if defined(C3D_HAVE_AVX2)
+    _mm256_storeu_ps(dst, _mm256_loadu_ps(src));   /* one 256-bit move */
+#elif defined(C3D_HAVE_NEON)
     float32x4_t a = vld1q_f32(src);
     float32x4_t b = vld1q_f32(src + 4);
     vst1q_f32(dst,     a);
@@ -1084,127 +1156,164 @@ static void c3d_dwt_1d_inv_x4(float *restrict x, size_t N, float *restrict aux) 
 #define C3D_Y_TILE  C3D_TILE_X
 #define C3D_Z_TILE  C3D_TILE_X
 
-static void c3d_dwt3_fwd_level(float *restrict buf, size_t side, float *scratch) {
-    (void)scratch;  /* per-thread buffers supersede the shared scratch. */
+/* One forward DWT level, X→Y→Z.  MUST be called from inside an existing
+ * `#pragma omp parallel` region: the three passes use `omp for` whose
+ * implicit end-of-loop barrier enforces the X→Y→Z (and, across calls,
+ * level→level) data dependency without tearing the thread team down.
+ * Collapsing the per-axis / per-level fork-joins (15 per fwd DWT) into a
+ * single persistent team is the whole point — see the scaling profile.
+ * `t_aux` / `t_tile` are caller-supplied thread-private scratch, each
+ * C3D_TILE_X * C3D_CHUNK_SIDE floats (t_aux's first C3D_CHUNK_SIDE used
+ * by the contiguous X pass). */
+static void c3d_dwt3_fwd_level_team(float *restrict buf, size_t side,
+                                    float *restrict t_aux,
+                                    float *restrict t_tile) {
     buf = __builtin_assume_aligned(buf, C3D_ALIGN);
     /* side ∈ {256,128,64,32,16}: power-of-2 ≥ 16, ≤ 256. */
     c3d_invariant(side >= 16u && side <= 256u);
     c3d_invariant((side & (side - 1u)) == 0u);
-
-    /* X pass — row stride 1, contiguous.  Outer z loop is parallelised;
-     * each thread gets its own aux (512 floats = 2 KB on stack). */
-    #pragma omp parallel
-    {
-        float aux[C3D_CHUNK_SIDE];
-        #pragma omp for schedule(static)
-        for (size_t z = 0; z < side; ++z) {
-            for (size_t y = 0; y < side; ++y) {
-                float *row = &buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y];
-                c3d_dwt_1d_fwd(row, side, aux);
-            }
-        }
-    }
-    /* Y pass — 4 adjacent X-columns at a time (cache-line-sized load/store). */
     c3d_assert((side & 3u) == 0);
-    #pragma omp parallel
-    {
-        float tile[C3D_TILE_X * C3D_CHUNK_SIDE];
-        float aux [C3D_TILE_X * C3D_CHUNK_SIDE];
-        #pragma omp for schedule(static)
-        for (size_t z = 0; z < side; ++z) {
-            for (size_t xb = 0; xb < side; xb += C3D_Y_TILE) {
-                for (size_t y = 0; y < side; ++y)
-                    c3d_copy8(&tile[y * C3D_TILE_X],
-                              &buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + xb]);
-                c3d_dwt_1d_fwd_x4(tile, side, aux);
-                for (size_t y = 0; y < side; ++y)
-                    c3d_copy8(&buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + xb],
-                              &tile[y * C3D_TILE_X]);
-            }
-        }
-    }
-    /* Z pass — same tiling, parallelise over outer y. */
-    #pragma omp parallel
-    {
-        float tile[C3D_TILE_X * C3D_CHUNK_SIDE];
-        float aux [C3D_TILE_X * C3D_CHUNK_SIDE];
-        #pragma omp for schedule(static)
+
+    /* X pass — row stride 1, contiguous. */
+    #pragma omp for schedule(static)
+    for (size_t z = 0; z < side; ++z) {
         for (size_t y = 0; y < side; ++y) {
-            for (size_t xb = 0; xb < side; xb += C3D_Z_TILE) {
-                for (size_t z = 0; z < side; ++z)
-                    c3d_copy8(&tile[z * C3D_TILE_X],
-                              &buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + xb]);
-                c3d_dwt_1d_fwd_x4(tile, side, aux);
-                for (size_t z = 0; z < side; ++z)
-                    c3d_copy8(&buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + xb],
-                              &tile[z * C3D_TILE_X]);
-            }
+            float *row = &buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y];
+            c3d_dwt_1d_fwd(row, side, t_aux);
         }
     }
+    /* implicit barrier here: X complete before any Y read */
+
+    /* Y pass — TILE_X adjacent X-columns at a time. */
+    #pragma omp for schedule(static)
+    for (size_t z = 0; z < side; ++z) {
+        for (size_t xb = 0; xb < side; xb += C3D_Y_TILE) {
+            for (size_t y = 0; y < side; ++y)
+                c3d_copy8(&t_tile[y * C3D_TILE_X],
+                          &buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + xb]);
+            c3d_dwt_1d_fwd_x4(t_tile, side, t_aux);
+            for (size_t y = 0; y < side; ++y)
+                c3d_copy8(&buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + xb],
+                          &t_tile[y * C3D_TILE_X]);
+        }
+    }
+    /* implicit barrier here: Y complete before any Z read */
+
+    /* Z pass — same tiling, parallelise over outer y. */
+    #pragma omp for schedule(static)
+    for (size_t y = 0; y < side; ++y) {
+        for (size_t xb = 0; xb < side; xb += C3D_Z_TILE) {
+            for (size_t z = 0; z < side; ++z)
+                c3d_copy8(&t_tile[z * C3D_TILE_X],
+                          &buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + xb]);
+            c3d_dwt_1d_fwd_x4(t_tile, side, t_aux);
+            for (size_t z = 0; z < side; ++z)
+                c3d_copy8(&buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + xb],
+                          &t_tile[z * C3D_TILE_X]);
+        }
+    }
+    /* implicit barrier here: level complete before next level's X pass */
 }
 
-static void c3d_dwt3_inv_level(float *restrict buf, size_t side, float *scratch) {
-    (void)scratch;  /* per-thread buffers supersede the shared scratch. */
+/* One inverse DWT level, Z→Y→X (mirror of the forward team function).
+ * MUST be called from inside an existing `#pragma omp parallel`; the
+ * `omp for` implicit barriers enforce Z→Y→X and level→level ordering
+ * while reusing one persistent thread team. */
+static void c3d_dwt3_inv_level_team(float *restrict buf, size_t side,
+                                    float *restrict t_aux,
+                                    float *restrict t_tile) {
     buf = __builtin_assume_aligned(buf, C3D_ALIGN);
     c3d_invariant(side >= 16u && side <= 256u);
     c3d_invariant((side & (side - 1u)) == 0u);
-
     c3d_assert((side & 3u) == 0);
-    /* Inverse order: Z, Y, X — each pass parallelised over its outer loop. */
-    #pragma omp parallel
-    {
-        float tile[C3D_TILE_X * C3D_CHUNK_SIDE];
-        float aux [C3D_TILE_X * C3D_CHUNK_SIDE];
-        #pragma omp for schedule(static)
+
+    /* Z pass. */
+    #pragma omp for schedule(static)
+    for (size_t y = 0; y < side; ++y) {
+        for (size_t xb = 0; xb < side; xb += C3D_Z_TILE) {
+            for (size_t z = 0; z < side; ++z)
+                c3d_copy8(&t_tile[z * C3D_TILE_X],
+                          &buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + xb]);
+            c3d_dwt_1d_inv_x4(t_tile, side, t_aux);
+            for (size_t z = 0; z < side; ++z)
+                c3d_copy8(&buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + xb],
+                          &t_tile[z * C3D_TILE_X]);
+        }
+    }
+    /* implicit barrier: Z complete before any Y read */
+
+    /* Y pass. */
+    #pragma omp for schedule(static)
+    for (size_t z = 0; z < side; ++z) {
+        for (size_t xb = 0; xb < side; xb += C3D_Y_TILE) {
+            for (size_t y = 0; y < side; ++y)
+                c3d_copy8(&t_tile[y * C3D_TILE_X],
+                          &buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + xb]);
+            c3d_dwt_1d_inv_x4(t_tile, side, t_aux);
+            for (size_t y = 0; y < side; ++y)
+                c3d_copy8(&buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + xb],
+                          &t_tile[y * C3D_TILE_X]);
+        }
+    }
+    /* implicit barrier: Y complete before any X read */
+
+    /* X pass — contiguous. */
+    #pragma omp for schedule(static)
+    for (size_t z = 0; z < side; ++z) {
         for (size_t y = 0; y < side; ++y) {
-            for (size_t xb = 0; xb < side; xb += C3D_Z_TILE) {
-                for (size_t z = 0; z < side; ++z)
-                    c3d_copy8(&tile[z * C3D_TILE_X],
-                              &buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + xb]);
-                c3d_dwt_1d_inv_x4(tile, side, aux);
-                for (size_t z = 0; z < side; ++z)
-                    c3d_copy8(&buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + xb],
-                              &tile[z * C3D_TILE_X]);
-            }
+            float *row = &buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y];
+            c3d_dwt_1d_inv(row, side, t_aux);
         }
     }
+    /* implicit barrier: level complete before next level's Z pass */
+}
+
+/* Single-level inverse DWT with its own thread team.  Test/compat shim;
+ * production goes through c3d_dwt3_inv_levels (one team, all levels). */
+static void c3d_dwt3_inv_level(float *restrict buf, size_t side,
+                               float *scratch) {
+    (void)scratch;
     #pragma omp parallel
     {
-        float tile[C3D_TILE_X * C3D_CHUNK_SIDE];
-        float aux [C3D_TILE_X * C3D_CHUNK_SIDE];
-        #pragma omp for schedule(static)
-        for (size_t z = 0; z < side; ++z) {
-            for (size_t xb = 0; xb < side; xb += C3D_Y_TILE) {
-                for (size_t y = 0; y < side; ++y)
-                    c3d_copy8(&tile[y * C3D_TILE_X],
-                              &buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + xb]);
-                c3d_dwt_1d_inv_x4(tile, side, aux);
-                for (size_t y = 0; y < side; ++y)
-                    c3d_copy8(&buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + xb],
-                              &tile[y * C3D_TILE_X]);
-            }
-        }
-    }
-    #pragma omp parallel
-    {
-        float aux[C3D_CHUNK_SIDE];
-        #pragma omp for schedule(static)
-        for (size_t z = 0; z < side; ++z) {
-            for (size_t y = 0; y < side; ++y) {
-                float *row = &buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y];
-                c3d_dwt_1d_inv(row, side, aux);
-            }
-        }
+        float t_aux [C3D_TILE_X * C3D_CHUNK_SIDE];
+        float t_tile[C3D_TILE_X * C3D_CHUNK_SIDE];
+        c3d_dwt3_inv_level_team(buf, side, t_aux, t_tile);
     }
 }
 
-/* Full 5-level forward DWT on a 256³ f32 buffer.
- * scratch must be ≥ 8 * C3D_CHUNK_SIDE floats (2 KiB). */
+/* Single-level forward DWT with its own thread team.  Only used by the
+ * test harness (partial k-level forwards); production goes through
+ * c3d_dwt3_fwd which keeps one team across all levels. */
+static void c3d_dwt3_fwd_level(float *restrict buf, size_t side,
+                               float *scratch) {
+    (void)scratch;
+    #pragma omp parallel
+    {
+        float t_aux [C3D_TILE_X * C3D_CHUNK_SIDE];
+        float t_tile[C3D_TILE_X * C3D_CHUNK_SIDE];
+        c3d_dwt3_fwd_level_team(buf, side, t_aux, t_tile);
+    }
+}
+
+/* Full 5-level forward DWT on a 256³ f32 buffer.  `scratch` is unused
+ * (thread-private scratch is stack-allocated per worker); kept in the
+ * signature for call-site compatibility.
+ *
+ * One `omp parallel` spans all 5 levels: the thread team is created once
+ * and reused across every axis pass of every level, with `omp for`
+ * implicit barriers providing the X→Y→Z and level→level ordering.  This
+ * replaces the previous 15 fork/join regions (5 levels × 3 axes). */
 static void c3d_dwt3_fwd(float *restrict buf, float *scratch) {
-    size_t side = C3D_CHUNK_SIDE;
-    for (unsigned lvl = 0; lvl < C3D_N_DWT_LEVELS; ++lvl) {
-        c3d_dwt3_fwd_level(buf, side, scratch);
-        side /= 2;
+    (void)scratch;
+    #pragma omp parallel
+    {
+        float t_aux [C3D_TILE_X * C3D_CHUNK_SIDE];
+        float t_tile[C3D_TILE_X * C3D_CHUNK_SIDE];
+        size_t side = C3D_CHUNK_SIDE;
+        for (unsigned lvl = 0; lvl < C3D_N_DWT_LEVELS; ++lvl) {
+            c3d_dwt3_fwd_level_team(buf, side, t_aux, t_tile);
+            side /= 2;
+        }
     }
 }
 
@@ -1213,10 +1322,18 @@ static void c3d_dwt3_fwd(float *restrict buf, float *scratch) {
  *   n=k → synthesise levels 5, 4, ..., 6-k; output is LLL_{5-k} at [0:(8<<k), ...].
  *   n=5 → full inverse, output at [0:256, 0:256, 0:256]. */
 static void c3d_dwt3_inv_levels(float *restrict buf, unsigned n_synth_levels, float *scratch) {
+    (void)scratch;
     c3d_assert(n_synth_levels <= C3D_N_DWT_LEVELS);
-    for (unsigned i = 0; i < n_synth_levels; ++i) {
-        size_t active_side = (size_t)16u << i;   /* 16, 32, 64, 128, 256 */
-        c3d_dwt3_inv_level(buf, active_side, scratch);
+    if (n_synth_levels == 0u) return;   /* LOD decode stopping at LLL_5 */
+    /* One team for all synth levels; omp-for barriers chain the levels. */
+    #pragma omp parallel
+    {
+        float t_aux [C3D_TILE_X * C3D_CHUNK_SIDE];
+        float t_tile[C3D_TILE_X * C3D_CHUNK_SIDE];
+        for (unsigned i = 0; i < n_synth_levels; ++i) {
+            size_t active_side = (size_t)16u << i;   /* 16, 32, 64, 128, 256 */
+            c3d_dwt3_inv_level_team(buf, active_side, t_aux, t_tile);
+        }
     }
 }
 
@@ -1269,6 +1386,181 @@ static inline float c3d_dequant(int32_t q, float step, float dz_half, float alph
     float aq  = (float)((q < 0) ? -q : q);
     float mag = dz_half + (aq - 1.0f + alpha) * step;
     return (q < 0) ? -mag : mag;
+}
+
+/* ---- Vectorised row quant / dequant ------------------------------------- *
+ *
+ * Three hot kernels (encode, rate-estimate, inverse) share an identical
+ * float↔int dead-zone quant/dequant inner loop.  Factoring the SIMD body
+ * into these two helpers keeps the AVX512 / AVX2 / NEON / scalar branching
+ * in one place instead of three duplicated copies.
+ *
+ * Bit-exactness vs the scalar c3d_quant / c3d_dequant:
+ *   - float→int truncation toward zero: NEON vcvtq_s32_f32, AVX
+ *     _mm*_cvtt ps_epi32 ("cvtt" = truncate), and C (int32_t) all agree.
+ *   - the dead-zone (|c| < dz_half → 0) and sign are reapplied by mask
+ *     select, mirroring the scalar branch order exactly.
+ * Same-binary determinism (CLAUDE.md §0) holds because every lane runs
+ * the identical fused expression the scalar path runs. */
+
+/* qv[x] = c3d_quant(crow[x], step, dz_half) for x in [0, n). */
+static inline void c3d_quant_row(const float *restrict crow,
+                                 int32_t *restrict qv, uint32_t n,
+                                 float step, float dz_half) {
+    const float inv_step = 1.0f / step;
+    (void)inv_step;   /* unused on the pure-scalar fallback */
+    uint32_t x = 0;
+#if defined(C3D_HAVE_AVX512)
+    __m512 vdz  = _mm512_set1_ps(dz_half);
+    __m512 vinv = _mm512_set1_ps(inv_step);
+    for (; x + 16 <= n; x += 16) {
+        __m512 c   = _mm512_loadu_ps(crow + x);
+        __m512 ac  = _mm512_abs_ps(c);
+        __mmask16 below = _mm512_cmp_ps_mask(ac, vdz, _CMP_LT_OQ);
+        __m512 s   = _mm512_mul_ps(_mm512_sub_ps(ac, vdz), vinv);
+        __m512i qi = _mm512_add_epi32(_mm512_cvttps_epi32(s),
+                                      _mm512_set1_epi32(1));
+        __mmask16 neg = _mm512_cmp_ps_mask(c, _mm512_setzero_ps(), _CMP_LT_OQ);
+        __m512i q  = _mm512_mask_sub_epi32(qi, neg, _mm512_setzero_si512(), qi);
+        q = _mm512_mask_blend_epi32(below, q, _mm512_setzero_si512());
+        _mm512_storeu_si512((void *)(qv + x), q);
+    }
+#elif defined(C3D_HAVE_AVX2)
+    __m256 vdz  = _mm256_set1_ps(dz_half);
+    __m256 vinv = _mm256_set1_ps(inv_step);
+    __m256 vzero = _mm256_setzero_ps();
+    for (; x + 8 <= n; x += 8) {
+        __m256 c   = _mm256_loadu_ps(crow + x);
+        __m256 ac  = _mm256_andnot_ps(_mm256_set1_ps(-0.0f), c);   /* fabs */
+        __m256 below = _mm256_cmp_ps(ac, vdz, _CMP_LT_OQ);
+        __m256 s   = _mm256_mul_ps(_mm256_sub_ps(ac, vdz), vinv);
+        __m256i qi = _mm256_add_epi32(_mm256_cvttps_epi32(s),
+                                      _mm256_set1_epi32(1));
+        __m256 neg = _mm256_cmp_ps(c, vzero, _CMP_LT_OQ);
+        __m256i qn = _mm256_sub_epi32(_mm256_setzero_si256(), qi);
+        __m256i q  = _mm256_blendv_epi8(qi, qn, _mm256_castps_si256(neg));
+        q = _mm256_blendv_epi8(q, _mm256_setzero_si256(),
+                               _mm256_castps_si256(below));
+        _mm256_storeu_si256((__m256i *)(qv + x), q);
+    }
+#elif defined(C3D_HAVE_NEON)
+    float32x4_t vdz  = vdupq_n_f32(dz_half);
+    float32x4_t vinv = vdupq_n_f32(inv_step);
+    float32x4_t vzero = vdupq_n_f32(0.0f);
+    for (; x + 4 <= n; x += 4) {
+        float32x4_t c  = vld1q_f32(crow + x);
+        float32x4_t ac = vabsq_f32(c);
+        uint32x4_t below = vcltq_f32(ac, vdz);
+        float32x4_t s  = vmulq_f32(vsubq_f32(ac, vdz), vinv);
+        int32x4_t  qi  = vaddq_s32(vcvtq_s32_f32(s), vdupq_n_s32(1));
+        uint32x4_t neg = vcltq_f32(c, vzero);
+        int32x4_t  q   = vbslq_s32(neg, vnegq_s32(qi), qi);
+        q = vbslq_s32(below, vdupq_n_s32(0), q);
+        vst1q_s32(qv + x, q);
+    }
+#endif
+    for (; x < n; ++x) qv[x] = c3d_quant(crow[x], step, dz_half);
+}
+
+/* out[x] = c3d_dequant(qv[x], step, dz_half, alpha) for x in [0, n). */
+static inline void c3d_dequant_row(const int32_t *restrict qv,
+                                   float *restrict out, uint32_t n,
+                                   float step, float dz_half, float alpha) {
+    uint32_t x = 0;
+#if defined(C3D_HAVE_AVX512)
+    __m512 vdz   = _mm512_set1_ps(dz_half);
+    __m512 vstep = _mm512_set1_ps(step);
+    __m512 vbias = _mm512_set1_ps(alpha - 1.0f);
+    for (; x + 16 <= n; x += 16) {
+        __m512i q  = _mm512_loadu_si512((const void *)(qv + x));
+        __mmask16 isz = _mm512_cmpeq_epi32_mask(q, _mm512_setzero_si512());
+        __mmask16 neg = _mm512_cmpgt_epi32_mask(_mm512_setzero_si512(), q);
+        __m512 af  = _mm512_cvtepi32_ps(_mm512_abs_epi32(q));
+        __m512 mag = _mm512_fmadd_ps(vstep, _mm512_add_ps(af, vbias), vdz);
+        __m512 res = _mm512_mask_sub_ps(mag, neg, _mm512_setzero_ps(), mag);
+        res = _mm512_mask_blend_ps(isz, res, _mm512_setzero_ps());
+        _mm512_storeu_ps(out + x, res);
+    }
+#elif defined(C3D_HAVE_AVX2)
+    __m256 vdz   = _mm256_set1_ps(dz_half);
+    __m256 vstep = _mm256_set1_ps(step);
+    __m256 vbias = _mm256_set1_ps(alpha - 1.0f);
+    __m256i izero = _mm256_setzero_si256();
+    for (; x + 8 <= n; x += 8) {
+        __m256i q  = _mm256_loadu_si256((const __m256i *)(qv + x));
+        __m256i isz = _mm256_cmpeq_epi32(q, izero);
+        __m256i neg = _mm256_cmpgt_epi32(izero, q);
+        __m256 af  = _mm256_cvtepi32_ps(_mm256_abs_epi32(q));
+        __m256 mag = _mm256_fmadd_ps(vstep, _mm256_add_ps(af, vbias), vdz);
+        __m256 res = _mm256_blendv_ps(mag,
+                        _mm256_sub_ps(_mm256_setzero_ps(), mag),
+                        _mm256_castsi256_ps(neg));
+        res = _mm256_blendv_ps(res, _mm256_setzero_ps(),
+                               _mm256_castsi256_ps(isz));
+        _mm256_storeu_ps(out + x, res);
+    }
+#elif defined(C3D_HAVE_NEON)
+    float32x4_t vdz   = vdupq_n_f32(dz_half);
+    float32x4_t vstep = vdupq_n_f32(step);
+    float32x4_t vbias = vdupq_n_f32(alpha - 1.0f);
+    float32x4_t vzero = vdupq_n_f32(0.0f);
+    for (; x + 4 <= n; x += 4) {
+        int32x4_t q   = vld1q_s32(qv + x);
+        uint32x4_t isz = vceqq_s32(q, vdupq_n_s32(0));
+        float32x4_t af = vcvtq_f32_s32(vabsq_s32(q));
+        float32x4_t mag = vfmaq_f32(vdz, vstep, vaddq_f32(af, vbias));
+        uint32x4_t neg = vcltq_s32(q, vdupq_n_s32(0));
+        float32x4_t res = vbslq_f32(neg, vnegq_f32(mag), mag);
+        res = vbslq_f32(isz, vzero, res);
+        vst1q_f32(out + x, res);
+    }
+#endif
+    for (; x < n; ++x) out[x] = c3d_dequant(qv[x], step, dz_half, alpha);
+}
+
+/* bin[x] = min((uint32_t)(fabsf(row[x]) * inv_w), nbins-1) for x in [0, n).
+ * Phase-1 of the fine-histogram builder; the scatter increment stays scalar.
+ * float→uint truncation toward zero (NEON vcvtq_u32_f32 / AVX cvttps_epi32 /
+ * C cast) agrees because every value is non-negative and < nbins after the
+ * clamp.  `nbins` is passed in because C3D_FINE_BINS is #defined further down
+ * the TU than this helper. */
+static inline void c3d_bin_row(const float *restrict row,
+                               uint32_t *restrict bin, uint32_t n,
+                               float inv_w, uint32_t nbins) {
+    uint32_t x = 0;
+#if defined(C3D_HAVE_AVX512)
+    __m512 vinv  = _mm512_set1_ps(inv_w);
+    __m512i vclip = _mm512_set1_epi32((int32_t)(nbins - 1u));
+    for (; x + 16 <= n; x += 16) {
+        __m512 a = _mm512_abs_ps(_mm512_loadu_ps(row + x));
+        __m512i b = _mm512_cvttps_epi32(_mm512_mul_ps(a, vinv));
+        b = _mm512_min_epu32(b, vclip);
+        _mm512_storeu_si512((void *)(bin + x), b);
+    }
+#elif defined(C3D_HAVE_AVX2)
+    __m256 vinv  = _mm256_set1_ps(inv_w);
+    __m256i vclip = _mm256_set1_epi32((int32_t)(nbins - 1u));
+    for (; x + 8 <= n; x += 8) {
+        __m256 a = _mm256_andnot_ps(_mm256_set1_ps(-0.0f),
+                                    _mm256_loadu_ps(row + x));   /* fabs */
+        __m256i b = _mm256_cvttps_epi32(_mm256_mul_ps(a, vinv));
+        b = _mm256_min_epu32(b, vclip);
+        _mm256_storeu_si256((__m256i *)(bin + x), b);
+    }
+#elif defined(C3D_HAVE_NEON)
+    float32x4_t vinv = vdupq_n_f32(inv_w);
+    uint32x4_t vclip = vdupq_n_u32(nbins - 1u);
+    for (; x + 4 <= n; x += 4) {
+        float32x4_t a = vabsq_f32(vld1q_f32(row + x));
+        uint32x4_t b = vcvtq_u32_f32(vmulq_f32(a, vinv));
+        b = vminq_u32(b, vclip);
+        vst1q_u32(bin + x, b);
+    }
+#endif
+    for (; x < n; ++x) {
+        uint32_t b = (uint32_t)(fabsf(row[x]) * inv_w);
+        bin[x] = b >= nbins ? nbins - 1u : b;
+    }
 }
 
 /* Look up dz_half for a subband from its kind. */
@@ -1903,36 +2195,14 @@ static void c3d_build_fine_hist(c3d_encoder *s) {
         if (mx <= 0.0f) continue;
         float inv_w = (float)C3D_FINE_BINS / mx;
         c3d_subband_info sb; c3d_subband_info_of(sidx, &sb);
-        /* Two-phase per row: NEON computes 4-wide fabs + bin index;
-         * scalar pass increments the histogram (scatter dependency). */
+        /* Two-phase per row: SIMD computes fabs + clamped bin index
+         * (AVX512/AVX2/NEON/scalar); the scalar pass below increments the
+         * histogram (scatter dependency keeps it scalar). */
         uint32_t bin_row[128];
         for (uint32_t z = sb.z0; z < sb.z0 + sb.side; ++z)
         for (uint32_t y = sb.y0; y < sb.y0 + sb.side; ++y) {
             const float *row = &s->coeff_buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + sb.x0];
-#ifdef C3D_HAVE_NEON
-            float32x4_t vinv = vdupq_n_f32(inv_w);
-            uint32x4_t vclip = vdupq_n_u32(C3D_FINE_BINS - 1u);
-            uint32_t xx = 0;
-            for (; xx + 4 <= sb.side; xx += 4) {
-                float32x4_t a = vabsq_f32(vld1q_f32(row + xx));
-                uint32x4_t b = vcvtq_u32_f32(vmulq_f32(a, vinv));
-                b = vminq_u32(b, vclip);
-                vst1q_u32(bin_row + xx, b);
-            }
-            for (; xx < sb.side; ++xx) {
-                float ac = fabsf(row[xx]);
-                uint32_t b = (uint32_t)(ac * inv_w);
-                if (b >= C3D_FINE_BINS) b = C3D_FINE_BINS - 1u;
-                bin_row[xx] = b;
-            }
-#else
-            for (uint32_t xx = 0; xx < sb.side; ++xx) {
-                float ac = fabsf(row[xx]);
-                uint32_t b = (uint32_t)(ac * inv_w);
-                if (b >= C3D_FINE_BINS) b = C3D_FINE_BINS - 1u;
-                bin_row[xx] = b;
-            }
-#endif
+            c3d_bin_row(row, bin_row, sb.side, inv_w, C3D_FINE_BINS);
             for (uint32_t xh = 0; xh < sb.side; ++xh) pref[bin_row[xh] + 1]++;
         }
         for (unsigned i = 1; i <= C3D_FINE_BINS; ++i) pref[i] += pref[i - 1];
@@ -1998,37 +2268,11 @@ static size_t c3d_encode_one_subband(
      * state (sp, lane_ctx, hist) is unchanged; only the float arithmetic
      * moves to 4-lane NEON fma/fabs/vcvt. */
     int32_t qv_row[128];
-#ifdef C3D_HAVE_NEON
-    const float inv_step = 1.0f / step;
-#endif
     for (uint32_t z = sb_z0; z < sb_z0 + sb_side; ++z)
     for (uint32_t y = sb_y0; y < sb_y0 + sb_side; ++y) {
         const float *crow = &coeff_buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + sb_x0];
-        /* Phase 1. */
-#ifdef C3D_HAVE_NEON
-        float32x4_t vdz    = vdupq_n_f32(dz_half);
-        float32x4_t vinv   = vdupq_n_f32(inv_step);
-        float32x4_t vzero  = vdupq_n_f32(0.0f);
-        uint32_t x = 0;
-        for (; x + 4 <= sb_side; x += 4) {
-            float32x4_t c  = vld1q_f32(crow + x);
-            float32x4_t ac = vabsq_f32(c);
-            uint32x4_t below = vcltq_f32(ac, vdz);             /* zero mask */
-            float32x4_t s  = vmulq_f32(vsubq_f32(ac, vdz), vinv);
-            int32x4_t  qi  = vcvtq_s32_f32(s);
-            qi = vaddq_s32(qi, vdupq_n_s32(1));
-            uint32x4_t neg = vcltq_f32(c, vzero);
-            int32x4_t  qn  = vnegq_s32(qi);
-            int32x4_t  q   = vbslq_s32(neg, qn, qi);
-            q = vbslq_s32(below, vdupq_n_s32(0), q);
-            vst1q_s32(qv_row + x, q);
-        }
-        for (; x < sb_side; ++x)
-            qv_row[x] = c3d_quant(crow[x], step, dz_half);
-#else
-        for (uint32_t x = 0; x < sb_side; ++x)
-            qv_row[x] = c3d_quant(crow[x], step, dz_half);
-#endif
+        /* Phase 1 — vectorised float→int quant (AVX512/AVX2/NEON/scalar). */
+        c3d_quant_row(crow, qv_row, sb_side, step, dz_half);
         /* Phase 2 — scalar, keeps sp/lane_ctx/hist/escape correct. */
         for (uint32_t xp = 0; xp < sb_side; ++xp) {
             uint32_t escape_mag;
@@ -2238,37 +2482,11 @@ static double c3d_estimate_one_subband_bytes(
     size_t est_idx = 0;
     /* §S11 two-phase quant (same as c3d_encode_one_subband). */
     int32_t qv_row[128];
-#ifdef C3D_HAVE_NEON
-    const float inv_step = 1.0f / step;
-#endif
     const uint32_t sb_side = sb->side;
     for (uint32_t z = sb->z0; z < sb->z0 + sb_side; ++z)
     for (uint32_t y = sb->y0; y < sb->y0 + sb_side; ++y) {
         const float *crow = &coeff_buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + sb->x0];
-#ifdef C3D_HAVE_NEON
-        float32x4_t vdz    = vdupq_n_f32(dz_half);
-        float32x4_t vinv   = vdupq_n_f32(inv_step);
-        float32x4_t vzero  = vdupq_n_f32(0.0f);
-        uint32_t x = 0;
-        for (; x + 4 <= sb_side; x += 4) {
-            float32x4_t c  = vld1q_f32(crow + x);
-            float32x4_t ac = vabsq_f32(c);
-            uint32x4_t below = vcltq_f32(ac, vdz);
-            float32x4_t s  = vmulq_f32(vsubq_f32(ac, vdz), vinv);
-            int32x4_t  qi  = vcvtq_s32_f32(s);
-            qi = vaddq_s32(qi, vdupq_n_s32(1));
-            uint32x4_t neg = vcltq_f32(c, vzero);
-            int32x4_t  qn  = vnegq_s32(qi);
-            int32x4_t  q   = vbslq_s32(neg, qn, qi);
-            q = vbslq_s32(below, vdupq_n_s32(0), q);
-            vst1q_s32(qv_row + x, q);
-        }
-        for (; x < sb_side; ++x)
-            qv_row[x] = c3d_quant(crow[x], step, dz_half);
-#else
-        for (uint32_t x = 0; x < sb_side; ++x)
-            qv_row[x] = c3d_quant(crow[x], step, dz_half);
-#endif
+        c3d_quant_row(crow, qv_row, sb_side, step, dz_half);
         for (uint32_t xp = 0; xp < sb_side; ++xp) {
             uint32_t escape_mag;
             bool *sp = &prev_sign_zy[(y - sb->y0) * sb_side + xp];
@@ -3495,12 +3713,11 @@ static void c3d_decode_one_subband(
     size_t idx = 0;
     /* Row-wise two-phase dequant.  Phase 1 (scalar): read sub_symbols, do
      * the stateful sign-prediction + escape LEB128 decode, emit qv into a
-     * stack-local row buffer.  Phase 2 (NEON): turn qv → float via the
-     * dequant formula, 4 lanes at a time, write contiguous x-run.
-     * The scalar phase keeps sp/escape flow trivially correct; NEON only
-     * touches the pure float math. */
+     * stack-local row buffer.  Phase 2 (SIMD): turn qv → float via the
+     * dequant formula, AVX512/AVX2/NEON-wide, write contiguous x-run.
+     * The scalar phase keeps sp/escape flow trivially correct; the SIMD
+     * helper only touches the pure float math. */
     int32_t qv_row[128];   /* max sb_side = 128 */
-    const float inv_step_unused = 0.0f; (void)inv_step_unused;
     for (uint32_t z = sb_z0; z < sb_z0 + sb_side; ++z)
     for (uint32_t y = sb_y0; y < sb_y0 + sb_side; ++y) {
         /* Phase 1 — scalar, keeps sp + escape state correct. */
@@ -3518,31 +3735,9 @@ static void c3d_decode_one_subband(
             bool *sp = &prev_sign_zy[(y - sb_y0) * sb_side + x];
             qv_row[x] = c3d_symbol_to_quant(sym, escape_mag, sp);
         }
-        /* Phase 2 — NEON dequant over the row. */
+        /* Phase 2 — vectorised int→float dequant (AVX512/AVX2/NEON/scalar). */
         float *out_row = &coeff_buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + sb_x0];
-#ifdef C3D_HAVE_NEON
-        float32x4_t vdz    = vdupq_n_f32(dz_half);
-        float32x4_t vstep  = vdupq_n_f32(step);
-        float32x4_t vbias  = vdupq_n_f32(alpha - 1.0f);
-        float32x4_t vzero  = vdupq_n_f32(0.0f);
-        uint32_t x = 0;
-        for (; x + 4 <= sb_side; x += 4) {
-            int32x4_t q   = vld1q_s32(qv_row + x);
-            uint32x4_t isz = vceqq_s32(q, vdupq_n_s32(0));
-            int32x4_t aq   = vabsq_s32(q);
-            float32x4_t af = vcvtq_f32_s32(aq);
-            float32x4_t mag = vfmaq_f32(vdz, vstep, vaddq_f32(af, vbias));
-            uint32x4_t neg = vcltq_s32(q, vdupq_n_s32(0));
-            float32x4_t res = vbslq_f32(neg, vnegq_f32(mag), mag);
-            res = vbslq_f32(isz, vzero, res);
-            vst1q_f32(out_row + x, res);
-        }
-        for (; x < sb_side; ++x)
-            out_row[x] = c3d_dequant(qv_row[x], step, dz_half, alpha);
-#else
-        for (uint32_t x = 0; x < sb_side; ++x)
-            out_row[x] = c3d_dequant(qv_row[x], step, dz_half, alpha);
-#endif
+        c3d_dequant_row(qv_row, out_row, sb_side, step, dz_half, alpha);
     }
     c3d_assert(esc_remaining == 0);
 }
