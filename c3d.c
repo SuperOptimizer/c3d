@@ -3878,12 +3878,9 @@ void c3d_decoder_chunk_decode_lod(c3d_decoder *d,
     /* Encoder v2: coeff_scale is already absorbed into per-subband step, so
      * dequant produces raw-magnitude coefficients.  coeff_scale in the header
      * is informational only (preserved for c3d_inspect and downstream tools). */
-    /* §T10: branch-free u8 output cast.  Previous version had `? 0.5 : -0.5`
-     * and a clamping if-ladder, both of which blocked auto-vectorization.
-     * This form is pure float arithmetic with fminf/fmaxf and single cast —
-     * clang and gcc both auto-vectorize the innermost x-loop.  Inputs to the
-     * cast live in [0, 255] after the fmaxf/fminf so (uint8_t)(v_c + 0.5f)
-     * rounds correctly (no negative-rounding case needed). */
+    /* Ternary clamp, not fminf/fmaxf: under strict IEEE math the libm
+     * calls don't lower to minss/maxss and block vectorization. v is a
+     * finite coefficient sum, so this is bit-identical for real inputs. */
     (void)coeff_scale;
     for (size_t z = 0; z < out_side; ++z) {
         for (size_t y = 0; y < out_side; ++y) {
@@ -3893,7 +3890,7 @@ void c3d_decoder_chunk_decode_lod(c3d_decoder *d,
                                    + y * out_side;
             for (size_t x = 0; x < out_side; ++x) {
                 float v = row[x] + dc_offset + 128.0f;
-                float v_c = fminf(fmaxf(v, 0.0f), 255.0f);
+                float v_c = (v < 0.0f) ? 0.0f : ((v > 255.0f) ? 255.0f : v);
                 orow[x] = (uint8_t)(v_c + 0.5f);
             }
         }
