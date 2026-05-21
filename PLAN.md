@@ -543,21 +543,18 @@ Bytes on disk (format version 1, permanent during dev):
 
 ### Deferred — gated scaffolding on main
 
-- **Per-chunk R-D allocator (Q3).** Two implementations gated off on main:
-  - `c3d_rd_allocate` (fine-histogram, v1, `C3D_RD_ALLOCATOR=1`): rate
-    estimate undercounts ~20–25 % vs the accurate quant-scan estimator,
-    so byte targets drift.
-  - `c3d_rd_allocate_hybrid` (v2, `C3D_RD_HYBRID=1`): rate accuracy is
-    fine (uses the same accurate estimator as global-q bisection, targets
-    the budget that estimator predicts at the converged q).  The
-    distortion metric regresses PSNR by 0.1–1.0 dB regardless of grid
-    width because weighted-coef-MSE + escape-bin mean-|q| approximation
-    doesn't match true pixel MSE under bi-orthogonal CDF 9/7.  The
-    perceptual softness=0.5 baseline already balances R-D slopes in pixel
-    space, so moves away from mult=1 need a more faithful distortion
-    model (closed-form Laplacian integral, or exact per-escape dequant
-    accounting).  Leave scaffolding, revisit when willing to derive the
-    full closed-form dist formula.
+- **Per-chunk R-D allocator distortion model (Q3).** `c3d_rd_allocate_hybrid`
+  runs by default (disable via `C3D_NO_RD=1`).  Rate accuracy is fine (uses
+  the same accurate estimator as global-q bisection, targets the budget that
+  estimator predicts at the converged q).  The distortion metric still leaves
+  detail on the table: weighted-coef-MSE + escape-bin mean-|q| approximation
+  doesn't match true pixel MSE under bi-orthogonal CDF 9/7, and measurement on
+  scroll CT shows the allocator smooths high-frequency subbands (~12 pp of
+  laplacian-variance at r50) for ~0 PSNR/MS-SSIM gain.  A faithful distortion
+  model (closed-form Laplacian integral, or exact per-escape dequant
+  accounting), or an HF-preserving / perceptual weighting, is the open work.
+  (The old fine-histogram `c3d_rd_allocate` v1 was removed — its rate estimate
+  undercounted ~20–25 % so byte targets drifted and quality cratered.)
 
 - **Context-adaptive rANS (Q4).** Would use per-symbol freq tables keyed on
   the causal neighbour's class for another +0.3–1.0 dB.  Not attempted: the

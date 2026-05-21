@@ -2765,130 +2765,6 @@ static void c3d_rd_allocate_hybrid(c3d_encoder *s,
     s->has_allocator_steps = true;
 }
 
-/* Original fine-histogram R-D allocator — kept for reference / future
- * calibration work.  Gated behind C3D_RD_ALLOCATOR env; see PLAN.md.
- *
- * Picks per-subband step minimising
- *     Σ d_s(step_s) + λ · Σ r_s(step_s)
- * under a fixed byte target, using the fine-histogram cache (§I1). */
-#define C3D_RD_NCAND_LEGACY 10
-static void c3d_rd_allocate(c3d_encoder *s,
-                            double target_bytes)
-{
-    c3d_build_fine_hist(s);
-
-    /* Per-subband trial step grid, centred on q_seed * baseline_s *
-     * coeff_scale, log-spaced from /8 to ×8 so the allocator can reallocate
-     * bits freely.  q_seed from warm-start if the caller is re-using the
-     * encoder at the same target ratio; else the classic sqrt(ratio)/64
-     * heuristic, which centres the grid near the true optimum. */
-    float q_seed;
-    if (s->last_q > 0.0f && target_bytes > 0.0) {
-        q_seed = s->last_q;
-    } else {
-        /* ratio ≈ C3D_VOXELS / (target + fixed_header); solve for q heuristic. */
-        double target_ratio = (double)C3D_VOXELS_PER_CHUNK
-                            / (target_bytes + (double)C3D_CHUNK_FIXED_SIZE);
-        if (target_ratio < 1.0) target_ratio = 1.0;
-        q_seed = (float)(sqrt(target_ratio) / 64.0);
-    }
-    if (q_seed < C3D_Q_MIN) q_seed = C3D_Q_MIN;
-    if (q_seed > C3D_Q_MAX) q_seed = C3D_Q_MAX;
-
-    float grid[C3D_N_SUBBANDS][C3D_RD_NCAND_LEGACY];
-    for (unsigned i = 0; i < C3D_N_SUBBANDS; ++i) {
-        float base = c3d_emit_baseline(s, i) * s->coeff_scale;
-        float centre = q_seed * base;
-        /* Factors: 1/8, 1/4, 1/2.5, 1/1.5, 1/1.1, 1.1, 1.5, 2.5, 4, 8. */
-        static const float mults[C3D_RD_NCAND_LEGACY] = {
-            1.0f/8.0f, 1.0f/4.0f, 1.0f/2.5f, 1.0f/1.5f, 1.0f/1.1f,
-            1.1f, 1.5f, 2.5f, 4.0f, 8.0f
-        };
-        for (unsigned j = 0; j < C3D_RD_NCAND_LEGACY; ++j) {
-            float t = centre * mults[j];
-            if (t <= 0.0f) t = 1e-9f;
-            grid[i][j] = t;
-        }
-    }
-
-    /* Pre-compute r_ij = rate(step_ij), d_ij = dist(step_ij).  Cached so
-     * λ bisection is O(subbands × ncand × 1) lookups instead of rebuilds. */
-    double rate[C3D_N_SUBBANDS][C3D_RD_NCAND_LEGACY];
-    double dist[C3D_N_SUBBANDS][C3D_RD_NCAND_LEGACY];
-    for (unsigned i = 0; i < C3D_N_SUBBANDS; ++i) {
-        for (unsigned j = 0; j < C3D_RD_NCAND_LEGACY; ++j) {
-            c3d_rd_estimate_subband(s, i, grid[i][j], /*alpha=*/0.375f,
-                                    &rate[i][j], &dist[i][j]);
-        }
-    }
-
-    /* Bisect λ in log space.  For each λ, pick per-subband j that minimises
-     * d_ij + λ·r_ij; sum over subbands and compare vs target. */
-    double lam_lo = 1e-8, lam_hi = 1e8;
-    /* Safe upper and lower brackets: pick coarsest and finest steps. */
-    double rate_coarse = 0.0, rate_fine = 0.0;
-    for (unsigned i = 0; i < C3D_N_SUBBANDS; ++i) {
-        rate_coarse += rate[i][C3D_RD_NCAND_LEGACY - 1];   /* coarsest = last grid slot */
-        rate_fine   += rate[i][0];                   /* finest = first slot */
-    }
-    if (rate_fine <= target_bytes) {
-        /* Target is easy — even finest steps fit.  Pick finest everywhere. */
-        for (unsigned i = 0; i < C3D_N_SUBBANDS; ++i)
-            s->allocator_steps[i] = grid[i][0];
-        s->has_allocator_steps = true;
-        if (getenv("C3D_RD_DEBUG"))
-            fprintf(stderr, "RD: shortcut FINE  target=%.0f rate_fine=%.0f rate_coarse=%.0f\n",
-                    target_bytes, rate_fine, rate_coarse);
-        return;
-    }
-    if (rate_coarse >= target_bytes) {
-        /* Target is hopelessly tight even at coarsest; pick coarsest. */
-        for (unsigned i = 0; i < C3D_N_SUBBANDS; ++i)
-            s->allocator_steps[i] = grid[i][C3D_RD_NCAND_LEGACY - 1];
-        s->has_allocator_steps = true;
-        if (getenv("C3D_RD_DEBUG"))
-            fprintf(stderr, "RD: shortcut COARSE target=%.0f rate_fine=%.0f rate_coarse=%.0f\n",
-                    target_bytes, rate_fine, rate_coarse);
-        return;
-    }
-
-    float best_j_all[C3D_N_SUBBANDS];
-    for (int it = 0; it < 14; ++it) {
-        double lam = sqrt(lam_lo * lam_hi);
-        double total_rate = 0.0;
-        for (unsigned i = 0; i < C3D_N_SUBBANDS; ++i) {
-            unsigned best_j = 0;
-            double   best_cost = dist[i][0] + lam * rate[i][0];
-            for (unsigned j = 1; j < C3D_RD_NCAND_LEGACY; ++j) {
-                double c = dist[i][j] + lam * rate[i][j];
-                if (c < best_cost) { best_cost = c; best_j = j; }
-            }
-            best_j_all[i] = (float)best_j;   /* stash as float to reuse the array */
-            total_rate += rate[i][best_j];
-        }
-        if (fabs(total_rate - target_bytes) < 0.01 * target_bytes) break;
-        if (total_rate > target_bytes) lam_lo = lam;   /* need more penalty on rate */
-        else                           lam_hi = lam;
-    }
-
-    /* Final picks at the last λ. */
-    double lam = sqrt(lam_lo * lam_hi);
-    double total_est_rate = 0.0;
-    for (unsigned i = 0; i < C3D_N_SUBBANDS; ++i) {
-        unsigned best_j = 0;
-        double   best_cost = dist[i][0] + lam * rate[i][0];
-        for (unsigned j = 1; j < C3D_RD_NCAND_LEGACY; ++j) {
-            double c = dist[i][j] + lam * rate[i][j];
-            if (c < best_cost) { best_cost = c; best_j = j; }
-        }
-        s->allocator_steps[i] = grid[i][best_j];
-        total_est_rate += rate[i][best_j];
-    }
-    s->has_allocator_steps = true;
-    (void)best_j_all; (void)total_est_rate; (void)rate_fine; (void)rate_coarse;
-    (void)lam;
-}
-
 /* Cheap whole-chunk estimate: sum of per-subband estimates under the same
  * baseline / denom_shift / ctx-override logic as c3d_emit_entropy_at_q. */
 static double c3d_estimate_entropy_at_q(float q, const c3d_encoder *s)
@@ -3165,13 +3041,8 @@ size_t c3d_encoder_chunk_encode(c3d_encoder *e, const uint8_t *in,
                           - (double)C3D_CHUNK_FIXED_SIZE;
     if (target_bytes_d < 64.0) target_bytes_d = 64.0;
 
-    /* Legacy fine-histogram R-D allocator (§Q3 v1) stays gated under
-     * C3D_RD_ALLOCATOR env — its rate estimate misses by ~20 % on real
-     * data.  The hybrid allocator below fires by default. */
+    /* The hybrid allocator below fires by default. */
     e->has_allocator_steps = false;
-    if (getenv("C3D_RD_ALLOCATOR")) {
-        c3d_rd_allocate(e, target_bytes_d);
-    }
 
     /* Warm-start q from the previous chunk when target_ratio hasn't changed.
      * Bracket narrows to [q/4, q*4] — still wide enough to converge even if
